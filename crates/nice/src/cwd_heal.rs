@@ -185,7 +185,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A throwaway directory removed on drop (mirrors the claude_hook_installer
-    /// / shell_inject test plumbing).
+    /// / `shell::zsh` test plumbing).
     struct Scratch(PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {

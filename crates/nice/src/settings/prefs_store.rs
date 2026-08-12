@@ -38,11 +38,18 @@ struct FontsSection {
     terminal_line_height: Option<f32>,
 }
 
-/// The `advanced` object — the persisted-inert smooth-scroll toggle (D2).
+/// The `advanced` object — the persisted-inert smooth-scroll toggle (D2) and
+/// the shell-abstraction migration's `shell` key (design §4 step 2). `shell`
+/// absent, or an empty string, means
+/// [`crate::shell::resolve::ShellSetting::Automatic`]; a non-empty string is a
+/// `Path` override. No Settings UI writes this key yet (migration step 6) — it
+/// round-trips only through a hand-edited `ui_settings.json` for now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AdvancedSection {
     #[serde(default)]
     smooth_scroll: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell: Option<String>,
 }
 
 /// The on-disk document, for DECODING R23's own keys. Every other top-level key is
@@ -116,6 +123,18 @@ impl SettingsPrefsStore {
     /// The persisted smooth-scroll toggle (default OFF).
     pub fn smooth_scroll(&self) -> bool {
         self.advanced.smooth_scroll
+    }
+
+    /// The persisted `advanced.shell` choice, as a
+    /// [`crate::shell::resolve::ShellSetting`]. Absent, or an empty string
+    /// (defensive — an empty value should never win a resolution hop), reads
+    /// as `Automatic`. No setter in this slice: the Settings ▸ Advanced row is
+    /// migration step 6, and the shell bootstrap only ever reads this.
+    pub fn shell_setting(&self) -> crate::shell::resolve::ShellSetting {
+        match &self.advanced.shell {
+            Some(s) if !s.is_empty() => crate::shell::resolve::ShellSetting::Path(s.clone()),
+            _ => crate::shell::resolve::ShellSetting::Automatic,
+        }
     }
 
     /// The injected file path (test hook).
@@ -329,5 +348,72 @@ mod tests {
         let store = SettingsPrefsStore::load(path);
         assert_eq!(store.terminal_font_px(), None);
         assert!(!store.smooth_scroll());
+    }
+
+    /// Absent `advanced.shell` ⇒ `Automatic` — the default before any UI ever
+    /// writes the key.
+    #[test]
+    fn shell_setting_absent_is_automatic() {
+        let path = temp_path("shell-absent");
+        let store = SettingsPrefsStore::load(path);
+        assert_eq!(
+            store.shell_setting(),
+            crate::shell::resolve::ShellSetting::Automatic
+        );
+    }
+
+    /// A non-empty `advanced.shell` string ⇒ `Path`.
+    #[test]
+    fn shell_setting_present_is_path() {
+        let path = temp_path("shell-present");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"advanced":{"shell":"/opt/homebrew/bin/fish"}}"#,
+        )
+        .unwrap();
+        let store = SettingsPrefsStore::load(path);
+        assert_eq!(
+            store.shell_setting(),
+            crate::shell::resolve::ShellSetting::Path("/opt/homebrew/bin/fish".to_string())
+        );
+    }
+
+    /// An empty `advanced.shell` string is defensively treated as absent.
+    #[test]
+    fn shell_setting_empty_string_is_automatic() {
+        let path = temp_path("shell-empty");
+        std::fs::write(&path, br#"{"version":1,"advanced":{"shell":""}}"#).unwrap();
+        let store = SettingsPrefsStore::load(path);
+        assert_eq!(
+            store.shell_setting(),
+            crate::shell::resolve::ShellSetting::Automatic
+        );
+    }
+
+    /// `advanced.shell` survives a write of an unrelated advanced field
+    /// (`set_smooth_scroll`) — the read-merge-write writer round-trips it even
+    /// though this slice adds no setter for it.
+    #[test]
+    fn shell_setting_survives_a_smooth_scroll_write_round_trip() {
+        let path = temp_path("shell-round-trip");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"advanced":{"shell":"/opt/homebrew/bin/fish"}}"#,
+        )
+        .unwrap();
+
+        let mut store = SettingsPrefsStore::load(path.clone());
+        assert_eq!(
+            store.shell_setting(),
+            crate::shell::resolve::ShellSetting::Path("/opt/homebrew/bin/fish".to_string())
+        );
+        store.set_smooth_scroll(true).unwrap();
+
+        let reloaded = SettingsPrefsStore::load(path);
+        assert!(reloaded.smooth_scroll());
+        assert_eq!(
+            reloaded.shell_setting(),
+            crate::shell::resolve::ShellSetting::Path("/opt/homebrew/bin/fish".to_string())
+        );
     }
 }

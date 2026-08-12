@@ -5,7 +5,7 @@
 //! quitting vim drops back to a zsh prompt instead of closing the pane — so
 //! these pins are cheap insurance the carve-out is not rewritten back inline.
 
-use nice_term_core::{build_argv, build_exec_args, shell_single_quote, ZSH_PATH};
+use nice_term_core::{build_argv, build_exec_args, shell_single_quote, SpawnSpec, ZSH_PATH};
 
 #[test]
 fn build_exec_args_none_returns_login_shell() {
@@ -109,4 +109,34 @@ fn quoting_table_produces_expected_exec_argv() {
             case.raw_path
         );
     }
+}
+
+// ---- SpawnSpec.argv: the zsh shape is the default, callers may override -----
+
+/// The constructors store the zsh-shaped default argv on the spec, so every
+/// caller that has NOT been routed through a shell profile (hermetic term-core
+/// tests, itest fixtures, scenarios) execs exactly what it always did.
+#[test]
+fn spawn_spec_argv_defaults_to_build_argv() {
+    assert_eq!(SpawnSpec::shell("/tmp").argv, build_argv(None));
+    assert_eq!(
+        SpawnSpec::command("vim '/tmp/x.md'", "/tmp").argv,
+        build_argv(Some("vim '/tmp/x.md'"))
+    );
+}
+
+/// `with_argv` replaces the exec truth and leaves `command` — the display /
+/// launch-overlay source of truth — untouched.
+#[test]
+fn with_argv_overrides_only_the_argv() {
+    let argv = vec![
+        "/bin/bash".to_string(),
+        "-i".to_string(),
+        "-l".to_string(),
+        "-c".to_string(),
+        "exec vim".to_string(),
+    ];
+    let spec = SpawnSpec::command("vim", "/tmp").with_argv(argv.clone());
+    assert_eq!(spec.argv, argv);
+    assert_eq!(spec.command.as_deref(), Some("vim"));
 }

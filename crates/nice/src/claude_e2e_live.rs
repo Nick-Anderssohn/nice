@@ -169,7 +169,7 @@ impl Fixture {
 
         // The ZDOTDIR: write the FROZEN R14 stubs against this temp dir (never the
         // real Application Support location).
-        crate::shell_inject::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
+        crate::shell::zsh::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
 
         Ok(Fixture {
             home,

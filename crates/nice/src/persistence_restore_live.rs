@@ -112,7 +112,7 @@ impl Fixture {
 
         // The R14 ZDOTDIR stub chain (the `print -z` prefill tail) so a restored
         // deferred-resume Claude window pre-types NICE_PREFILL_COMMAND.
-        crate::shell_inject::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
+        crate::shell::zsh::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
 
         // The stub `claude`: idle forever (a restored window never RUNS it — the
         // prefill is only pre-typed). NEVER the machine's real claude.

@@ -1605,8 +1605,26 @@ fn probe_d_close_model_only_session_reaches_cascade_synchronously() {
 // spawn_window-shaped merge) are unit-tested directly (Validation §3 a/b/c); the
 // full live spawn path is the `shell-socket` scenario.
 
-/// Helper: a manager with a fully-populated window shell env (socket + zdotdir +
-/// an inherited user zdotdir).
+/// Helper: the injection pairs a window gets under the zsh profile, composed
+/// exactly as production does (`crate::shell::window_inject_pairs` over a
+/// `ShellRuntime`) so these tests keep pinning the real pairs rather than a
+/// hand-rolled copy of them — including the degraded `zdotdir: None` shape.
+fn zsh_inject_pairs(zdotdir: Option<&str>, user_zdotdir: Option<&str>) -> Vec<(String, String)> {
+    let runtime = crate::shell::ShellRuntime {
+        profile: Box::new(crate::shell::zsh::ZshProfile::new("/bin/zsh")),
+        inject: zdotdir.map(|d| crate::shell::InjectPaths {
+            dir: d.into(),
+            rcfile: None,
+        }),
+        user_env: crate::shell::UserShellEnv {
+            user_zdotdir: user_zdotdir.map(str::to_string),
+        },
+    };
+    crate::shell::window_inject_pairs(&runtime)
+}
+
+/// Helper: a manager with a fully-populated window shell env (socket + the zsh
+/// profile's injection pairs for a given zdotdir / inherited user zdotdir).
 fn manager_with_shell_env(
     socket: Option<&str>,
     zdotdir: Option<&str>,
@@ -1615,8 +1633,7 @@ fn manager_with_shell_env(
     let mut m = PtyManager::new();
     m.set_window_shell_env(WindowShellEnv {
         socket_path: socket.map(str::to_string),
-        zdotdir: zdotdir.map(str::to_string),
-        user_zdotdir: user_zdotdir.map(str::to_string),
+        inject_pairs: zsh_inject_pairs(zdotdir, user_zdotdir),
         compose_conf: Some("/conf/compose.json".to_string()),
     });
     m
@@ -1682,8 +1699,7 @@ fn absent_compose_conf_is_not_injected() {
     let mut m = PtyManager::new();
     m.set_window_shell_env(WindowShellEnv {
         socket_path: Some("/tmp/s".to_string()),
-        zdotdir: None,
-        user_zdotdir: None,
+        inject_pairs: zsh_inject_pairs(None, None),
         compose_conf: None,
     });
     let pairs = m.session_window_env_pairs("t", "p");
@@ -1721,6 +1737,71 @@ fn unbootstrapped_manager_injects_no_env() {
     );
 }
 
+// ---- the per-pane shell snapshot (design §2's PaneShell) ---------------------
+
+/// A spawned pane captures the ACTIVE profile's kind + compose capability, and a
+/// manager with no runtime installed (the `run_selftest` shape) captures the
+/// historical zsh snapshot. `compose_route` gates the trigger bytes on this, so a
+/// wrong snapshot is exactly finding F6 coming back.
+#[gpui::test]
+fn spawned_pane_snapshots_the_active_profile(cx: &mut gpui::TestAppContext) {
+    // A cheap hermetic child: no shell rc, no user config, just a process that
+    // sits on its pty until the manager drops it.
+    fn spec() -> SpawnSpec {
+        SpawnSpec::shell(std::env::temp_dir().to_string_lossy().to_string()).with_argv(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ])
+    }
+
+    let zsh = crate::shell::PaneShell {
+        kind: crate::shell::ShellKind::Zsh,
+        compose: crate::shell::ComposeSupport::Trigger,
+    };
+
+    cx.update(|cx| {
+        // 1. No ShellRuntime (scenarios never bootstrap one) ⇒ the zsh default.
+        let mut mgr = PtyManager::new();
+        mgr.set_event_wakes_enabled_for_test(false);
+        mgr.spawn_window("t1", "p1", spec(), cx).unwrap();
+        assert_eq!(mgr.pane_shell("t1", "p1"), Some(zsh));
+
+        // 2. A zsh runtime ⇒ the same snapshot, read off the profile this time.
+        crate::app::set_scenario_shell_inject_config(cx, None, None);
+        mgr.spawn_window("t1", "p2", spec(), cx).unwrap();
+        assert_eq!(mgr.pane_shell("t1", "p2"), Some(zsh));
+
+        // 3. A fallback runtime ⇒ a pane that must never receive trigger bytes.
+        cx.set_global(crate::shell::ShellRuntime {
+            profile: Box::new(crate::shell::fallback::FallbackProfile::new(
+                "/usr/local/bin/fish",
+            )),
+            inject: None,
+            user_env: crate::shell::UserShellEnv::default(),
+        });
+        mgr.spawn_window("t1", "p3", spec(), cx).unwrap();
+        assert_eq!(
+            mgr.pane_shell("t1", "p3"),
+            Some(crate::shell::PaneShell {
+                kind: crate::shell::ShellKind::Other,
+                compose: crate::shell::ComposeSupport::None,
+            })
+        );
+
+        // 4. The earlier panes keep THEIR snapshot — a mid-run profile swap never
+        //    reaches back into a running pane (design §2: runtime-only, per pane).
+        assert_eq!(mgr.pane_shell("t1", "p1"), Some(zsh));
+        assert_eq!(mgr.pane_shell("t1", "p2"), Some(zsh));
+
+        // 5. A window with no live pty has no snapshot.
+        assert_eq!(mgr.pane_shell("t1", "nope"), None);
+        assert_eq!(mgr.pane_shell("nope", "p1"), None);
+
+        mgr.teardown();
+    });
+}
+
 // ---- R14 build_claude_extra_env: the FROZEN per-mode matrix (R15 wires it) ---
 
 /// EVERY mode sets TERM_PROGRAM + the ids + NICE_SOCKET, and a non-deferred mode
@@ -1737,8 +1818,8 @@ fn claude_extra_env_common_columns_for_every_mode() {
             "tab1",
             "pane1",
             Some("/tmp/s.sock"),
-            Some("/z"),
-            Some("/user/z"),
+            &zsh_inject_pairs(Some("/z"), Some("/user/z")),
+            crate::shell::PrefillStrategy::ShellSide,
             None,
         );
         assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
@@ -1755,7 +1836,15 @@ fn claude_extra_env_common_columns_for_every_mode() {
 /// No socket ⇒ no NICE_SOCKET (the only conditional common column).
 #[test]
 fn claude_extra_env_omits_socket_when_absent() {
-    let env = build_claude_extra_env(&ClaudeSessionMode::None, "t", "p", None, None, None, None);
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::None,
+        "t",
+        "p",
+        None,
+        &[],
+        crate::shell::PrefillStrategy::ShellSide,
+        None,
+    );
     assert_eq!(value_of(&env, "NICE_SOCKET"), None);
     assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
 }
@@ -1769,8 +1858,8 @@ fn claude_extra_env_resume_deferred_sets_prefill_and_zdotdir() {
         "t1",
         "p1",
         Some("/tmp/s.sock"),
-        Some("/managed/z"),
-        Some("/user/z"),
+        &zsh_inject_pairs(Some("/managed/z"), Some("/user/z")),
+        crate::shell::PrefillStrategy::ShellSide,
         None,
     );
     assert_eq!(value_of(&env, "ZDOTDIR"), Some("/managed/z"));
@@ -1791,8 +1880,8 @@ fn claude_extra_env_resume_deferred_user_zdotdir_empty_when_none() {
         "t",
         "p",
         Some("/s"),
-        Some("/z"),
-        None,
+        &zsh_inject_pairs(Some("/z"), None),
+        crate::shell::PrefillStrategy::ShellSide,
         None,
     );
     assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), Some(""));
@@ -1807,14 +1896,66 @@ fn claude_extra_env_settings_path_splices_into_prefill() {
         "t",
         "p",
         Some("/s"),
-        Some("/z"),
-        Some("/user/z"),
+        &zsh_inject_pairs(Some("/z"), Some("/user/z")),
+        crate::shell::PrefillStrategy::ShellSide,
         Some("/Users/nick/Library/Application Support/settings.json".to_string()),
     );
     assert_eq!(
         value_of(&env, "NICE_PREFILL_COMMAND"),
         Some("claude --settings '/Users/nick/Library/Application Support/settings.json' --resume SID"),
         "--settings must precede --resume and be single-quoted"
+    );
+}
+
+/// A profile with no prefill mechanism (design §5's fallback) gets NO
+/// `NICE_PREFILL_COMMAND` — its shell has no rc tail that would consume the var,
+/// so the pane opens at a bare prompt. Everything else about the mode is
+/// unchanged, and the profile's (empty) inject pairs still splice.
+#[test]
+fn claude_extra_env_prefill_off_sets_no_prefill_command() {
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::ResumeDeferred("SID-123".into()),
+        "t1",
+        "p1",
+        Some("/tmp/s.sock"),
+        // What `window_inject_pairs` yields for a fallback profile: nothing.
+        &[],
+        crate::shell::PrefillStrategy::Off,
+        Some("/settings.json".to_string()),
+    );
+    assert_eq!(
+        value_of(&env, "NICE_PREFILL_COMMAND"),
+        None,
+        "a shell with no prefill mechanism must not be handed the prefill var"
+    );
+    assert_eq!(value_of(&env, "ZDOTDIR"), None, "no zsh var leaks into a non-zsh pane");
+    assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), None);
+    // The common columns are untouched by the prefill axis.
+    assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
+    assert_eq!(value_of(&env, "NICE_TAB_ID"), Some("t1"));
+    assert_eq!(value_of(&env, "NICE_PANE_ID"), Some("p1"));
+    assert_eq!(value_of(&env, "NICE_SOCKET"), Some("/tmp/s.sock"));
+}
+
+/// The app-typed strategy (step 4's bash prefill) also sets no env var — it
+/// records a pending prefill and types it after the pane's first OSC 7. Nothing
+/// returns it yet; this pins that the env composer stays out of its way.
+#[test]
+fn claude_extra_env_prefill_app_typed_sets_no_prefill_command() {
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::ResumeDeferred("SID".into()),
+        "t",
+        "p",
+        Some("/s"),
+        &[("NICE_BASH_RC".to_string(), "/rc".to_string())],
+        crate::shell::PrefillStrategy::AppTyped,
+        None,
+    );
+    assert_eq!(value_of(&env, "NICE_PREFILL_COMMAND"), None);
+    assert_eq!(
+        value_of(&env, "NICE_BASH_RC"),
+        Some("/rc"),
+        "the profile's own inject pairs still splice, whatever the prefill strategy"
     );
 }
 

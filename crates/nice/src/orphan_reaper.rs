@@ -12,10 +12,12 @@
 //! filter + the OS surface behind the injectable [`ReaperEnv`] seam).
 //!
 //! Match = ALL FOUR (never name-pattern matching): PPID == 1, uid == getuid(),
-//! kernel comm == "zsh" (the three [`live_candidate_pids`] applies via libproc),
-//! and the env contains `NICE_TAB_ID=` (the load-bearing safety guard [`reap`]
-//! applies). The env check is what keeps us from SIGKILLing a non-Nice zsh the
-//! user deliberately daemonized (nohup'd, detached from a launchd job, …).
+//! kernel comm in the caller's accepted set (the three [`live_candidate_pids`]
+//! applies via libproc), and the env contains `NICE_TAB_ID=` (the load-bearing
+//! safety guard [`reap`] applies). The accepted set comes from the shell
+//! profiles — this module names no shell — and the env check is what keeps us
+//! from SIGKILLing a shell the user deliberately daemonized (nohup'd, detached
+//! from a launchd job, …).
 //! Sibling live `nice` instances are filtered by PPID — their children's
 //! PPID is the live instance's pid, not 1.
 //!
@@ -125,9 +127,14 @@ impl ReaperEnv {
     /// Production wiring: libproc + sysctl + `kill(2)`. The closures call only
     /// thread-safe Darwin primitives (libproc / sysctl / kill are
     /// kernel-mediated and reentrant).
-    pub(crate) fn live() -> ReaperEnv {
+    ///
+    /// `accepted` is the set of kernel comm names the prefilter admits. The
+    /// caller derives it from the shell profiles rather than this module naming
+    /// a shell: a run that crashed under a different shell than the current one
+    /// still leaves orphans worth reaping.
+    pub(crate) fn live(accepted: Vec<String>) -> ReaperEnv {
         ReaperEnv {
-            list_candidates: Box::new(live_candidate_pids),
+            list_candidates: Box::new(move || live_candidate_pids(&accepted)),
             environment: Box::new(live_environment),
             // SAFETY: `kill(2)` with a pid and SIGKILL touches no user memory.
             kill: Box::new(|pid| unsafe { libc::kill(pid, libc::SIGKILL) } == 0),
@@ -136,11 +143,11 @@ impl ReaperEnv {
 }
 
 /// Enumerate every process where PPID == 1, uid == ours, and the kernel comm is
-/// `zsh`. Uses libproc (`proc_pidinfo(PROC_PIDTBSDINFO)`) rather than
+/// one of `accepted`. Uses libproc (`proc_pidinfo(PROC_PIDTBSDINFO)`) rather than
 /// `sysctl(KERN_PROC_ALL)` so the filter doesn't reach into the quirky
 /// `kinfo_proc` import. The `NICE_TAB_ID=` env criterion is applied later by
 /// [`reap`], not here.
-fn live_candidate_pids() -> Vec<libc::pid_t> {
+fn live_candidate_pids(accepted: &[String]) -> Vec<libc::pid_t> {
     // SAFETY: `getuid` takes no arguments and cannot fail.
     let my_uid = unsafe { libc::getuid() };
     let mut results = Vec::new();
@@ -174,12 +181,20 @@ fn live_candidate_pids() -> Vec<libc::pid_t> {
         }
         // `pbi_comm` is a fixed C-string buffer (MAXCOMLEN = 16). `/bin/zsh`'s
         // truncated kernel comm is exactly "zsh".
-        if comm_name(&info.pbi_comm) != "zsh" {
+        if !comm_accepted(accepted, &comm_name(&info.pbi_comm)) {
             continue;
         }
         results.push(pid);
     }
     results
+}
+
+/// Whether a process's kernel comm name is one Nice's reaper will consider.
+/// Exact match, never a prefix or pattern — the comm is already
+/// MAXCOMLEN-truncated on both sides, and a looser match is how a reaper starts
+/// killing processes it does not own.
+fn comm_accepted(accepted: &[String], comm: &str) -> bool {
+    accepted.iter().any(|a| a == comm)
 }
 
 /// Read a fixed C-char comm buffer up to its first NUL into a `String`.
@@ -498,6 +513,31 @@ mod tests {
         );
         assert_eq!(reap(&env), 0);
         assert!(killed.borrow().is_empty());
+    }
+
+    // MARK: - comm prefilter
+
+    /// The prefilter admits exactly the caller's comm names — the bootstrap
+    /// passes the registry union plus the active profile's own comm
+    /// ([`crate::shell::reaper_comm_names`]); this proves which shells a given
+    /// set covers.
+    #[test]
+    fn comm_accepted_matches_the_set_exactly() {
+        let zsh_only = vec!["zsh".to_string()];
+        assert!(comm_accepted(&zsh_only, "zsh"));
+        assert!(!comm_accepted(&zsh_only, "bash"));
+        // No prefix / substring matching: a reaper that fuzzy-matches comm names
+        // eventually SIGKILLs something it does not own.
+        assert!(!comm_accepted(&zsh_only, "zsh-5.9"));
+        assert!(!comm_accepted(&zsh_only, "z"));
+        assert!(!comm_accepted(&zsh_only, ""));
+
+        let union = vec!["zsh".to_string(), "fish".to_string()];
+        assert!(comm_accepted(&union, "fish"));
+        assert!(comm_accepted(&union, "zsh"));
+        assert!(!comm_accepted(&union, "bash"));
+
+        assert!(!comm_accepted(&[], "zsh"), "an empty set admits nothing");
     }
 
     // MARK: - Live-enumeration regression guard

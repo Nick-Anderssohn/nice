@@ -52,7 +52,7 @@
 // slice 3 = bootstrap write-on-startup); the pure writer + guards below are
 // exercised by the in-crate tests and re-used by R21's live-retheme cache.
 // Matches the not-yet-fully-wired-module idiom used by `app_shell` /
-// `control_socket` / `shell_inject`.
+// `control_socket` / `shell::zsh`.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

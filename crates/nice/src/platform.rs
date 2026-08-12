@@ -1276,7 +1276,7 @@ pub fn main_bundle_name() -> Option<String> {
 /// session-store writer would rewrite the installed app's `sessions.json` /
 /// `ui_settings.json` under `~/Library/Application Support/Nice{,` Dev`}/`. The
 /// single source of truth for the folder used by [`crate::session_store`],
-/// `sort_settings_store`, `terminal_theme_catalog`, and `shell_inject`.
+/// `sort_settings_store`, `terminal_theme_catalog`, and `shell::zsh`.
 pub fn support_folder_name() -> String {
     main_bundle_name().unwrap_or_else(|| "Nice (unbundled)".to_string())
 }

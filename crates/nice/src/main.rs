@@ -95,11 +95,15 @@
 //!     `mpsc` → gpui foreground drain bridge (`CFRunLoopWakeUp`, AppNapSafe
 //!     shape). The window routing point lives on [`window_state`]; `app::run`
 //!     bootstrap wiring lands with the R14 env-injection slice.
-//!   * [`shell_inject`] — the R14 synthetic `ZDOTDIR` rc chain: the four FROZEN
-//!     stub bodies (`.zshenv`/`.zprofile`/`.zlogin`/`.zshrc` with the `claude()`
-//!     shadow + OSC 7 emitter + prefill tail), the self-healing stub writer, and
-//!     the per-variant Application Support location + `NICE_APPLICATION_SUPPORT_ROOT`
-//!     override seam (`app::run` bootstrap wiring lands later in R14).
+//!   * [`shell`] — the shell abstraction (`docs/design/shell-abstraction.md`):
+//!     the `ShellProfile` trait every supported shell implements, the §4
+//!     resolution chain behind the `ShellRuntime` global, the per-pane
+//!     `PaneShell` snapshot routing keys on, and the per-variant `shellrc/`
+//!     location + `NICE_APPLICATION_SUPPORT_ROOT` override seam. Its
+//!     [`shell::zsh`] submodule owns the R14 synthetic `ZDOTDIR` rc chain: the
+//!     four FROZEN stub bodies (`.zshenv`/`.zprofile`/`.zlogin`/`.zshrc` with
+//!     the `claude()` shadow + OSC 7 emitter + prefill tail) and the
+//!     self-healing stub writer.
 //!   * [`claude_hook_installer`] — the R16 Claude `SessionStart` hook installer:
 //!     the FROZEN socket-client script body (byte-for-byte with the Swift
 //!     installer, installed at `~/.nice/nice-claude-hook.sh`, mode 0755) + the
@@ -159,7 +163,7 @@ mod session_store;
 mod settings;
 mod settings_import;
 mod sf_symbols;
-mod shell_inject;
+mod shell;
 mod shell_socket_live;
 mod shortcuts_store;
 mod sidebar_actions;

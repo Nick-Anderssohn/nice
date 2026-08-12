@@ -762,7 +762,7 @@ impl CompFixture {
             std::fs::create_dir_all(d)?;
         }
         // The R14 ZDOTDIR blanked stub chain (a spec-wins rc chain — no user rc).
-        crate::shell_inject::write_stubs(&zdotdir)?;
+        crate::shell::zsh::write_stubs(&zdotdir)?;
         // A stub `claude` that idles — this leg never spawns Claude, but
         // NICE_CLAUDE_OVERRIDE must be set so nothing can reach the real binary.
         let bin = base.join("bin");

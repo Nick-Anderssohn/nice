@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::spawn::{build_argv, build_env, expand_tilde, SpawnSpec, ZSH_PATH};
+use crate::spawn::{build_env, expand_tilde, SpawnSpec};
 
 /// How long the detached escalation thread gives a hung-up child to die before
 /// escalating from SIGHUP to SIGKILL (mirrors `TabPtySession.terminatePane`'s
@@ -181,17 +181,32 @@ impl PtyProcess {
     ///
     /// Fork/exec sequence: `openpty` (with the initial winsize) → `fork` → in
     /// the child, `login_tty(slave)` (new session, controlling tty, dup to
-    /// 0/1/2) then `chdir(cwd)` then `execve(/bin/zsh, argv, env)`. All argv,
-    /// env, and cwd C strings are built **before** the fork; the child touches
-    /// only async-signal-safe calls, per the fork-in-a-multithreaded-process
-    /// rule.
+    /// 0/1/2) then `chdir(cwd)` then `execve(spec.argv[0], argv, env)`. All
+    /// argv, env, and cwd C strings are built **before** the fork; the child
+    /// touches only async-signal-safe calls, per the
+    /// fork-in-a-multithreaded-process rule.
+    ///
+    /// The spawn contract is "argv[0] is the program": this layer carries no
+    /// shell policy, it execs whatever [`SpawnSpec::argv`] holds — the zsh login
+    /// default from the constructors, or a shell profile's argv handed in by the
+    /// `nice` crate via `SpawnSpec::with_argv`.
     pub fn spawn(spec: &SpawnSpec) -> io::Result<PtyProcess> {
         // ---- Build everything the child needs BEFORE forking (no allocation
         // is permitted between fork and exec in a multithreaded process). ----
-        let program = cstr(ZSH_PATH)?;
-        let argv_owned: Vec<CString> = build_argv(spec.command.as_deref())
-            .into_iter()
-            .map(|a| cstr(&a))
+        // An empty argv names no program. Refuse it here rather than indexing
+        // into it: a caller bug must surface as an error, never as a panic on
+        // the fork path.
+        let Some(program_path) = spec.argv.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SpawnSpec.argv is empty (argv[0] is the program)",
+            ));
+        };
+        let program = cstr(program_path)?;
+        let argv_owned: Vec<CString> = spec
+            .argv
+            .iter()
+            .map(|a| cstr(a))
             .collect::<io::Result<_>>()?;
         let mut argv_ptrs: Vec<*const libc::c_char> =
             argv_owned.iter().map(|c| c.as_ptr()).collect();

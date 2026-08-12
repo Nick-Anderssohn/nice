@@ -126,6 +126,46 @@ fn injected_env_is_visible_to_wrapped_command() {
 }
 
 #[test]
+fn overridden_argv_is_what_gets_exec_d() {
+    // `with_argv` is the seam the `nice` crate's shell profiles use: the spec's
+    // `command` stays the display string while the argv is the exec truth.
+    // Prove it end-to-end against a real spawn — a /bin/sh argv rather than the
+    // zsh default, printing a marker only the overridden argv can produce.
+    let marker = format!("NICE_ARGVOK_{}", std::process::id());
+    let spec = SpawnSpec::command("never-run-this", "/tmp")
+        .with_env(test_env())
+        .with_argv(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo {marker}"),
+        ]);
+    let pty = PtyProcess::spawn(&spec).expect("spawn overridden-argv pane");
+    let drain = Drain::start(pty.master_fd());
+
+    let status = pty
+        .wait_timeout(Duration::from_secs(15))
+        .expect("overridden-argv child did not exit within timeout");
+    let output = String::from_utf8_lossy(&drain.join()).into_owned();
+
+    assert_eq!(status.code(), Some(0), "the /bin/sh argv should exit cleanly");
+    assert!(
+        output.contains(&marker),
+        "the overridden argv never ran; got: {output:?}"
+    );
+}
+
+#[test]
+fn empty_argv_is_an_error_not_a_panic() {
+    // A caller bug (an empty profile-built argv) must surface as InvalidInput
+    // from spawn, never as an index panic on the fork path.
+    let spec = SpawnSpec::shell("/tmp").with_argv(Vec::new());
+    match PtyProcess::spawn(&spec) {
+        Ok(_) => panic!("an empty argv must not spawn a child"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+    }
+}
+
+#[test]
 fn command_exit_status_is_reaped() {
     // A command that exits 3 must be reaped with the recorded exit code — no
     // grid needed, this is a pure process-level status assertion.

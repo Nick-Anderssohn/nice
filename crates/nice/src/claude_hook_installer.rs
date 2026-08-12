@@ -408,7 +408,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    // ---- temp-dir plumbing (mirrors shell_inject.rs) -----------------------
+    // ---- temp-dir plumbing (mirrors `shell/zsh.rs`) -----------------------
 
     /// A throwaway directory removed on drop. A panicking assertion leaves it
     /// behind, which is harmless.

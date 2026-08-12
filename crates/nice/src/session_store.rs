@@ -478,7 +478,7 @@ fn writer_loop(shared: Arc<Shared>) {
 
 /// Application-support root: `NICE_APPLICATION_SUPPORT_ROOT` when set (tests /
 /// scenarios redirect state into a sandbox), else `~/Library/Application
-/// Support`. Resolved only in `app::run` (the `shell_inject.rs` convention) —
+/// Support`. Resolved only in `app::run` (the `shell::zsh` convention) —
 /// never in a test or `run_selftest`. `pub` so [`crate::rename_migration`]
 /// resolves the same root for its one-time folder move.
 pub fn support_root() -> PathBuf {

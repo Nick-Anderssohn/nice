@@ -2,7 +2,7 @@
 //! transport gate.
 //!
 //! Where the ported unit suites pin the pure pieces (the frozen rc-stub text +
-//! real-zsh chain in [`crate::shell_inject`], the socket parse/normalization +
+//! real-zsh chain in [`crate::shell::zsh`], the socket parse/normalization +
 //! self-healing in [`crate::control_socket`], the spec-wins env merge + the
 //! per-mode env matrix in [`crate::pty_manager`]), this scenario drives the
 //! **whole transport end to end** on a real pty: it spawns real login shells
@@ -156,7 +156,7 @@ impl Fixture {
 
         // The ZDOTDIR: write the FROZEN stubs by calling the R14 writer directly
         // against this temp path (never the real Application Support location).
-        crate::shell_inject::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
+        crate::shell::zsh::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
 
         Ok(Fixture {
             home,
@@ -222,12 +222,16 @@ async fn run_shell_socket(
         crate::app::arm_window_control_socket(
             s,
             cx,
-            Some(zdotdir),
+            // The zsh profile's injection pairs, spelled out rather than resolved:
+            // this scenario drives zsh fixture stubs by design (design §10).
             // Nice inherited no ZDOTDIR in this fixture → NICE_USER_ZDOTDIR is
             // injected as the empty string (the .zshenv stub then discovers the
             // user's intended layout by sourcing the fixture ~/.zshenv, absent here,
             // so it resolves to $HOME = the fake home).
-            None,
+            vec![
+                ("ZDOTDIR".to_string(), zdotdir),
+                ("NICE_USER_ZDOTDIR".to_string(), String::new()),
+            ],
             Some(HEALTH_INTERVAL),
         )
     });

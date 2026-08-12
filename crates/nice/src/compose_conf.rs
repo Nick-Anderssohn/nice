@@ -10,7 +10,7 @@
 //! or model switch takes effect on the next ⌘↩ with no relaunch.
 //!
 //! Shape (all keys flat, Nice-controlled, no escapes — the zsh side parses with
-//! plain parameter surgery, see `shell_inject.rs` `_nice_compose_conf_get`):
+//! plain parameter surgery, see `shell/scripts/zsh/zshrc.zsh`'s `_nice_compose_conf_get`):
 //!
 //! ```json
 //! {"accent":"#c96442","model":"sonnet","effort":"medium"}
@@ -73,7 +73,7 @@ fn render(accent_hex: &str, model: &str, effort: &str) -> String {
 }
 
 /// Extract `key`'s string value from a conf blob — the Rust mirror of the zsh
-/// `_nice_compose_conf_get` parser (the two must agree; the shell_inject static
+/// `_nice_compose_conf_get` parser (the two must agree; the `shell::zsh` static
 /// test pins the zsh side against this shape). `None` when the key is absent.
 pub(crate) fn parse_value(blob: &str, key: &str) -> Option<String> {
     let marker = format!("\"{key}\":\"");
@@ -153,7 +153,7 @@ pub(crate) fn set_effort(cx: &mut App, effort: &str) {
 }
 
 /// Atomic write: temp sibling + rename (same discipline as
-/// `shell_inject::write_atomic` — a pty child mid-read never sees a torn file).
+/// `shell::zsh::write_atomic` — a pty child mid-read never sees a torn file).
 fn write_atomic(path: &std::path::Path, contents: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;

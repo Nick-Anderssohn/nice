@@ -1,18 +1,26 @@
-//! Spawn spec + the pure projections that feed the pty layer: the arg list
-//! handed to `/bin/zsh`, tilde expansion of the cwd, and the injected
-//! environment. Ports the PROTECTED spawn contract from
+//! Spawn spec + the pure projections that feed the pty layer: the argv handed
+//! to `execve`, tilde expansion of the cwd, and the injected environment. Ports
+//! the PROTECTED spawn contract from
 //! `Sources/Nice/Process/TabPtySession.swift` (`buildExecArgs`, `buildEnv`,
 //! `expandTilde`) — behavior, not structure.
+//!
+//! This crate is shell-policy-free (`docs/design/shell-abstraction.md` §8): a
+//! spec carries a **prebuilt argv** and the pty layer execs it verbatim. The
+//! convenience constructors default that argv to the historical zsh login shell
+//! so hermetic term-core tests, itest fixtures, and scenarios keep spawning
+//! exactly what they always did; production Nice overrides it via
+//! [`SpawnSpec::with_argv`] from the active shell profile.
 
-/// The login shell every pane runs. zsh is assumed throughout, exactly as in
-/// today's Nice (`TabPtySession.swift` hardcodes `/bin/zsh`; there is no shell
-/// profiles feature).
+/// The login shell the default argv runs. Retained as the shell-agnostic
+/// crate's *default* (not its policy): the `nice` crate's shell profiles decide
+/// what production panes exec, and every caller that has not been routed through
+/// a profile — hermetic tests, itest fixtures — still gets this.
 pub const ZSH_PATH: &str = "/bin/zsh";
 
 /// How a pane's child process is launched.
 ///
-/// - `command == None` → a plain **login + interactive** zsh (`-il`): the
-///   user's PATH/rc are honored and the pane renders a shell prompt.
+/// - `command == None` → a plain **login + interactive** shell (zsh `-il` by
+///   default): the user's PATH/rc are honored and the pane renders a prompt.
 /// - `command == Some(cmd)` → the login shell replaces itself with `cmd` via
 ///   `zsh -ilc "exec <cmd>"`, so rc files still run first (PATH parity) but
 ///   quitting the command closes the pty (matching the pane lifecycle) and
@@ -24,6 +32,10 @@ pub const ZSH_PATH: &str = "/bin/zsh";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnSpec {
     /// `None` = shell-only (`-il`); `Some(cmd)` = `-ilc "exec <cmd>"`.
+    ///
+    /// Display/launch-overlay source of truth. It does NOT drive the exec —
+    /// [`argv`](Self::argv) does. A caller that overrides the argv must build it
+    /// from this same string (see [`with_argv`](Self::with_argv)).
     pub command: Option<String>,
     /// Working directory. Tilde-expanded (`~`, `~/…`) at spawn time.
     pub cwd: String,
@@ -34,6 +46,12 @@ pub struct SpawnSpec {
     pub rows: u16,
     /// Initial pty width in character cells.
     pub cols: u16,
+    /// The full argv (argv\[0\] = the program) `execve`d for this spec — the
+    /// exec truth. Defaults to [`build_argv`] over
+    /// [`command`](Self::command) (the zsh login shape); production Nice
+    /// replaces it with the active shell profile's argv via
+    /// [`with_argv`](Self::with_argv). Must never be empty.
+    pub argv: Vec<String>,
 }
 
 /// Parity default terminal size (SwiftTerm's classic 80x24). Callers that care
@@ -42,7 +60,9 @@ const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 
 impl SpawnSpec {
-    /// A shell-only pane (`zsh -il`) rooted at `cwd`.
+    /// A shell-only pane rooted at `cwd`. The default argv is a zsh login shell
+    /// (`/bin/zsh -il`); production Nice overrides it via
+    /// [`with_argv`](Self::with_argv) from the active shell profile.
     pub fn shell(cwd: impl Into<String>) -> Self {
         Self {
             command: None,
@@ -50,23 +70,47 @@ impl SpawnSpec {
             env: Vec::new(),
             rows: DEFAULT_ROWS,
             cols: DEFAULT_COLS,
+            argv: build_argv(None),
         }
     }
 
-    /// A command pane: `zsh -ilc "exec <command>"` rooted at `cwd`.
+    /// A command pane rooted at `cwd`. The default argv is a zsh login shell
+    /// running the command (`/bin/zsh -ilc "exec <command>"`); production Nice
+    /// overrides it via [`with_argv`](Self::with_argv).
     pub fn command(command: impl Into<String>, cwd: impl Into<String>) -> Self {
+        let command = command.into();
+        let argv = build_argv(Some(&command));
         Self {
-            command: Some(command.into()),
+            command: Some(command),
             cwd: cwd.into(),
             env: Vec::new(),
             rows: DEFAULT_ROWS,
             cols: DEFAULT_COLS,
+            argv,
         }
     }
 
     /// Set the injected env pairs (builder style).
     pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Replace the argv `execve`s for this spec (builder style) — how the `nice`
+    /// crate hands term-core a shell profile's argv without term-core knowing
+    /// any shell's dialect.
+    ///
+    /// **Invariant:** build `argv` from the spec's own
+    /// [`command`](Self::command). The `command` stays the display/launch-overlay
+    /// source of truth while the argv is the exec truth, and a pane whose overlay
+    /// advertises one command while its child runs another is a bug with no
+    /// visible symptom until the pane exits.
+    ///
+    /// An empty `argv` is rejected at spawn time
+    /// ([`PtyProcess::spawn`](crate::PtyProcess::spawn) returns `InvalidInput`),
+    /// never at exec.
+    pub fn with_argv(mut self, argv: Vec<String>) -> Self {
+        self.argv = argv;
         self
     }
 
@@ -94,10 +138,12 @@ pub fn build_exec_args(command: Option<&str>) -> Vec<String> {
     }
 }
 
-/// The full argv handed to `execve` for a spec: `[ZSH_PATH, <exec args…>]`.
-/// argv[0] is the plain executable path (no leading-dash login convention —
-/// login-ness comes from the `-l` flag, matching `execName: nil` in
-/// `TabPtySession.addTerminalPane`).
+/// The DEFAULT argv for a spec: `[ZSH_PATH, <exec args…>]`. argv[0] is the plain
+/// executable path (no leading-dash login convention — login-ness comes from the
+/// `-l` flag, matching `execName: nil` in `TabPtySession.addTerminalPane`).
+///
+/// This is what [`SpawnSpec::shell`] / [`SpawnSpec::command`] store on the spec;
+/// [`SpawnSpec::with_argv`] replaces it for callers that resolve their own shell.
 pub fn build_argv(command: Option<&str>) -> Vec<String> {
     let mut argv = Vec::with_capacity(3);
     argv.push(ZSH_PATH.to_string());

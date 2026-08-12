@@ -101,7 +101,7 @@ impl Fixture {
             std::fs::create_dir_all(d).context("create fixture dir")?;
         }
         // The R14 ZDOTDIR blanked stub chain (a spec-wins rc chain — no user rc).
-        crate::shell_inject::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
+        crate::shell::zsh::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
 
         // A stub `claude` that idles — this scenario never spawns Claude, but
         // NICE_CLAUDE_OVERRIDE must be set so no leg can reach the real binary.

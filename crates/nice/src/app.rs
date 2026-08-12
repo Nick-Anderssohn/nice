@@ -43,6 +43,7 @@ use nice_theme::color::Srgba;
 use nice_theme::palette::SlotColor;
 use nice_theme::AccentPreset;
 
+use crate::shell::{InjectPaths, ShellRuntime, UserShellEnv};
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
@@ -789,7 +790,7 @@ fn should_offer_handoff_prompt() -> bool {
 
 /// Pure gate logic for [`should_offer_handoff_prompt`], split out so the unit test
 /// drives it directly without mutating process env (which would race the parallel
-/// `shell_inject` tests reading `NICE_APPLICATION_SUPPORT_ROOT`).
+/// `shell::zsh` tests reading `NICE_APPLICATION_SUPPORT_ROOT`).
 fn should_offer_handoff_prompt_from(support_root_set: bool, force_prompt_set: bool) -> bool {
     !support_root_set || force_prompt_set
 }
@@ -1176,13 +1177,17 @@ pub fn run() {
         crate::keymap::rebuild_keymap(cx);
         // R14: the process-wide shell-injection bootstrap — app::run ONLY (NEVER
         // run_selftest, so the regression suite never writes real user files, per
-        // the tranche-3 hermeticity rule). Order (Swift NiceServices.bootstrap):
-        // sweep stale $TMPDIR debris → write the ZDOTDIR stubs (overwrite-always
-        // self-heal; a write failure ⇒ zdotdir None and windows still get
-        // NICE_SOCKET) → capture Nice's own inherited ZDOTDIR before any pty child
-        // sees our override. The captured config becomes an app global so every
-        // window (the first + every ⌘N) threads the same zdotdir / user-zdotdir
-        // into its PtyManager's shell env.
+        // the tranche-3 hermeticity rule). Order: resolve the active shell profile
+        // (the design §4 chain) + capture Nice's own inherited ZDOTDIR before any
+        // pty child sees our override + write that profile's rc files under
+        // shellrc/<shell>/ (overwrite-always self-heal; a write failure ⇒ inject
+        // None and windows still get NICE_SOCKET) + install the ShellRuntime app
+        // global → sweep stale $TMPDIR debris → reap orphan shells matched on the
+        // comm-name union → kick off the claude probe through the profile's own
+        // probe argv. Resolution goes FIRST because both the reaper and the probe
+        // read the runtime. That ShellRuntime global is what every window (the
+        // first + every ⌘N) reads for the inject_pairs it threads into its
+        // PtyManager's shell env.
         install_shell_inject_bootstrap(cx);
         // R16: install (or refresh) the Claude Code SessionStart hook — the
         // frozen socket-client script at ~/.nice/nice-claude-hook.sh (mode 0755)
@@ -1347,24 +1352,7 @@ pub fn run() {
     });
 }
 
-/// Process-wide shell-injection config, captured once by [`run`]'s bootstrap and
-/// read by every [`open_managed_window`] (the first window and every ⌘N). UNSET
-/// under [`run_selftest`] — the launch-time writers never run there (hermeticity),
-/// so a scenario opening through `open_managed_window` gets a socket-only window
-/// env (no real `ZDOTDIR` override; the shells read the user's real rc directly,
-/// exactly as before R14).
-struct ShellInjectConfig {
-    /// The synthetic rc-chain directory (`ZDOTDIR`), or `None` if the stub write
-    /// failed. Threaded into every window's `PtyManager` shell env.
-    zdotdir: Option<String>,
-    /// Nice's own inherited `ZDOTDIR` (the value for `NICE_USER_ZDOTDIR`), captured
-    /// before any pty child sees our override. `None` when Nice inherited none.
-    user_zdotdir: Option<String>,
-}
-
-impl Global for ShellInjectConfig {}
-
-/// Scenario-only seam (R17 `claude-e2e`): install a [`ShellInjectConfig`] so the
+/// Scenario-only seam (R17 `claude-e2e`): install a [`ShellRuntime`] so the
 /// SHIPPED window built by [`open_managed_window`] forks its Main window WITH the
 /// synthetic `ZDOTDIR` rc chain (the `claude()` shadow) — the `claude-e2e` scenario
 /// needs a live shadow in the real Main window to drive the typed handshake, and
@@ -1372,15 +1360,24 @@ impl Global for ShellInjectConfig {}
 /// (hermeticity). The scenario points `zdotdir` at a stub-written FIXTURE dir (never
 /// the real Application Support location) and resets it to `(None, None)` at
 /// teardown so the later `multiwindow` scenario's windows fork socket-only, exactly
-/// as before.
+/// as before — a runtime whose `inject` is `None`, which degrades the window env to
+/// the same pairs it always did.
+///
+/// Scenarios drive zsh fixtures by design (design §10), so the runtime this
+/// installs is always a [`ZshProfile`](crate::shell::zsh::ZshProfile) at the
+/// historical `/bin/zsh`.
 pub(crate) fn set_scenario_shell_inject_config(
     cx: &mut App,
     zdotdir: Option<String>,
     user_zdotdir: Option<String>,
 ) {
-    cx.set_global(ShellInjectConfig {
-        zdotdir,
-        user_zdotdir,
+    cx.set_global(ShellRuntime {
+        profile: Box::new(crate::shell::zsh::ZshProfile::new(nice_term_core::ZSH_PATH)),
+        inject: zdotdir.map(|dir| InjectPaths {
+            dir: dir.into(),
+            rcfile: None,
+        }),
+        user_env: UserShellEnv { user_zdotdir },
     });
 }
 
@@ -1388,36 +1385,37 @@ pub(crate) fn set_scenario_shell_inject_config(
 /// Runs from [`run`] ONLY — never [`run_selftest`], so the regression suite never
 /// writes real user files. See the call site for the ordering rationale.
 fn install_shell_inject_bootstrap(cx: &mut App) {
-    // 1. Sweep stale $TMPDIR debris (crashed-run `nice-*.sock` + legacy
+    // 1. Resolve the active shell, capture the user-side env, write that
+    //    profile's rc files, install the ShellRuntime global (design §4 puts
+    //    resolution at the TOP — the reaper and the claude probe both consume
+    //    it). The rc write moved inside the installer: it touches Application
+    //    Support only, so its order against the sweep/reaper is not load-bearing.
+    //    `advanced.shell` comes from the SettingsPrefsStore global, installed
+    //    earlier in `run` (before this bootstrap runs — see that call site).
+    let shell_setting = cx
+        .global::<crate::settings::prefs_store::SettingsPrefsStore>()
+        .shell_setting();
+    crate::shell::install_shell_runtime(cx, &shell_setting);
+    // 2. Sweep stale $TMPDIR debris (crashed-run `nice-*.sock` + legacy
     //    `nice-zdotdir-*` dirs) whose owning pid is gone. Cross-app safe: a live
     //    sibling's debris is kept (pid-liveness rule).
     crate::tmp_sweep::sweep_stale_temp_files();
-    // R15 (C12): reap zsh orphaned by prior crashes / SIGKILLs BEFORE any new window
-    // spawns, so we don't inherit a starved pty table (macOS caps kern.tty.ptmx_max
-    // at 511). Match = PPID==1 & uid==me & comm=="zsh" & env has NICE_TAB_ID=; never
-    // name-pattern matching. Best-effort + synchronous; `run_selftest` never runs it.
-    let reaped = crate::orphan_reaper::reap(&crate::orphan_reaper::ReaperEnv::live());
+    // 3. R15 (C12): reap shells orphaned by prior crashes / SIGKILLs BEFORE any new
+    // window spawns, so we don't inherit a starved pty table (macOS caps
+    // kern.tty.ptmx_max at 511). Match = PPID==1 & uid==me & comm in the accepted
+    // set & env has NICE_TAB_ID=; never name-pattern matching. The accepted set is
+    // every shell Nice ships a profile for PLUS the active profile's own comm, so
+    // shells orphaned by a prior run under a DIFFERENT shell setting are still
+    // caught (design §7). Best-effort + synchronous; `run_selftest` never runs it.
+    let accepted =
+        crate::shell::reaper_comm_names(cx.global::<ShellRuntime>().profile.comm_name());
+    let reaped = crate::orphan_reaper::reap(&crate::orphan_reaper::ReaperEnv::live(accepted));
     if reaped > 0 {
-        eprintln!("nice: reaped {reaped} orphan zsh shell(s) from prior runs");
+        // No shell named: the accepted set spans several, and which one each
+        // orphan ran is not worth reporting.
+        eprintln!("nice: reaped {reaped} orphan shell(s) from prior runs");
     }
-    // 2. Write the ZDOTDIR stubs (overwrite-always self-heal). A write failure is
-    //    non-fatal: zdotdir stays None and windows still get NICE_SOCKET.
-    let zdotdir = match crate::shell_inject::write_stubs(&crate::shell_inject::default_location()) {
-        Ok(path) => Some(path.to_string_lossy().into_owned()),
-        Err(e) => {
-            eprintln!("nice: ZDOTDIR inject failed: {e} (windows still get NICE_SOCKET)");
-            None
-        }
-    };
-    // 3. Capture Nice's own inherited ZDOTDIR from the process env, BEFORE any pty
-    //    child inherits our override (read straight from the env so this works even
-    //    if the stub write failed — a window still benefits from NICE_USER_ZDOTDIR).
-    let user_zdotdir = std::env::var("ZDOTDIR").ok();
-    cx.set_global(ShellInjectConfig {
-        zdotdir,
-        user_zdotdir,
-    });
-    // 4. Kick off the C11 claude-binary probe (last, per the sweep→reap→zdotdir→
+    // 4. Kick off the C11 claude-binary probe (last, per the sweep→reap→shell→
     //    probe ordering). Delivers to a process-global the Claude spawn path reads.
     kickoff_claude_probe(cx);
 }
@@ -1438,26 +1436,35 @@ fn kickoff_claude_probe(cx: &mut App) {
             return;
         }
     }
+    // The active profile decides how a probe loads the user's PATH; read it on
+    // the foreground (globals are not reachable from the background executor).
+    // For zsh this is the historical `/bin/zsh -ilc <cmd>`, byte for byte.
+    let argv = cx
+        .global::<ShellRuntime>()
+        .profile
+        .probe_argv(CLAUDE_PROBE_COMMAND);
     cx.spawn(async move |acx: &mut AsyncApp| {
         let resolved = acx
             .background_executor()
-            .spawn(async { run_which_claude() })
+            .spawn(async move { run_which_claude(&argv) })
             .await;
         let _ = acx.update(|app| app.set_global(ResolvedClaudePath(resolved)));
     })
     .detach();
 }
 
-/// Run `/bin/zsh -ilc 'command -v -- claude'` and return the absolute path if
-/// found — Swift `NiceServices.runWhich` (`NiceServices.swift:427-446`). A
-/// login-interactive shell so the user's `.zshenv`/`.zshrc` PATH additions are
-/// honored (Nice launched from Finder/Spotlight otherwise inherits only the macOS
-/// default PATH). Accepts only exit-0 stdout that trims to an absolute path.
-fn run_which_claude() -> Option<String> {
-    let out = std::process::Command::new("/bin/zsh")
-        .args(["-ilc", "command -v -- claude"])
-        .output()
-        .ok()?;
+/// The one-shot the claude probe runs in a login-interactive shell.
+const CLAUDE_PROBE_COMMAND: &str = "command -v -- claude";
+
+/// Run the active profile's probe argv (zsh: `/bin/zsh -ilc 'command -v --
+/// claude'`) and return the absolute path if found — Swift
+/// `NiceServices.runWhich` (`NiceServices.swift:427-446`). A login-interactive
+/// shell so the user's rc-file PATH additions are honored (Nice launched from
+/// Finder/Spotlight otherwise inherits only the macOS default PATH). Accepts only
+/// exit-0 stdout that trims to an absolute path.
+fn run_which_claude(argv: &[String]) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let out = std::process::Command::new(program).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1474,8 +1481,8 @@ fn run_which_claude() -> Option<String> {
 /// the window's [`PtyManager`] — the Rust twin of Swift
 /// `SessionsModel.bootstrapSocket` + `startSocketListener`. Must run BEFORE the
 /// window's Main window forks (the "env before fork" invariant: the window inherits
-/// `NICE_SOCKET` / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch, or the `claude()`
-/// shadow can't reach us). Shared by [`open_managed_window`] (production) and the
+/// `NICE_SOCKET` and the shell profile's `inject_pairs` from launch, or the
+/// `claude()` shadow can't reach us). Shared by [`open_managed_window`] (production) and the
 /// `shell-socket` scenario, so both wire the socket identically.
 ///
 /// The socket path is minted first (two-phase, no bind yet) so it can ride pty env
@@ -1490,8 +1497,7 @@ fn run_which_claude() -> Option<String> {
 pub(crate) fn arm_window_control_socket(
     ws: &mut WindowState,
     cx: &mut Context<WindowState>,
-    zdotdir: Option<String>,
-    user_zdotdir: Option<String>,
+    inject_pairs: Vec<(String, String)>,
     health_interval: Option<Duration>,
 ) -> String {
     use crate::control_socket::{socket_channel, NiceControlSocket};
@@ -1507,8 +1513,7 @@ pub(crate) fn arm_window_control_socket(
     // Set the window's shell-injection env BEFORE the caller forks the Main window.
     ws.ptys.set_window_shell_env(WindowShellEnv {
         socket_path: Some(socket_path.clone()),
-        zdotdir,
-        user_zdotdir,
+        inject_pairs,
         compose_conf: Some(
             crate::compose_conf::default_path()
                 .to_string_lossy()
@@ -1642,24 +1647,30 @@ pub(crate) fn open_managed_window_with(
     };
 
     // R14: mint + arm this window's control socket and set its shell-injection env
-    // BEFORE the Main window forks (env-before-fork). The zdotdir / user-zdotdir come
-    // from the process-wide bootstrap config, which is UNSET under run_selftest —
-    // a scenario opening through here gets a socket-only window env (no real
-    // ZDOTDIR override), so its shells behave exactly as before R14.
-    let (zdotdir, user_zdotdir) = cx
-        .try_global::<ShellInjectConfig>()
-        .map(|c| (c.zdotdir.clone(), c.user_zdotdir.clone()))
-        .unwrap_or((None, None));
+    // BEFORE the Main window forks (env-before-fork). The injection pairs come from
+    // the active shell profile in the process-wide ShellRuntime, which is UNSET
+    // under run_selftest — a scenario opening through here gets a socket-only window
+    // env (no rc injection), so its shells behave exactly as before R14.
+    let inject_pairs = cx
+        .try_global::<ShellRuntime>()
+        .map(crate::shell::window_inject_pairs)
+        .unwrap_or_default();
     state.update(cx, |ws, cx| {
-        arm_window_control_socket(ws, cx, zdotdir, user_zdotdir, None);
+        arm_window_control_socket(ws, cx, inject_pairs, None);
     });
 
     if let Some((session_id, term_window_id)) = main {
+        // The Main window is a normal pane: injected, and its argv comes from the
+        // active shell profile (the historical `zsh -il` / `zsh -ilc "exec …"`
+        // while resolution is pinned to zsh).
         let spec = match std::env::var("NICE_COMMAND") {
             // A one-off command window (the live-smoke path: `ls -la`, colour tests).
-            Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
-            // The default: an interactive login shell (`zsh -il`).
-            _ => SpawnSpec::shell(cwd.clone()),
+            Ok(cmd) if !cmd.trim().is_empty() => {
+                let argv = crate::shell::spawn_argv(cx, true, Some(&cmd));
+                SpawnSpec::command(cmd, cwd.clone()).with_argv(argv)
+            }
+            // The default: an interactive login shell.
+            _ => SpawnSpec::shell(cwd.clone()).with_argv(crate::shell::spawn_argv(cx, true, None)),
         }
         .with_size(LIVE_ROWS, LIVE_COLS);
         state.update(cx, |ws, cx| ws.ptys.spawn_window(&session_id, &term_window_id, spec, cx))?;
@@ -4379,13 +4390,31 @@ pub fn run_selftest(selector: String) {
 mod tests {
     use super::*;
 
+    /// The probe's argv now comes from the active profile. Pin that routing it
+    /// through zsh reproduces the historical command byte for byte — the probe
+    /// is what decides whether a Claude window runs claude or degrades to a
+    /// shell, so a changed spelling is silent and expensive.
+    #[test]
+    fn claude_probe_argv_for_zsh_is_the_historical_command() {
+        use crate::shell::ShellProfile;
+        let profile = crate::shell::zsh::ZshProfile::new(nice_term_core::ZSH_PATH);
+        assert_eq!(
+            profile.probe_argv(CLAUDE_PROBE_COMMAND),
+            vec![
+                "/bin/zsh".to_string(),
+                "-ilc".to_string(),
+                "command -v -- claude".to_string()
+            ]
+        );
+    }
+
     #[test]
     fn first_launch_prompt_gate_suppresses_under_support_root_override() {
         // Swift `shouldSuppressFirstLaunchPrompt` parity: the shipped app (neither
         // var set) offers; a harness redirecting Application Support
         // (`NICE_APPLICATION_SUPPORT_ROOT` set) suppresses UNLESS it also opts back
         // in via `NICE_FORCE_FIRST_LAUNCH_PROMPT`. Driven through the pure inner
-        // helper so no process-env mutation races the parallel `shell_inject` tests.
+        // helper so no process-env mutation races the parallel `shell::zsh` tests.
         assert!(
             should_offer_handoff_prompt_from(false, false),
             "shipped app (no overrides) offers the prompt"

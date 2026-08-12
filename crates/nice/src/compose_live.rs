@@ -8,9 +8,9 @@
 //!
 //! * the Nice-side gate + byte routing — `WindowState::compose_route`'s truth
 //!   table + the itests keymap dispatch (⌘↩ → the window-scoped handler);
-//! * the widget's translate/strip/conf functions — `shell_inject`'s real-zsh
+//! * the widget's translate/strip/conf functions — `shell::zsh`'s real-zsh
 //!   e2e tests (stdin piping, conf flags, fence strip, parser agreement);
-//! * the trigger byte/text agreement — `shell_inject`'s static pins.
+//! * the trigger byte/text agreement — `shell::zsh`'s static pins.
 //!
 //! So THIS scenario drives the pty with [`COMPOSE_TRIGGER_SEQ`] exactly as
 //! `dispatch_command_compose`'s `Trigger` route does (standing up a full
@@ -42,7 +42,7 @@ use nice_term_view::{
 };
 use nice_theme::AccentPreset;
 
-use crate::shell_inject::COMPOSE_TRIGGER_SEQ;
+use crate::shell::COMPOSE_TRIGGER_SEQ;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
@@ -108,7 +108,7 @@ fn prepare_scratch() -> Result<(PathBuf, PathBuf, String)> {
     let _ = std::fs::remove_dir_all(&base);
     let home = base.join("home");
     std::fs::create_dir_all(&home)?;
-    crate::shell_inject::write_stubs(&base.join("zdotdir"))?;
+    crate::shell::zsh::write_stubs(&base.join("zdotdir"))?;
 
     let bin = base.join("bin");
     std::fs::create_dir_all(&bin)?;

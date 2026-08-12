@@ -107,6 +107,7 @@ use nice_model::{TermWindow, TermWindowKind, SidebarSessionSelection, Session, W
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{TerminalEvent, TerminalSessionHandle, DEFAULT_LAUNCH_OVERLAY_GRACE};
 
+use crate::shell::{PaneShell, PrefillStrategy};
 use crate::window_registry::WindowRegistry;
 
 /// Terminal-window pill titles clip at 40 chars so the toolbar pill never
@@ -198,6 +199,12 @@ pub(crate) struct RoutedExit {
 struct WindowPty {
     /// The `nice-term-view` adapter entity owning this window's `Session`.
     handle: Entity<TerminalSessionHandle>,
+    /// What this pane's shell actually is, captured from the active profile at
+    /// spawn ([`crate::shell::pane_shell`]). Runtime-only — never persisted, so a
+    /// restored pane respawns under the then-current profile. Routing reads this
+    /// and never the live profile: a mid-run shell change must not make Nice talk
+    /// to a running pane in a dialect it does not speak.
+    shell: PaneShell,
 }
 
 /// The per-window pty/session manager. Session-keyed: each session maps to its live window
@@ -223,14 +230,12 @@ pub(crate) struct WindowShellEnv {
     /// the socket binds); a bind failure leaves it set so shells' `nc … -w 2`
     /// fails fast and falls back to direct `command claude`.
     pub(crate) socket_path: Option<String>,
-    /// `ZDOTDIR` — the synthetic rc-chain directory. `None` when the launch-time
-    /// stub write failed (windows still get `NICE_SOCKET`; they just source the
-    /// user's real rc directly).
-    pub(crate) zdotdir: Option<String>,
-    /// The value for `NICE_USER_ZDOTDIR`. `None` ⇒ the empty string is injected
-    /// (Nice inherited no `ZDOTDIR`); the empty/absent distinction is semantic
-    /// for the `.zshenv` stub's XDG discovery branch, so the var is ALWAYS set.
-    pub(crate) user_zdotdir: Option<String>,
+    /// The active shell profile's rc-injection pairs, built once at window
+    /// construction (`crate::shell::ShellProfile::inject_env`) and spliced into
+    /// every pty this window spawns. Shell-shaped and opaque here: zsh sends
+    /// `ZDOTDIR` + `NICE_USER_ZDOTDIR`, a shell that injects via argv sends
+    /// nothing. Empty ⇒ no rc injection (the pane sources the user's own rc).
+    pub(crate) inject_pairs: Vec<(String, String)>,
     /// `NICE_COMPOSE_CONF` — the Command Compose conf-file path the injected
     /// ZLE widget reads per compose (accent + `claude -p` flags). `None` ⇒ the
     /// var is not injected and the widget falls back to its built-in defaults.
@@ -1252,6 +1257,18 @@ impl PtyManager {
             .map(|session| session.handle.clone())
     }
 
+    /// What `(session_id, term_window_id)`'s pane actually runs, as captured at
+    /// its spawn — `None` for a window with no live pty (model-only or already
+    /// exited). The routing seam for everything that must not speak a dialect the
+    /// pane's shell does not: Command Compose reads `.compose` before writing any
+    /// trigger bytes.
+    pub(crate) fn pane_shell(&self, session_id: &str, term_window_id: &str) -> Option<PaneShell> {
+        self.sessions
+            .get(session_id)
+            .and_then(|windows| windows.get(term_window_id))
+            .map(|session| session.shell)
+    }
+
     /// Every `(session_id, term_window_id)` with a live window session right now — the
     /// enumeration the shipped window's subscribe-once sweep
     /// ([`crate::window_state::WindowState::subscribe_spawned_windows`]) walks to
@@ -1282,21 +1299,23 @@ impl PtyManager {
 
     /// Set this window's shell-injection env (Swift `SessionsModel.bootstrapSocket`).
     /// Called once at window construction, BEFORE the Main window forks, so every
-    /// pty spawned through [`spawn_window`](Self::spawn_window) inherits `NICE_SOCKET`
-    /// / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch (the "env before fork"
-    /// invariant the shell's `claude()` shadow depends on).
+    /// pty spawned through [`spawn_window`](Self::spawn_window) inherits
+    /// `NICE_SOCKET` and the profile's injection pairs from launch (the "env
+    /// before fork" invariant the shell's `claude()` shadow depends on).
     pub(crate) fn set_window_shell_env(&mut self, env: WindowShellEnv) {
         self.window_shell_env = Some(env);
     }
 
     /// The per-window terminal env pairs this window injects into every pty
-    /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` +
-    /// `ZDOTDIR` (each only when set) + `NICE_USER_ZDOTDIR` (ALWAYS, empty string
-    /// when Nice inherited none — the empty/absent distinction is semantic for the
-    /// `.zshenv` stub) + this window's `NICE_TAB_ID` / `NICE_PANE_ID` (the handshake
-    /// identity the `claude()` shadow includes in its socket payload). Empty when
-    /// the window bootstrapped no socket. Pure — no `cx`, so the env matrix is
-    /// unit-tested directly (Validation §3 b/c).
+    /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` (when
+    /// set) + the active profile's injection pairs (zsh: `ZDOTDIR` +
+    /// `NICE_USER_ZDOTDIR`) + this window's `NICE_TAB_ID` / `NICE_PANE_ID` (the
+    /// handshake identity the `claude()` shadow includes in its socket payload).
+    /// Empty when the window bootstrapped no socket. Pure — no `cx`, so the env
+    /// matrix is unit-tested directly (Validation §3 b/c).
+    ///
+    /// Everything shell-shaped rides `inject_pairs`; the rest is dialect-free
+    /// app↔shell interchange, so this stays shell-agnostic.
     fn session_window_env_pairs(&self, session_id: &str, term_window_id: &str) -> Vec<(String, String)> {
         let Some(env) = &self.window_shell_env else {
             return Vec::new();
@@ -1305,13 +1324,7 @@ impl PtyManager {
         if let Some(sp) = &env.socket_path {
             pairs.push(("NICE_SOCKET".to_string(), sp.clone()));
         }
-        if let Some(zp) = &env.zdotdir {
-            pairs.push(("ZDOTDIR".to_string(), zp.clone()));
-        }
-        pairs.push((
-            "NICE_USER_ZDOTDIR".to_string(),
-            env.user_zdotdir.clone().unwrap_or_default(),
-        ));
+        pairs.extend(env.inject_pairs.iter().cloned());
         if let Some(conf) = &env.compose_conf {
             pairs.push(("NICE_COMPOSE_CONF".to_string(), conf.clone()));
         }
@@ -1372,10 +1385,13 @@ impl PtyManager {
         if !self.event_wakes_enabled {
             handle.read(cx).set_event_wake_enabled(false);
         }
+        // The pane's shell snapshot, taken at spawn from the active profile (the
+        // one whose argv this spec carries) and never revisited.
+        let shell = crate::shell::pane_shell(cx);
         self.sessions
             .entry(session_id.to_string())
             .or_default()
-            .insert(term_window_id.to_string(), WindowPty { handle });
+            .insert(term_window_id.to_string(), WindowPty { handle, shell });
         Ok(())
     }
 
@@ -1607,14 +1623,10 @@ impl PtyManager {
         settings_path: Option<&str>,
         cx: &mut App,
     ) -> Result<()> {
-        // Window shell-injection facts (None on a manager that never armed a socket).
-        let (socket_path, zdotdir, user_zdotdir) = match &self.window_shell_env {
-            Some(env) => (
-                env.socket_path.clone(),
-                env.zdotdir.clone(),
-                env.user_zdotdir.clone(),
-            ),
-            None => (None, None, None),
+        // Window shell-injection facts (empty on a manager that never armed a socket).
+        let (socket_path, inject_pairs) = match &self.window_shell_env {
+            Some(env) => (env.socket_path.clone(), env.inject_pairs.clone()),
+            None => (None, Vec::new()),
         };
         // `NICE_CLAUDE_OVERRIDE` in the env means the wrapper owns the full argv —
         // suppress every Nice-injected flag (re-read here, the test seam).
@@ -1622,6 +1634,9 @@ impl PtyManager {
             .map(|v| !v.is_empty())
             .unwrap_or(false);
         let claude = resolve_claude_binary(cx);
+        // How this pane's shell takes a deferred-resume prefill line (zsh: the rc
+        // tail's `print -z`; a fallback shell: not at all).
+        let prefill = crate::shell::prefill_strategy(cx);
 
         let spec = if matches!(mode, ClaudeSessionMode::ResumeDeferred(_)) {
             let env = build_claude_extra_env(
@@ -1629,19 +1644,23 @@ impl PtyManager {
                 session_id,
                 term_window_id,
                 socket_path.as_deref(),
-                zdotdir.as_deref(),
-                user_zdotdir.as_deref(),
+                &inject_pairs,
+                prefill,
                 settings_path.map(str::to_string),
             );
-            SpawnSpec::shell(cwd).with_env(env)
+            // Deferred-resume panes ARE injected: the rc tail is what pre-types
+            // the prefill line at the prompt.
+            SpawnSpec::shell(cwd)
+                .with_env(env)
+                .with_argv(crate::shell::spawn_argv(cx, true, None))
         } else if let Some(claude) = claude.as_deref() {
             let env = build_claude_extra_env(
                 mode,
                 session_id,
                 term_window_id,
                 socket_path.as_deref(),
-                zdotdir.as_deref(),
-                user_zdotdir.as_deref(),
+                &inject_pairs,
+                prefill,
                 settings_path.map(str::to_string),
             );
             let exec_line =
@@ -1653,10 +1672,14 @@ impl PtyManager {
                 .strip_prefix("exec ")
                 .unwrap_or(&exec_line)
                 .to_string();
-            SpawnSpec::command(command, cwd).with_env(env)
+            // A running-claude window is NOT injected — `build_claude_extra_env`
+            // adds no rc pairs outside ResumeDeferred, so this spawns the user's
+            // genuine login shell, exactly as it always has.
+            let argv = crate::shell::spawn_argv(cx, false, Some(&command));
+            SpawnSpec::command(command, cwd).with_env(env).with_argv(argv)
         } else {
             // Probe unresolved: plain shell, no Nice env (Swift `environment: nil`).
-            SpawnSpec::shell(cwd)
+            SpawnSpec::shell(cwd).with_argv(crate::shell::spawn_argv(cx, false, None))
         };
 
         self.spawn_session_raw(session_id, term_window_id, spec, cx)?;
@@ -1738,8 +1761,9 @@ impl PtyManager {
         }
         let cwd = model.resolved_spawn_cwd_for_window(session, term_window);
         // R14: the extra-env hook threads NICE_SOCKET/NICE_TAB_ID/NICE_PANE_ID
-        // onto this spec before spawn.
-        let spec = SpawnSpec::shell(cwd);
+        // onto this spec before spawn. A deferred terminal is a normal pane, so
+        // it spawns injected.
+        let spec = SpawnSpec::shell(cwd).with_argv(crate::shell::spawn_argv(cx, true, None));
         let _ = self.spawn_window(session_id, &term_window_id, spec, cx);
     }
 
@@ -1934,8 +1958,14 @@ pub(crate) enum ClaudeSessionMode {
 /// live spawn path and may extend the signature — never the matrix): EVERY mode sets `TERM_PROGRAM`,
 /// `NICE_TAB_ID`, `NICE_PANE_ID`, and `NICE_SOCKET` (when a socket exists) so the
 /// SessionStart hook can reach Nice; ONLY [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred)
-/// adds `ZDOTDIR` (when set), the always-present `NICE_USER_ZDOTDIR` (empty when
-/// none), and the `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
+/// adds the shell profile's `inject_pairs` (zsh: `ZDOTDIR` when the rc write
+/// succeeded, plus the always-present `NICE_USER_ZDOTDIR`) and the
+/// `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
+///
+/// `prefill` is the active profile's delivery mechanism, and it gates that last
+/// var: only a [`ShellSide`](PrefillStrategy::ShellSide) profile has an rc tail
+/// that consumes it, so setting it for anyone else would leave a dead var in the
+/// pane's env (and, for a fallback shell, a promise nothing keeps).
 ///
 /// Was production-unused before R15; R15's [`spawn_claude_window`](PtyManager::spawn_claude_window)
 /// now wires it as the live env composer for every Claude window spawn.
@@ -1949,8 +1979,8 @@ pub(crate) fn build_claude_extra_env(
     session_id: &str,
     term_window_id: &str,
     socket_path: Option<&str>,
-    zdotdir_path: Option<&str>,
-    user_zdotdir: Option<&str>,
+    inject_pairs: &[(String, String)],
+    prefill: PrefillStrategy,
     settings_path: Option<String>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
@@ -1962,24 +1992,34 @@ pub(crate) fn build_claude_extra_env(
         env.push(("NICE_SOCKET".to_string(), sp.to_string()));
     }
     if let ClaudeSessionMode::ResumeDeferred(claude_session_id) = mode {
-        if let Some(zp) = zdotdir_path {
-            env.push(("ZDOTDIR".to_string(), zp.to_string()));
+        // The rc-injection pairs the active profile produced for this window —
+        // for zsh, `ZDOTDIR` (when the launch-time rc write succeeded) plus the
+        // always-present `NICE_USER_ZDOTDIR`, whose empty/absent distinction the
+        // `.zshenv` stub keys off. Spliced verbatim: which vars carry the
+        // injection is the profile's knowledge, not this composer's.
+        env.extend(inject_pairs.iter().cloned());
+        match prefill {
+            // Pre-type the resume command the user runs with Enter. The prefill
+            // string is an R15-owned protocol composer (see
+            // [`build_claude_prefill_command`]); the FROZEN format is
+            // `claude[ --settings '<path>'] --resume <sid>`.
+            PrefillStrategy::ShellSide => env.push((
+                "NICE_PREFILL_COMMAND".to_string(),
+                build_claude_prefill_command(settings_path.as_deref(), claude_session_id),
+            )),
+            // step 4: record the prefill string as this pane's `pending_prefill`
+            // and type it into the pty master when the pane's FIRST OSC 7 arrives
+            // (the rc file's unconditional startup fire). Nothing to set here —
+            // an app-typed profile has no rc tail reading an env var. Worth
+            // knowing when that lands: a user profile that emits its own OSC 7
+            // can deliver that first report mid-rc, in which case the bytes queue
+            // in the tty until readline starts — still landing on the prompt line.
+            PrefillStrategy::AppTyped => {}
+            // No prefill mechanism at all: the pane opens at a bare prompt
+            // (design §5). Strictly better than pre-typing a line into a shell
+            // that would never consume the var.
+            PrefillStrategy::Off => {}
         }
-        // Pair NICE_USER_ZDOTDIR with ZDOTDIR — the .zshenv stub resolves the
-        // user's intended layout from it before our injection unwinds. Always set
-        // (empty string when Nice inherited none).
-        env.push((
-            "NICE_USER_ZDOTDIR".to_string(),
-            user_zdotdir.unwrap_or("").to_string(),
-        ));
-        // Pre-type the resume command the user runs with Enter. The prefill
-        // string is an R15-owned protocol composer (see
-        // [`build_claude_prefill_command`]); the FROZEN format is
-        // `claude[ --settings '<path>'] --resume <sid>`.
-        env.push((
-            "NICE_PREFILL_COMMAND".to_string(),
-            build_claude_prefill_command(settings_path.as_deref(), claude_session_id),
-        ));
     }
     env
 }

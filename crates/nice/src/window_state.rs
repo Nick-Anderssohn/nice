@@ -77,6 +77,7 @@ use crate::pty_manager::{
     compose_claude_reply, mint_session_uuid, ClaudeReplyDecision, ClaudeSessionMode,
     ClaudeSessionPlacement, ClaudeSessionSpec, DissolveTerminus, PtyManager,
 };
+use crate::shell::ComposeSupport;
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
 
 /// Mint a fresh window-session id — R18 (L2): a real lowercased UUIDv4 (reusing
@@ -2356,13 +2357,15 @@ impl WindowState {
     // MARK: - Command Compose (the `commandCompose` shortcut, ⌘↩)
 
     /// Command Compose dispatch (window-scoped, from the keymap handler). At an
-    /// idle interactive zsh prompt — a live `Terminal` window with no foreground
-    /// child — write [`crate::shell_inject::COMPOSE_TRIGGER_SEQ`] to the window's
-    /// pty; the injected ZLE widget takes it from there. Otherwise replay
-    /// exactly what an unbound ⌘↩ produced before this feature existed: the
-    /// kitty CSI-u encoding when the foreground app forwards super chords
-    /// (Claude Code, kitty TUIs), nothing at all otherwise. NEVER writes a
-    /// newline — running the composed command is always the user's own Enter.
+    /// idle interactive prompt of a shell that BOUND the trigger — a live
+    /// `Terminal` window with no foreground child whose spawn-time pane snapshot
+    /// reports [`ComposeSupport::Trigger`] — write
+    /// [`crate::shell::COMPOSE_TRIGGER_SEQ`] to the window's pty; the injected
+    /// widget takes it from there. Otherwise replay exactly what an unbound ⌘↩
+    /// produced before this feature existed: the kitty CSI-u encoding when the
+    /// foreground app forwards super chords (Claude Code, kitty TUIs), nothing at
+    /// all otherwise. NEVER writes a newline — running the composed command is
+    /// always the user's own Enter.
     pub(crate) fn dispatch_command_compose(&mut self, cx: &mut gpui::Context<WindowState>) {
         let Some(session_id) = self.workspace.active_session_id().map(str::to_owned) else {
             return;
@@ -2383,8 +2386,17 @@ impl WindowState {
         };
         let fg_child = self.ptys.shell_has_foreground_child(&session_id, &term_window_id, cx);
         let kitty_super = handle.read(cx).session().kitty_forwards_super();
-        let bytes: &[u8] = match Self::compose_route(kind, alive, fg_child, kitty_super) {
-            ComposeRoute::Trigger => crate::shell_inject::COMPOSE_TRIGGER_SEQ,
+        // What this pane's shell can actually do with the trigger bytes, frozen at
+        // its spawn. A pane with no snapshot (nothing in production reaches here —
+        // the handle lookup above already required a live pty) falls back to the
+        // zsh capability, the pre-abstraction behavior.
+        let compose = self
+            .ptys
+            .pane_shell(&session_id, &term_window_id)
+            .map(|shell| shell.compose)
+            .unwrap_or(ComposeSupport::Trigger);
+        let bytes: &[u8] = match Self::compose_route(kind, alive, fg_child, kitty_super, compose) {
+            ComposeRoute::Trigger => crate::shell::COMPOSE_TRIGGER_SEQ,
             ComposeRoute::ForwardCmdEnter => KITTY_CMD_ENTER,
             ComposeRoute::Noop => return,
         };
@@ -2393,20 +2405,31 @@ impl WindowState {
 
     /// The pure Command Compose routing core — the gpui-free truth table of
     /// [`dispatch_command_compose`](Self::dispatch_command_compose):
-    /// 1. A live `Terminal` window with no foreground child ⇒ [`ComposeRoute::Trigger`]
-    ///    (the kitty state is irrelevant: zsh at a prompt requests no kitty flags).
+    /// 1. A live `Terminal` window with no foreground child **whose shell bound the
+    ///    trigger** ⇒ [`ComposeRoute::Trigger`] (the kitty state is irrelevant: a
+    ///    shell at a prompt requests no kitty flags).
     /// 2. Anything else whose child forwards super chords ⇒
     ///    [`ComposeRoute::ForwardCmdEnter`] (vim/Claude Code/any kitty TUI keeps
     ///    receiving ⌘↩ exactly as before the chord was bound).
     /// 3. Otherwise ⇒ [`ComposeRoute::Noop`] (dead window, busy legacy-mode shell —
     ///    where an unbound ⌘↩ also produced no pty bytes).
+    ///
+    /// `compose` is the pane's spawn-time capability: a shell with no binding
+    /// ([`ComposeSupport::None`] — every fallback shell, and bash below 4.3) falls
+    /// through to legs 2/3, i.e. exactly the pre-feature ⌘↩ behavior. Trigger bytes
+    /// must never reach a prompt that would echo them as garbage.
     fn compose_route(
         kind: TermWindowKind,
         alive: bool,
         fg_child: bool,
         kitty_super: bool,
+        compose: ComposeSupport,
     ) -> ComposeRoute {
-        if matches!(kind, TermWindowKind::Terminal) && alive && !fg_child {
+        if matches!(kind, TermWindowKind::Terminal)
+            && alive
+            && !fg_child
+            && compose == ComposeSupport::Trigger
+        {
             return ComposeRoute::Trigger;
         }
         if kitty_super {
@@ -5887,12 +5910,15 @@ mod tests {
     #[test]
     fn compose_route_truth_table() {
         use ComposeRoute::*;
+        // Every row here is a pane whose shell BOUND the trigger (zsh, bash ≥ 4.3);
+        // the capability axis gets its own test below.
+        let bound = ComposeSupport::Trigger;
         // 1. The trigger fires ONLY for a live Terminal window with no foreground
         //    child — regardless of the kitty state (zsh at a prompt has none,
         //    but a stale bit must not divert the trigger).
         for kitty in [false, true] {
             assert_eq!(
-                WindowState::compose_route(TermWindowKind::Terminal, true, false, kitty),
+                WindowState::compose_route(TermWindowKind::Terminal, true, false, kitty, bound),
                 Trigger,
                 "idle live terminal (kitty={kitty}) triggers compose"
             );
@@ -5900,31 +5926,65 @@ mod tests {
         // 2. A busy window replays ⌘↩ iff the child forwards super chords —
         //    exactly the pre-feature byte contract.
         assert_eq!(
-            WindowState::compose_route(TermWindowKind::Terminal, true, true, true),
+            WindowState::compose_route(TermWindowKind::Terminal, true, true, true, bound),
             ForwardCmdEnter,
             "busy kitty window (Claude Code, vim+kitty) keeps receiving cmd-enter"
         );
         assert_eq!(
-            WindowState::compose_route(TermWindowKind::Terminal, true, true, false),
+            WindowState::compose_route(TermWindowKind::Terminal, true, true, false, bound),
             Noop,
             "busy legacy-mode shell got no bytes for an unbound cmd-enter either"
         );
         // 3. Dead windows and Claude windows never trigger; they may still forward.
         assert_eq!(
-            WindowState::compose_route(TermWindowKind::Terminal, false, false, false),
+            WindowState::compose_route(TermWindowKind::Terminal, false, false, false, bound),
             Noop,
             "dead terminal: nothing"
         );
         assert_eq!(
-            WindowState::compose_route(TermWindowKind::Claude, true, false, true),
+            WindowState::compose_route(TermWindowKind::Claude, true, false, true, bound),
             ForwardCmdEnter,
             "a Claude window (kitty on) receives cmd-enter, never the trigger"
         );
         assert_eq!(
-            WindowState::compose_route(TermWindowKind::Claude, true, false, false),
+            WindowState::compose_route(TermWindowKind::Claude, true, false, false, bound),
             Noop,
             "a Claude window without kitty gets nothing"
         );
+    }
+
+    /// The F6 fix: a pane whose shell never bound the trigger sequence must never
+    /// receive it. Every row of the table above that routed `Trigger` collapses to
+    /// the pre-feature ⌘↩ behavior — `ForwardCmdEnter` under kitty, else `Noop` —
+    /// and no row anywhere routes `Trigger`.
+    #[test]
+    fn compose_route_never_triggers_a_shell_without_the_binding() {
+        use ComposeRoute::*;
+        let unbound = ComposeSupport::None;
+        assert_eq!(
+            WindowState::compose_route(TermWindowKind::Terminal, true, false, false, unbound),
+            Noop,
+            "an idle fallback-shell prompt gets NO bytes (never the trigger)"
+        );
+        assert_eq!(
+            WindowState::compose_route(TermWindowKind::Terminal, true, false, true, unbound),
+            ForwardCmdEnter,
+            "an idle unbound pane whose child forwards super chords still gets cmd-enter"
+        );
+        for kind in [TermWindowKind::Terminal, TermWindowKind::Claude] {
+            for alive in [false, true] {
+                for fg_child in [false, true] {
+                    for kitty in [false, true] {
+                        assert_ne!(
+                            WindowState::compose_route(kind, alive, fg_child, kitty, unbound),
+                            Trigger,
+                            "compose=None must never route Trigger \
+                             (kind={kind:?} alive={alive} fg_child={fg_child} kitty={kitty})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

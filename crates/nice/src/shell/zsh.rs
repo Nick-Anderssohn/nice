@@ -1,4 +1,4 @@
-//! Shell injection — the synthetic `ZDOTDIR` rc chain (R14).
+//! [`ZshProfile`] — zsh's shell profile: the synthetic `ZDOTDIR` rc chain (R14).
 //!
 //! Ports Swift `MainTerminalShellInject`
 //! (`Sources/Nice/Process/MainTerminalShellInject.swift`). We write a `ZDOTDIR`
@@ -29,7 +29,7 @@
 //!     stub). macOS ships no `/etc/zshenv`, so this is documented, not fixed.
 //!
 //! Storage location: the stubs live in a fixed, per-variant directory under
-//! Application Support (`…/<CFBundleName>/zdotdir`) — NOT `$TMPDIR`. macOS's
+//! Application Support (`…/<CFBundleName>/shellrc/zsh`) — NOT `$TMPDIR`. macOS's
 //! `com.apple.bsd.dirhelper` sweeps `$TMPDIR` files older than 3 days; when Nice
 //! ran longer than that, the sweep deleted the stubs out from under the live
 //! process and every new window's zsh then sourced nothing. Application Support is
@@ -37,546 +37,140 @@
 //! serves every window and every process of a variant; each variant stays
 //! isolated in its own per-variant Application Support folder via `CFBundleName`.
 //! [`write_stubs`] rewrites the stubs on every launch, so the directory
-//! self-heals if anything ever removes a file.
+//! self-heals if anything ever removes a file. Older builds wrote the stubs one
+//! level up, in `…/<CFBundleName>/zdotdir`; that directory is left in place on
+//! disk rather than swept, because deleting shared Application Support state
+//! would race an older build of the same variant that is still reading it.
 //!
-//! **The four rc-stub bodies below are a FROZEN compatibility contract.**
-//! Installed helpers already on users' disks (`~/.nice/nice-claude-hook.sh`,
-//! `~/.nice/nice-handoff.sh`) and the shadow function's muscle-memory behavior
-//! must keep working byte-for-byte against the app. They are ported
-//! character-for-character from the Swift source and pinned by both the
-//! static-text tests and the real-zsh end-to-end tests below. Do not "clean
-//! them up" — the `\%` OSC 7 escape is load-bearing zsh arcana (a bare `%` is a
-//! parameter pattern anchor), and the `_nice_json_escape` dialect (backslash,
-//! double-quote, LF, CR, tab — nothing else) is exactly what Nice's JSON decoder
-//! expects. The Command Compose widget tail (`_nice_compose_*` +
-//! [`COMPOSE_TRIGGER_SEQ`]) joined the frozen contract with the `commandCompose`
-//! shortcut: the trigger bytes and the `$NICE_COMPOSE_CONF` key names are
-//! app↔shell interchange, pinned the same way.
+//! **The four rc-stub bodies in `scripts/zsh/` are a FROZEN compatibility
+//! contract.** Installed helpers already on users' disks
+//! (`~/.nice/nice-claude-hook.sh`, `~/.nice/nice-handoff.sh`) and the shadow
+//! function's muscle-memory behavior must keep working byte-for-byte against the
+//! app. They are ported character-for-character from the Swift source and pinned
+//! by both the static-text tests and the real-zsh end-to-end tests below. Do not
+//! "clean them up" — the `\%` OSC 7 escape is load-bearing zsh arcana (a bare `%`
+//! is a parameter pattern anchor), and the `_nice_json_escape` dialect
+//! (backslash, double-quote, LF, CR, tab — nothing else) is exactly what Nice's
+//! JSON decoder expects. The Command Compose widget tail (`_nice_compose_*` +
+//! [`COMPOSE_TRIGGER_SEQ`](super::COMPOSE_TRIGGER_SEQ)) joined the frozen
+//! contract with the `commandCompose` shortcut: the trigger bytes and the
+//! `$NICE_COMPOSE_CONF` key names are app↔shell interchange, pinned the same way.
+//!
+//! The bodies live as plain `.zsh` files pulled in with `include_str!` (design
+//! §8) rather than inline raw strings: no templating, ever — every dynamic value
+//! reaches the shell through an env var. The files carry **no trailing newline**,
+//! matching the raw strings they were extracted from; `stub_bodies_and_argv_sha256_frozen`
+//! pins that (and every other) byte.
 //!
 //! The `$NICE_SOCKET` env var the `claude()` function reads, and the per-window
 //! `NICE_TAB_ID` / `NICE_PANE_ID` / `NICE_USER_ZDOTDIR` / `NICE_PREFILL_COMMAND`
 //! values, are injected separately (R14 slice 3 / slice 4); these stubs only
-//! reference them. This module owns the stub text, the writer, and the
-//! per-variant location; the `app::run` bootstrap wiring is R14 slice 3.
-
-#![allow(dead_code)]
+//! reference them. This module owns the stub text, the writer, the per-variant
+//! location, and the zsh [`ShellProfile`] implementation that routes them.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The private pty trigger for Command Compose. Nice's `commandCompose` action
-/// handler writes exactly these bytes to the window's pty (only when the shell
-/// sits at an idle interactive prompt); the `ZSHRC_BODY` widget below binds
-/// exactly this sequence. CSI 5099~ (DECFNK style): no terminal emits
-/// tilde-coded numbers anywhere near 5099 from real keys (the real ones top out
-/// in the 30s), and it is deliberately far from bracketed paste's 200/201.
-/// Written in a single `write_input` call so ZLE's keymap trie matches it
-/// atomically against the `\e[5~` (PageUp) shared prefix.
-pub const COMPOSE_TRIGGER_SEQ: &[u8] = b"\x1b[5099~";
-
-/// The zsh-side `bindkey` spelling of [`COMPOSE_TRIGGER_SEQ`] (`\e` = ESC).
-/// The static tests below pin that `ZSHRC_BODY` binds exactly this string in
-/// all three keymaps, and that its bytes agree with the Rust constant.
-pub const COMPOSE_TRIGGER_BINDKEY: &str = r"\e[5099~";
+use super::{
+    ComposeSupport, InjectPaths, PrefillStrategy, ShellKind, ShellProfile, SpawnCtx, UserShellEnv,
+};
 
 /// Stub `.zshenv`: discover + stash the user's intended `ZDOTDIR`, then restore
 /// our temp dir so zsh keeps reading the other stubs.
-pub const ZSHENV_BODY: &str = r#"# Nice: discover and stash the user's intended ZDOTDIR, then
-# restore our temp dir so zsh keeps reading our other stubs
-# (.zprofile / .zshrc). See file header for the cooperation contract.
-NICE_TEMP_ZDOTDIR="$ZDOTDIR"
-if [[ -n "$NICE_USER_ZDOTDIR" ]]; then
-    # Inherited from Nice's launch env (launchctl / parent process).
-    USER_ZDOTDIR="$NICE_USER_ZDOTDIR"
-else
-    # Source ~/.zshenv ourselves to discover any ZDOTDIR set there
-    # (XDG-style). This is the FIRST source of ~/.zshenv this
-    # session — zsh read OUR stub, not the user's, because ZDOTDIR
-    # was overridden — so no double-source / non-idempotency risk.
-    unset ZDOTDIR
-    [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
-    USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
-fi
-export ZDOTDIR="$NICE_TEMP_ZDOTDIR"
-export NICE_USER_ZDOTDIR="$USER_ZDOTDIR"
-unset NICE_TEMP_ZDOTDIR USER_ZDOTDIR"#;
+pub const ZSHENV_BODY: &str = include_str!("scripts/zsh/zshenv.zsh");
 
 /// Stub `.zprofile`: chain back to the user's real `.zprofile` (login shells).
-pub const ZPROFILE_BODY: &str = r#"# Nice: source the user's real .zprofile from the location resolved
-# in our .zshenv. (Without this, login-shell users silently lose
-# .zprofile because zsh's $ZDOTDIR/.zprofile lookup hits our stub.)
-[[ -n "$NICE_USER_ZDOTDIR" && -f "$NICE_USER_ZDOTDIR/.zprofile" ]] \
-    && source "$NICE_USER_ZDOTDIR/.zprofile""#;
+pub const ZPROFILE_BODY: &str = include_str!("scripts/zsh/zprofile.zsh");
 
 /// Stub `.zlogin`: defensive chain-back to the user's real `.zlogin`.
-pub const ZLOGIN_BODY: &str = r#"# Nice: defensive — if our .zshrc somehow exited before restoring
-# ZDOTDIR (user .zshrc errored out, etc.), source the user's real
-# .zlogin from where they actually keep it. In the success path
-# ZDOTDIR has already been restored to the user's value by our
-# .zshrc, so zsh reads the user's .zlogin directly and this stub
-# is never reached.
-[[ -n "$NICE_USER_ZDOTDIR" && -f "$NICE_USER_ZDOTDIR/.zlogin" ]] \
-    && source "$NICE_USER_ZDOTDIR/.zlogin""#;
+pub const ZLOGIN_BODY: &str = include_str!("scripts/zsh/zlogin.zsh");
 
 /// Stub `.zshrc`: restore `ZDOTDIR` before sourcing the user's `.zshrc`, then
 /// install the `claude()` shadow, the OSC 7 cwd emitter, and the prefill tail.
-pub const ZSHRC_BODY: &str = r##"# Stash the resolved user-side ZDOTDIR before we drop NICE_USER_ZDOTDIR.
-# Trim trailing slashes so an accidental "/Users/nick/" (from launchctl
-# or weird shells) compares equal to "/Users/nick" for the unset branch.
-NICE_RESOLVED_USER_ZDOTDIR="${NICE_USER_ZDOTDIR%/}"
+pub const ZSHRC_BODY: &str = include_str!("scripts/zsh/zshrc.zsh");
 
-# Restore ZDOTDIR to the user's intended value BEFORE sourcing
-# their .zshrc — so anything they pull in during init (oh-my-zsh
-# `ZSH_COMPDUMP="${ZDOTDIR:-$HOME}/.zcompdump-..."`, p10k's
-# `source "${ZDOTDIR:-$HOME}/.p10k.zsh"`, plugin-manager caches,
-# etc.) probes the user's real config path instead of our temp
-# dir. The whole point of this PR is closing that gap; restoring
-# after the source would only fix tools the user runs at the
-# interactive prompt, not the much larger surface of init-time
-# tooling.
-if [[ "$NICE_RESOLVED_USER_ZDOTDIR" == "${HOME%/}" ]]; then
-    unset ZDOTDIR    # match standard convention when $HOME resolves
-else
-    export ZDOTDIR="$NICE_RESOLVED_USER_ZDOTDIR"
-fi
-unset NICE_USER_ZDOTDIR
-
-# Source the user's real .zshrc from where they actually keep it
-# (handles XDG-style ZDOTDIR layouts under e.g. ~/.config/zsh).
-[[ -n "$NICE_RESOLVED_USER_ZDOTDIR" && -f "$NICE_RESOLVED_USER_ZDOTDIR/.zshrc" ]] \
-    && source "$NICE_RESOLVED_USER_ZDOTDIR/.zshrc"
-unset NICE_RESOLVED_USER_ZDOTDIR
-
-# Now shadow `claude` so running it handshakes with Nice over
-# NICE_SOCKET. The socket either tells us to exit (Nice is opening
-# a new session) or to exec claude in place (Nice is promoting this
-# window to Claude). Defining the function AFTER user's .zshrc
-# ensures we win over anything they may have defined themselves —
-# if a user wants to opt out, they can still `unfunction claude`
-# in a precmd hook.
-_nice_json_escape() {
-    local s=$1
-    s=${s//\\/\\\\}
-    s=${s//\"/\\\"}
-    s=${s//$'\n'/\\n}
-    s=${s//$'\r'/\\r}
-    s=${s//$'\t'/\\t}
-    printf '"%s"' "$s"
+/// zsh — the profile Nice has always run, byte-frozen by the extraction
+/// (design §6.1). `path` is the resolved binary (normally `/bin/zsh`; a
+/// homebrew zsh keeps its own path).
+pub struct ZshProfile {
+    path: String,
 }
 
-# Tell Nice the Claude we ran as a CHILD has returned, so this window is a
-# plain shell prompt again. Only the `attach` verb below runs one as a
-# child; every other verb execs, and a window whose pty exits tells Nice by
-# exiting. Without this Nice's per-window "a Claude is running here" flag
-# would stay set forever and every later `claude` in this session would open
-# a NEW session instead of promoting this window. Fire-and-forget: Nice closes the
-# connection before handling it, so `nc` returns at once.
-_nice_claude_exited() {
-    [[ -z "$NICE_SOCKET" ]] && return 0
-    local pane_id_json
-    pane_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
-    printf '%s\n' "{\"action\":\"claude_exited\",\"paneId\":${pane_id_json}}" \
-        | nc -U "$NICE_SOCKET" -w 2 >/dev/null 2>&1
-    return 0
+impl ZshProfile {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
 }
 
-claude() {
-    # Passthrough to the real binary (no handshake) when:
-    #   1. Not inside a Nice pty ($NICE_SOCKET unset).
-    #   2. stdin is piped — caller is streaming input to claude.
-    #   3. User passed a flag that makes claude non-interactive.
-    #   4. User invoked a non-interactive subcommand.
-    if [[ -z "$NICE_SOCKET" ]]; then
-        command claude "$@"
-        return
-    fi
-    if [[ ! -t 0 ]]; then
-        command claude "$@"
-        return
-    fi
-    local a
-    for a in "$@"; do
-        case "$a" in
-            -p|--print|-h|--help|--version|--output-format|--output-format=*)
-                command claude "$@"
-                return
-                ;;
-        esac
-    done
-    case "${1-}" in
-        mcp|config|migrate-installer|update|doctor)
-            command claude "$@"
-            return
-            ;;
-    esac
+impl ShellProfile for ZshProfile {
+    fn kind(&self) -> ShellKind {
+        ShellKind::Zsh
+    }
 
-    local args_json="["
-    local first=1
-    for a in "$@"; do
-        [[ $first -eq 1 ]] || args_json+=","
-        args_json+=$(_nice_json_escape "$a")
-        first=0
-    done
-    args_json+="]"
+    fn program(&self) -> &str {
+        &self.path
+    }
 
-    # Send {cwd, args, tabId, paneId} and read a single-line reply.
-    # NICE_TAB_ID / NICE_PANE_ID are empty in the Main Terminal —
-    # Nice uses empty tabId as the signal for "always open a new
-    # sidebar session."
-    local cwd_json session_id_json window_id_json
-    cwd_json=$(_nice_json_escape "$PWD")
-    session_id_json=$(_nice_json_escape "${NICE_TAB_ID:-}")
-    window_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
-    local payload="{\"action\":\"claude\",\"cwd\":${cwd_json},\"args\":${args_json},\"tabId\":${session_id_json},\"paneId\":${window_id_json}}"
+    /// `[path, "-il"]` / `[path, "-ilc", "exec <cmd>"]`. The clustered spellings
+    /// come from [`nice_term_core::build_exec_args`], the one implementation the
+    /// term-core exec-args tests already pin.
+    ///
+    /// `ctx.inject` is deliberately ignored: zsh's argv is identical with and
+    /// without Nice's injection — the `ZDOTDIR` env pair decides
+    /// ([`Self::inject_env`]), which is exactly why the injected/non-injected
+    /// split has to be an explicit axis for the shells where it *is* argv-shaped.
+    fn spawn_argv(&self, ctx: &SpawnCtx) -> Vec<String> {
+        let mut argv = Vec::with_capacity(3);
+        argv.push(self.path.clone());
+        argv.extend(nice_term_core::build_exec_args(ctx.command));
+        argv
+    }
 
-    local response
-    response=$(printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 2 2>/dev/null)
-    if [[ -z "$response" ]]; then
-        print -u2 "nice: control socket unreachable; running claude directly"
-        exec command claude "$@"
-    fi
+    /// `ZDOTDIR` points zsh at our stub directory; `NICE_USER_ZDOTDIR` carries
+    /// Nice's own inherited value across to the `.zshenv` stub. The latter is
+    /// **always set, empty string included** — the stub branches on
+    /// `[[ -n "$NICE_USER_ZDOTDIR" ]]`, and an absent var and an empty one must
+    /// stay indistinguishable there. Load-bearing; preserved verbatim.
+    fn inject_env(&self, inject: &InjectPaths, user: &UserShellEnv) -> Vec<(String, String)> {
+        vec![
+            (
+                "ZDOTDIR".to_string(),
+                inject.dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "NICE_USER_ZDOTDIR".to_string(),
+                user.user_zdotdir.clone().unwrap_or_default(),
+            ),
+        ]
+    }
 
-    # The reply is one line of up to three positional fields:
-    #   newtab
-    #   inplace [<uuid>|-] [<settings path>]
-    #   attach  <uuid> [<settings path>]   (exec-time normalization)
-    #   resume  <uuid> [<settings path>]   (exec-time normalization)
-    # The last two carry Nice's decision about whether the named session is
-    # still hosted by the Claude daemon — only Nice can tell, and only at this
-    # moment (a deferred window's pre-typed command may have waited hours).
-    local mode sid settings
-    read -r mode sid settings <<< "$response"
-    case "$mode" in
-        newtab)
-            # Nice is opening a new sidebar session; nothing to do here.
-            return 0
-            ;;
-        inplace)
-            # Nice promoted this window to Claude. Build the exec line:
-            #   --settings <path>  when Nice's theme sync is on (the
-            #     3rd reply field), so this in-place Claude matches
-            #     the Nice theme like a from-scratch Nice Claude window;
-            #   --session-id <sid> when Nice minted an id so it can
-            #     resume later. A sid of "-" (or empty) means the
-            #     user's own args (e.g. --resume <uuid>) already
-            #     identify the session, so no --session-id is added.
-            local -a pre=()
-            [[ -n "$settings" ]] && pre+=(--settings "$settings")
-            [[ -n "$sid" && "$sid" != "-" ]] && pre+=(--session-id "$sid")
-            # Guard the expansion so an empty `pre` never trips the
-            # user's `setopt nounset` (and never injects an empty arg).
-            if (( ${#pre} )); then
-                exec command claude "${pre[@]}" "$@"
-            else
-                exec command claude "$@"
-            fi
-            ;;
-        attach)
-            # Nice resolved this invocation to a background session the Claude
-            # daemon STILL hosts (a `--resume <uuid>` would spawn a second
-            # process against a live conversation). `sid` is the FULL uuid;
-            # `claude attach` matches jobs by ~/.claude/jobs directory-name
-            # prefix, so it gets the leading 8 characters.
-            #
-            # Run attach as a CHILD, not exec: a jobs entry the daemon left
-            # behind when it died exits non-zero, and the fallback leg then
-            # degrades to a plain --resume instead of stranding the user at an
-            # error. Detaching is NOT a failure and never takes that leg —
-            # attach exits 0 both when the ctrl-z detach key fires and when the
-            # session ends, and non-zero only on an error outcome or an
-            # unmatched id (verified against 2.1.223).
-            #
-            # A child leaves this shell alive, which is exactly what the CLI
-            # promises ("Ctrl+Z drops back to your shell") — so tell Nice the
-            # window is a prompt again, or its promotion flag stays set forever.
-            local -a post=(--resume "$sid")
-            [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
-            if command claude attach "${sid[1,8]}"; then
-                _nice_claude_exited
-                return 0
-            fi
-            exec command claude "${post[@]}"
-            ;;
-        resume)
-            # The mirror: the user ran `claude attach <id>` for a session the
-            # daemon no longer hosts, so their args can only fail. Replace them
-            # wholesale with `--resume <uuid>` (never "$@" — that still says
-            # `attach`).
-            local -a post=(--resume "$sid")
-            [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
-            exec command claude "${post[@]}"
-            ;;
-        *)
-            print -u2 "nice: unexpected response '$response'; running claude directly"
-            exec command claude "$@"
-            ;;
-    esac
+    fn write_rc_files(&self, dir: &Path) -> io::Result<InjectPaths> {
+        let dir = write_stubs(dir)?;
+        Ok(InjectPaths { dir, rcfile: None })
+    }
+
+    fn compose_support(&self) -> ComposeSupport {
+        ComposeSupport::Trigger
+    }
+
+    /// The `.zshrc` tail consumes `NICE_PREFILL_COMMAND` via `print -z` — a
+    /// FROZEN contract (`zshrc_prefill_command_uses_print_z`).
+    fn prefill(&self) -> PrefillStrategy {
+        PrefillStrategy::ShellSide
+    }
+
+    fn probe_argv(&self, probe_cmd: &str) -> Vec<String> {
+        vec![self.path.clone(), "-ilc".to_string(), probe_cmd.to_string()]
+    }
+
+    fn comm_name(&self) -> &str {
+        "zsh"
+    }
+
+    fn display_name(&self) -> &str {
+        "zsh"
+    }
 }
-
-# Nice: emit OSC 7 (current working directory) on every cd so the
-# host terminal can capture and persist it. Format:
-#   ESC ] 7 ; file://hostname/path BEL
-# The injected hook appends to chpwd_functions rather than replacing
-# chpwd directly so anything the user already registered (in their
-# real .zshrc, sourced above) keeps firing.
-_nice_emit_cwd_osc7() {
-    # Minimal URL encoding: % first (so we don't double-encode the
-    # %20 we're about to emit), then space. macOS paths almost
-    # never need more; anything exotic (?, #, non-ASCII) flows
-    # through unencoded and SwiftTerm tolerates the raw bytes.
-    # The `\%` escape is load-bearing — a bare `%` in a zsh
-    # parameter pattern is the "anchor at end of string" matcher,
-    # which makes `${PWD//%/%25}` append `%25` to every path.
-    local p=${PWD//\%/%25}
-    p=${p// /%20}
-    printf '\e]7;file://%s%s\a' "${HOST}" "$p"
-}
-typeset -ga chpwd_functions
-chpwd_functions+=(_nice_emit_cwd_osc7)
-# Fire once at shell startup so the initial cwd is reported even
-# if the user never cd's.
-_nice_emit_cwd_osc7
-
-# Nice: if the app asked us to pre-type a command at the next
-# prompt (set when a restored Claude session boots), push it onto zsh's
-# line-editor buffer. The user sees the command typed and ready;
-# nothing runs until they hit Enter.
-if [[ -n "$NICE_PREFILL_COMMAND" ]]; then
-    print -z "$NICE_PREFILL_COMMAND"
-fi
-
-# Nice: Command Compose (the `commandCompose` shortcut, cmd-enter by
-# default). Nice writes the private trigger ESC[5099~ to this pty only
-# when the shell sits at an idle interactive prompt (no foreground
-# child); the widget below then rewrites the line buffer's plain-English
-# text into a real zsh command via `claude -p`, painting an animated
-# spinner under the line (in Nice's accent color, read from the
-# $NICE_COMPOSE_CONF file) while it thinks. The composed command
-# REPLACES the buffer for review — nothing here ever accepts the line;
-# running it is always the user's own Enter. A new prompt (Enter or
-# ctrl-c) abandons an in-flight compose via the precmd hook.
-typeset -g _nice_compose_gen=0
-typeset -g _nice_compose_my_gen=0
-typeset -g _nice_compose_fd= _nice_compose_pid=
-typeset -g _nice_compose_spin_fd= _nice_compose_spin_pid=
-typeset -g _nice_compose_frame=0
-typeset -g _nice_compose_color=
-typeset -g _nice_compose_hl=
-typeset -g _nice_compose_instruction='Convert this plain-English request into a single zsh command line for macOS. Reply with ONLY the command itself - no code fences, no backticks, no explanation, no surrounding quotes. If the request is already a valid shell command, return it unchanged.'
-
-_nice_compose_conf_get() {
-    # $1: key in the flat Nice-written JSON at $NICE_COMPOSE_CONF,
-    # e.g. {"accent":"#7A94DB","model":"sonnet","effort":"medium"}.
-    # Prints the string value; fails if the file or key is missing.
-    # Keys and values are Nice-controlled (no escapes), so plain
-    # parameter surgery beats requiring a JSON tool on PATH.
-    emulate -L zsh
-    [[ -n "$NICE_COMPOSE_CONF" && -r "$NICE_COMPOSE_CONF" ]] || return 1
-    local blob rest
-    blob="$(<$NICE_COMPOSE_CONF)"
-    rest="${blob#*\"$1\":\"}"
-    [[ "$rest" == "$blob" ]] && return 1
-    print -rn -- "${rest%%\"*}"
-}
-
-_nice_compose_translate() {
-    # stdin: the plain-English request; stdout: the composed command.
-    # Split from the widget so it is testable without a tty/ZLE. The
-    # request rides stdin — user text is never placed on a command
-    # line, so no quoting of it can ever be wrong.
-    emulate -L zsh
-    local -a flags=()
-    local v
-    v="$(_nice_compose_conf_get model)" && [[ -n "$v" ]] && flags+=(--model "$v")
-    v="$(_nice_compose_conf_get effort)" && [[ -n "$v" ]] && flags+=(--effort "$v")
-    # Guard the expansion so an empty `flags` never trips a user's
-    # `setopt nounset` (same pattern as the claude() shadow above).
-    if (( ${#flags} )); then
-        command claude -p "$_nice_compose_instruction" "${flags[@]}" 2>/dev/null
-    else
-        command claude -p "$_nice_compose_instruction" 2>/dev/null
-    fi
-}
-
-_nice_compose_strip() {
-    # $1: raw model output. Prints the cleaned command: trim
-    # whitespace, then defensively unwrap a ``` fence or a wrapping
-    # backtick pair if the model ignored the instruction.
-    emulate -L zsh -o extendedglob
-    local out=$1
-    out="${out##[[:space:]]#}"
-    out="${out%%[[:space:]]#}"
-    if [[ "$out" == '```'* && "$out" == *$'\n'* ]]; then
-        out="${out#*$'\n'}"
-        out="${out%$'\n'*}"
-        out="${out##[[:space:]]#}"
-        out="${out%%[[:space:]]#}"
-    fi
-    if [[ "$out" == \`*\` ]]; then
-        out="${out#\`}"
-        out="${out%\`}"
-    fi
-    print -rn -- "$out"
-}
-
-_nice_compose_display() {
-    # $1: POSTDISPLAY text ('' clears). Colors it with the accent
-    # captured at compose start; our region_highlight entry is tracked
-    # in _nice_compose_hl so repeated frames never stack entries.
-    # WIDGET context only — POSTDISPLAY/region_highlight are ZLE special
-    # parameters, live only inside widget calls (an fd handler is NOT
-    # widget context; handlers below re-enter one via `zle <widget>`).
-    if [[ -n "$_nice_compose_hl" ]]; then
-        region_highlight=("${(@)region_highlight:#$_nice_compose_hl}")
-        _nice_compose_hl=
-    fi
-    POSTDISPLAY="$1"
-    if [[ -n "$1" && -n "$_nice_compose_color" ]]; then
-        # region_highlight offsets index BUFFER then POSTDISPLAY appended
-        # after it (the P flag would ADD PREDISPLAY to the indexing — it
-        # does NOT mean "relative to POSTDISPLAY"), so the spinner span
-        # starts at the buffer's character length.
-        _nice_compose_hl="${#BUFFER} $(( ${#BUFFER} + ${#POSTDISPLAY} )) fg=$_nice_compose_color"
-        region_highlight+=("$_nice_compose_hl")
-    fi
-    zle -R
-}
-
-_nice_compose_show_frame() {
-    # Claude Code's own thinking indicator: a star on the LEFT that pulses
-    # through growing/shrinking asterisk glyphs (quoted — bare * would glob).
-    local -a frames=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢')
-    _nice_compose_display $'\n'"${frames[$(( _nice_compose_frame % 10 + 1 ))]} Composing… (ctrl-c cancels)"
-}
-
-_nice_compose_stop() {
-    # Unregister + close both fds and reap both children. ZLE-active
-    # context only (`zle -F` needs ZLE).
-    if [[ -n "$_nice_compose_fd" ]]; then
-        zle -F "$_nice_compose_fd" 2>/dev/null
-        exec {_nice_compose_fd}<&-
-        _nice_compose_fd=
-    fi
-    if [[ -n "$_nice_compose_spin_fd" ]]; then
-        zle -F "$_nice_compose_spin_fd" 2>/dev/null
-        exec {_nice_compose_spin_fd}<&-
-        _nice_compose_spin_fd=
-    fi
-    [[ -n "$_nice_compose_pid" ]] && kill "$_nice_compose_pid" 2>/dev/null
-    [[ -n "$_nice_compose_spin_pid" ]] && kill "$_nice_compose_spin_pid" 2>/dev/null
-    _nice_compose_pid= _nice_compose_spin_pid=
-}
-
-# Widget: repaint the current spinner frame (fd handlers re-enter widget
-# context through this so POSTDISPLAY is actually live).
-_nice_compose_spin_widget() {
-    _nice_compose_show_frame
-}
-zle -N _nice_compose_spin_widget
-
-# Widget: clear the spinner line (stale-compose cleanup path).
-_nice_compose_clear_widget() {
-    _nice_compose_display ""
-}
-zle -N _nice_compose_clear_widget
-
-# Widget: land the composed command in the buffer ($1 = raw model output).
-# NEVER accepts the line — running it is always the user's own Enter.
-_nice_compose_apply_widget() {
-    emulate -L zsh
-    _nice_compose_display ""
-    local out
-    out="$(_nice_compose_strip "$1")"
-    if [[ -z "$out" ]]; then
-        zle -M "nice: compose failed (is claude on PATH?)"
-        return 1
-    fi
-    BUFFER="$out"
-    CURSOR=${#BUFFER}
-    zle -R
-}
-zle -N _nice_compose_apply_widget
-
-_nice_compose_tick() {
-    # zle -F handler (NOT widget context — no direct BUFFER/POSTDISPLAY).
-    emulate -L zsh
-    if (( _nice_compose_my_gen != _nice_compose_gen )); then
-        # Stale ticker from an abandoned compose: full cleanup.
-        _nice_compose_stop
-        zle _nice_compose_clear_widget
-        return 0
-    fi
-    local junk
-    if ! read -r -k 1 -u "$1" junk 2>/dev/null; then
-        # Ticker hit EOF (crashed); drop just the spinner side.
-        zle -F "$1" 2>/dev/null
-        if [[ "$1" == "$_nice_compose_spin_fd" ]]; then
-            exec {_nice_compose_spin_fd}<&-
-            _nice_compose_spin_fd=
-        fi
-        return 0
-    fi
-    (( _nice_compose_frame++ ))
-    zle _nice_compose_spin_widget
-}
-
-_nice_compose_done() {
-    # zle -F handler (NOT widget context): drain + clean up, then hand
-    # the result to the apply widget where the ZLE params are live.
-    emulate -L zsh
-    local fd=$1 out=
-    zle -F "$fd" 2>/dev/null
-    out="$(command cat <&$fd 2>/dev/null)"
-    exec {fd}<&-
-    [[ "$fd" == "$_nice_compose_fd" ]] && _nice_compose_fd=
-    local stale=$(( _nice_compose_my_gen != _nice_compose_gen ))
-    _nice_compose_stop
-    if (( stale )); then
-        zle _nice_compose_clear_widget
-        return 0
-    fi
-    zle _nice_compose_apply_widget -- "$out"
-}
-
-_nice_command_compose() {
-    emulate -L zsh
-    [[ -z "$BUFFER" ]] && return 0
-    _nice_compose_stop
-    (( _nice_compose_gen++ ))
-    _nice_compose_my_gen=$_nice_compose_gen
-    _nice_compose_color="$(_nice_compose_conf_get accent)"
-    [[ -n "$_nice_compose_color" ]] || _nice_compose_color=8
-    local request="$BUFFER"
-    exec {_nice_compose_fd}< <(_nice_compose_translate <<< "$request")
-    _nice_compose_pid=$!
-    zle -F "$_nice_compose_fd" _nice_compose_done
-    exec {_nice_compose_spin_fd}< <(
-        while :; do printf x; command sleep 0.1; done
-    )
-    _nice_compose_spin_pid=$!
-    zle -F "$_nice_compose_spin_fd" _nice_compose_tick
-    _nice_compose_frame=0
-    _nice_compose_show_frame
-}
-
-_nice_compose_precmd() {
-    # A new prompt (accepted line or ctrl-c) abandons any in-flight
-    # compose: bump the generation so a pending fd handler discards its
-    # result, and reap the children now. The fds stay registered until
-    # ZLE is next active — the handlers self-clean on the stale path
-    # (`zle -F` is unavailable outside ZLE, so it cannot happen here).
-    (( _nice_compose_gen++ ))
-    [[ -n "$_nice_compose_pid" ]] && kill "$_nice_compose_pid" 2>/dev/null
-    [[ -n "$_nice_compose_spin_pid" ]] && kill "$_nice_compose_spin_pid" 2>/dev/null
-    _nice_compose_pid= _nice_compose_spin_pid=
-}
-typeset -ga precmd_functions
-precmd_functions+=(_nice_compose_precmd)
-
-zle -N _nice_command_compose
-bindkey -M emacs '\e[5099~' _nice_command_compose
-bindkey -M viins '\e[5099~' _nice_command_compose
-bindkey -M vicmd '\e[5099~' _nice_command_compose"##;
 
 /// Write the four `ZDOTDIR` stubs into `dir`, creating it (and any missing
 /// parents) if needed, and return `dir`. Ports Swift
@@ -608,46 +202,26 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The fixed, per-variant `ZDOTDIR` location:
-/// `<app support root>/<CFBundleName>/zdotdir`. Ports Swift
-/// `MainTerminalShellInject.defaultLocation()`. Honors the
-/// `NICE_APPLICATION_SUPPORT_ROOT` override seam (tests redirect it into a
-/// sandbox; production leaves it unset). The folder name tracks `CFBundleName`
-/// so each variant gets its own directory (`Nice` / `Nice Dev`).
-/// Pure — creates nothing (unlike the Swift `FileManager.url(create:true)`,
-/// which is unnecessary here because [`write_stubs`] creates the dir).
+/// The fixed, per-variant `ZDOTDIR` location: zsh's own subdirectory of the
+/// shared rc root, `<app support root>/<CFBundleName>/shellrc/zsh`. Ports Swift
+/// `MainTerminalShellInject.defaultLocation()`; the per-shell split (and the
+/// `zdotdir` → `shellrc/zsh` rename it brought) is design §8's, so bash's
+/// `nice.bashrc` can land beside these stubs without either shell seeing the
+/// other's files. Pure — creates nothing (unlike the Swift
+/// `FileManager.url(create:true)`, which is unnecessary here because
+/// [`write_stubs`] creates the dir).
+///
+/// The bootstrap does not call this: it writes into
+/// [`crate::shell::rc_dir_for`] the ACTIVE profile, which for a [`ZshProfile`]
+/// is exactly this path.
 pub fn default_location() -> PathBuf {
-    let override_value = std::env::var("NICE_APPLICATION_SUPPORT_ROOT").ok();
-    let home = std::env::var("HOME").ok();
-    application_support_root(override_value.as_deref(), home.as_deref())
-        .join(bundle_folder_name())
-        .join("zdotdir")
-}
-
-/// Resolve the Application Support root. The `NICE_APPLICATION_SUPPORT_ROOT`
-/// override wins when present and non-empty (the test seam); otherwise
-/// `<home>/Library/Application Support`. Factored out of [`default_location`] so
-/// the override seam is unit-tested without mutating the process environment.
-fn application_support_root(override_value: Option<&str>, home: Option<&str>) -> PathBuf {
-    if let Some(root) = override_value {
-        if !root.is_empty() {
-            return PathBuf::from(root);
-        }
-    }
-    PathBuf::from(home.unwrap_or("/")).join("Library/Application Support")
-}
-
-/// The per-variant folder name: the running app's `CFBundleName` (`"Nice"` /
-/// `"Nice Dev"` for the shipped bundles), falling back to `"Nice (unbundled)"`
-/// when unbundled — so an unbundled `cargo run` gets its own directory. Delegates
-/// to [`crate::platform::support_folder_name`], the single source of truth.
-fn bundle_folder_name() -> String {
-    crate::platform::support_folder_name()
+    super::shellrc_root().join("zsh")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::{COMPOSE_TRIGGER_BINDKEY, COMPOSE_TRIGGER_SEQ};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -695,6 +269,95 @@ mod tests {
         read_stub(".zshrc")
     }
 
+    // ---- byte-freeze proof -------------------------------------------------
+
+    /// SHA-256 of `bytes`, via the system `shasum` — the same tool a reviewer
+    /// runs by hand against the on-disk script files, so a mismatch between the
+    /// test and a manual spot-check is impossible.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn shasum");
+        child
+            .stdin
+            .take()
+            .expect("shasum stdin")
+            .write_all(bytes)
+            .expect("write body to shasum");
+        let out = child.wait_with_output().expect("shasum output");
+        assert!(out.status.success(), "shasum exited {:?}", out.status);
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .expect("shasum digest field")
+            .to_string()
+    }
+
+    /// The byte-freeze proof for the shell-profile extraction: the four rc-stub
+    /// bodies and the argv/trigger goldens are pinned by content hash and by
+    /// literal value, so moving the bodies into `include_str!` script files (or
+    /// re-homing the constants) cannot perturb a single byte unnoticed.
+    ///
+    /// A failure here means one of two things: the extraction changed the shell
+    /// text (fix the text — these bodies are a FROZEN compatibility contract
+    /// against helpers already installed on users' disks), or an `include_str!`
+    /// points at the wrong file. Re-pin the literals ONLY together with a
+    /// deliberate, reviewed change to the frozen contract.
+    #[test]
+    fn stub_bodies_and_argv_sha256_frozen() {
+        for (name, body, want) in [
+            (
+                "ZSHENV_BODY",
+                ZSHENV_BODY,
+                "d74a811318154a9083f1e53e224d341bfb4840410e3f1b3e6d7de0769053b0d0",
+            ),
+            (
+                "ZPROFILE_BODY",
+                ZPROFILE_BODY,
+                "4656c980ad7e520fc8610e22734e179621235eccacf2c90bf3e0ab300ff405e8",
+            ),
+            (
+                "ZLOGIN_BODY",
+                ZLOGIN_BODY,
+                "ef704c0a3087039ae34c4696c8f1056c3f8039746cf408b85de5b9e340e76570",
+            ),
+            (
+                "ZSHRC_BODY",
+                ZSHRC_BODY,
+                "482b4f0d30a1d16b1bd8939cc71e1977479e5988a87e404d204e56f23fc9376b",
+            ),
+        ] {
+            assert_eq!(sha256_hex(body.as_bytes()), want, "{name} bytes changed");
+            assert!(
+                !body.ends_with('\n'),
+                "{name} must not end with a newline (the inline raw strings did not)"
+            );
+        }
+
+        // The spawn argv goldens the zsh profile must keep producing.
+        assert_eq!(
+            nice_term_core::build_argv(None),
+            vec!["/bin/zsh".to_string(), "-il".to_string()]
+        );
+        assert_eq!(
+            nice_term_core::build_argv(Some("x")),
+            vec![
+                "/bin/zsh".to_string(),
+                "-ilc".to_string(),
+                "exec x".to_string()
+            ]
+        );
+
+        // The compose trigger, on both sides of the app↔shell interchange.
+        assert_eq!(COMPOSE_TRIGGER_SEQ, b"\x1b[5099~");
+        assert_eq!(COMPOSE_TRIGGER_BINDKEY, r"\e[5099~");
+    }
+
     // ---- file layout -------------------------------------------------------
 
     #[test]
@@ -724,22 +387,28 @@ mod tests {
         }
     }
 
-    /// The ZDOTDIR must live under Application Support, NOT `$TMPDIR` (which
-    /// macOS sweeps after 3 days), and be stable across calls so the dir is
-    /// reused rather than re-namespaced per launch.
+    /// The ZDOTDIR must be zsh's own subdirectory of the per-variant `shellrc`
+    /// root under Application Support, NOT `$TMPDIR` (which macOS sweeps after 3
+    /// days), and be stable across calls so the dir is reused rather than
+    /// re-namespaced per launch.
     #[test]
     fn default_location_is_under_app_support_not_temp() {
         let dir = default_location();
         assert_eq!(
             dir.file_name().and_then(|n| n.to_str()),
-            Some("zdotdir"),
-            "ZDOTDIR directory should be named `zdotdir`"
+            Some("zsh"),
+            "ZDOTDIR directory should be the `zsh` leaf of the shellrc root"
+        );
+        let parent = dir.parent().expect("has parent");
+        assert_eq!(
+            parent.file_name().and_then(|n| n.to_str()),
+            Some("shellrc"),
+            "zsh's stubs live under the shared per-variant `shellrc` root"
         );
         assert!(
             !dir.starts_with(std::env::temp_dir()),
             "ZDOTDIR must not live in $TMPDIR (macOS dirhelper sweeps it after 3 days). Got: {dir:?}"
         );
-        let parent = dir.parent().expect("has parent");
         assert!(
             parent.to_string_lossy().contains("Application Support"),
             "ZDOTDIR should live under Application Support. Got: {dir:?}"
@@ -751,34 +420,9 @@ mod tests {
         );
     }
 
-    // ---- the NICE_APPLICATION_SUPPORT_ROOT override seam -------------------
-    //
-    // Driven through the pure `application_support_root` so no process env is
-    // mutated (which would race parallel tests).
-
-    #[test]
-    fn override_root_wins_when_set() {
-        assert_eq!(
-            application_support_root(Some("/sandbox/appsup"), Some("/home/u")),
-            PathBuf::from("/sandbox/appsup")
-        );
-    }
-
-    #[test]
-    fn empty_override_falls_back_to_home() {
-        assert_eq!(
-            application_support_root(Some(""), Some("/home/u")),
-            PathBuf::from("/home/u/Library/Application Support")
-        );
-    }
-
-    #[test]
-    fn default_root_uses_home_app_support() {
-        assert_eq!(
-            application_support_root(None, Some("/home/u")),
-            PathBuf::from("/home/u/Library/Application Support")
-        );
-    }
+    // The `NICE_APPLICATION_SUPPORT_ROOT` override-seam tests moved to
+    // `shell/mod.rs` with `application_support_root` itself — the rc root is now
+    // shared by every profile, not zsh's alone.
 
     // ---- chain-back stubs --------------------------------------------------
 
@@ -1847,5 +1491,147 @@ zpty -d n 2>/dev/null
         // claude recorded the request, and no `total`-style ls output follows.
         let stdin = std::fs::read_to_string(rec.0.join("stdin")).unwrap();
         assert_eq!(stdin, "list all files with details\n");
+    }
+
+    // ---- the ShellProfile surface -----------------------------------------
+
+    fn profile() -> ZshProfile {
+        ZshProfile::new("/bin/zsh")
+    }
+
+    #[test]
+    fn zsh_profile_identity() {
+        let p = profile();
+        assert_eq!(p.kind(), ShellKind::Zsh);
+        assert_eq!(p.program(), "/bin/zsh");
+        assert_eq!(p.comm_name(), "zsh");
+        assert_eq!(p.display_name(), "zsh");
+        assert_eq!(p.compose_support(), ComposeSupport::Trigger);
+        assert_eq!(p.prefill(), PrefillStrategy::ShellSide);
+    }
+
+    /// A homebrew zsh keeps its own path everywhere argv is built — the profile
+    /// never rewrites it back to `/bin/zsh`.
+    #[test]
+    fn zsh_profile_carries_its_resolved_path() {
+        let p = ZshProfile::new("/opt/homebrew/bin/zsh");
+        assert_eq!(p.program(), "/opt/homebrew/bin/zsh");
+        assert_eq!(
+            p.spawn_argv(&SpawnCtx {
+                inject: None,
+                command: None
+            })[0],
+            "/opt/homebrew/bin/zsh"
+        );
+        assert_eq!(
+            p.probe_argv("command -v -- claude")[0],
+            "/opt/homebrew/bin/zsh"
+        );
+    }
+
+    /// The full `SpawnCtx` grid: zsh's argv depends ONLY on the command axis.
+    /// Injection rides `ZDOTDIR` in the env, so the inject axis must be inert —
+    /// this is the pin that says so out loud, because for bash it will not be.
+    #[test]
+    fn zsh_spawn_argv_ignores_the_inject_axis() {
+        let paths = InjectPaths {
+            dir: PathBuf::from("/tmp/nice-zdotdir"),
+            rcfile: None,
+        };
+        let p = profile();
+        for inject in [None, Some(&paths)] {
+            assert_eq!(
+                p.spawn_argv(&SpawnCtx {
+                    inject,
+                    command: None
+                }),
+                vec!["/bin/zsh".to_string(), "-il".to_string()]
+            );
+            assert_eq!(
+                p.spawn_argv(&SpawnCtx {
+                    inject,
+                    command: Some("claude --resume abc")
+                }),
+                vec![
+                    "/bin/zsh".to_string(),
+                    "-ilc".to_string(),
+                    "exec claude --resume abc".to_string()
+                ]
+            );
+        }
+    }
+
+    /// `NICE_USER_ZDOTDIR` is set even when Nice inherited no `ZDOTDIR` — the
+    /// `.zshenv` stub branches on `-n`, so "absent" and "empty" must stay
+    /// indistinguishable to it.
+    #[test]
+    fn zsh_inject_env_always_sets_user_zdotdir() {
+        let paths = InjectPaths {
+            dir: PathBuf::from("/tmp/nice-zdotdir"),
+            rcfile: None,
+        };
+        let p = profile();
+        assert_eq!(
+            p.inject_env(
+                &paths,
+                &UserShellEnv {
+                    user_zdotdir: Some("/Users/u/.config/zsh".to_string())
+                }
+            ),
+            vec![
+                ("ZDOTDIR".to_string(), "/tmp/nice-zdotdir".to_string()),
+                (
+                    "NICE_USER_ZDOTDIR".to_string(),
+                    "/Users/u/.config/zsh".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            p.inject_env(&paths, &UserShellEnv { user_zdotdir: None }),
+            vec![
+                ("ZDOTDIR".to_string(), "/tmp/nice-zdotdir".to_string()),
+                ("NICE_USER_ZDOTDIR".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn zsh_probe_argv_is_an_interactive_login_shell() {
+        assert_eq!(
+            profile().probe_argv("command -v -- claude"),
+            vec![
+                "/bin/zsh".to_string(),
+                "-ilc".to_string(),
+                "command -v -- claude".to_string()
+            ]
+        );
+    }
+
+    /// The trait writer is the same overwrite-always self-heal as
+    /// [`write_stubs`], and reports the directory back as the `InjectPaths` the
+    /// env injection references — with no `rcfile`, because zsh is injected
+    /// through the environment, not argv.
+    #[test]
+    fn zsh_write_rc_files_reports_paths_and_self_heals() {
+        let dir = Scratch(unique("nice-profile-rc-test"));
+        let paths = profile().write_rc_files(&dir.0).expect("write rc files");
+        assert_eq!(
+            paths,
+            InjectPaths {
+                dir: dir.0.clone(),
+                rcfile: None
+            }
+        );
+        for name in [".zshenv", ".zprofile", ".zlogin", ".zshrc"] {
+            assert!(dir.0.join(name).is_file(), "expected {name}");
+        }
+
+        std::fs::remove_file(dir.0.join(".zshrc")).expect("remove a stub");
+        profile().write_rc_files(&dir.0).expect("rewrite rc files");
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(".zshrc")).expect("read"),
+            ZSHRC_BODY,
+            "a removed stub must be restored byte-for-byte on the next write"
+        );
     }
 }
