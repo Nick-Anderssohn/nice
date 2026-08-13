@@ -51,7 +51,7 @@ use nice_model::shortcuts::{default_bindings, default_combo, ShortcutAction};
 use nice_model::{TermWindow, TermWindowKind, SidebarMode, SidebarModel, Session, WorkspaceModel};
 
 // ---------------------------------------------------------------------------
-// The 14 gpui actions — one struct per `ShortcutAction` case, in a local
+// One gpui action struct per `ShortcutAction` case, in a local
 // `r12_itests` namespace so they can't collide with the app's own actions. The
 // `all_actions_map_to_a_binding` test pins that this set and `ShortcutAction::ALL`
 // stay in lockstep, mirroring the app keymap's completeness test.
@@ -85,6 +85,24 @@ gpui::actions!(
         ScrollHalfPageUp,
         ScrollHalfPageDown,
         WindowByIndex,
+        // tmux Phase 2 (splits). Probe actions only: the pane verbs need a pane
+        // tree, a pty and a painted size this window-isolation probe does not
+        // stand up, so their behavior is pinned by `keymap` / `pane_layout` unit
+        // tests in `crates/nice` and `crates/nice-model`. What this mirror
+        // proves is that every table chord — the two divider mnemonics and the
+        // ⌃⌥⌘[⇧] rungs included — parses into a gpui binding.
+        SplitDown,
+        SplitRight,
+        ZoomPane,
+        BreakPane,
+        ResizePaneLeft,
+        ResizePaneDown,
+        ResizePaneUp,
+        ResizePaneRight,
+        SwapPaneLeft,
+        SwapPaneDown,
+        SwapPaneUp,
+        SwapPaneRight,
     ]
 );
 
@@ -385,6 +403,20 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &ScrollHalfPageUp, _cx: &mut App| {});
     cx.on_action(|_: &ScrollHalfPageDown, _cx: &mut App| {});
     cx.on_action(|_: &WindowByIndex, _cx: &mut App| {});
+    // Phase 2's pane verbs — registered so their chords are consumed here too,
+    // inert for the reason the actions! note gives.
+    cx.on_action(|_: &SplitDown, _cx: &mut App| {});
+    cx.on_action(|_: &SplitRight, _cx: &mut App| {});
+    cx.on_action(|_: &ZoomPane, _cx: &mut App| {});
+    cx.on_action(|_: &BreakPane, _cx: &mut App| {});
+    cx.on_action(|_: &ResizePaneLeft, _cx: &mut App| {});
+    cx.on_action(|_: &ResizePaneDown, _cx: &mut App| {});
+    cx.on_action(|_: &ResizePaneUp, _cx: &mut App| {});
+    cx.on_action(|_: &ResizePaneRight, _cx: &mut App| {});
+    cx.on_action(|_: &SwapPaneLeft, _cx: &mut App| {});
+    cx.on_action(|_: &SwapPaneDown, _cx: &mut App| {});
+    cx.on_action(|_: &SwapPaneUp, _cx: &mut App| {});
+    cx.on_action(|_: &SwapPaneRight, _cx: &mut App| {});
 }
 
 /// Route a window-scoped action to the key window's state (mirror of
@@ -437,6 +469,18 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
         ShortcutAction::ScrollHalfPageDown => KeyBinding::new(chord, ScrollHalfPageDown, None),
         // One binding here, not the app's nine-way expansion — see the actions! note.
         ShortcutAction::WindowByIndex => KeyBinding::new(chord, WindowByIndex, None),
+        ShortcutAction::SplitDown => KeyBinding::new(chord, SplitDown, None),
+        ShortcutAction::SplitRight => KeyBinding::new(chord, SplitRight, None),
+        ShortcutAction::ZoomPane => KeyBinding::new(chord, ZoomPane, None),
+        ShortcutAction::BreakPane => KeyBinding::new(chord, BreakPane, None),
+        ShortcutAction::ResizePaneLeft => KeyBinding::new(chord, ResizePaneLeft, None),
+        ShortcutAction::ResizePaneDown => KeyBinding::new(chord, ResizePaneDown, None),
+        ShortcutAction::ResizePaneUp => KeyBinding::new(chord, ResizePaneUp, None),
+        ShortcutAction::ResizePaneRight => KeyBinding::new(chord, ResizePaneRight, None),
+        ShortcutAction::SwapPaneLeft => KeyBinding::new(chord, SwapPaneLeft, None),
+        ShortcutAction::SwapPaneDown => KeyBinding::new(chord, SwapPaneDown, None),
+        ShortcutAction::SwapPaneUp => KeyBinding::new(chord, SwapPaneUp, None),
+        ShortcutAction::SwapPaneRight => KeyBinding::new(chord, SwapPaneRight, None),
     }
 }
 

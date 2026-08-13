@@ -2819,6 +2819,8 @@ fn live_window_counts_counts_modelled_but_unspawned_windows() {
             kind: TermWindowKind::Claude,
             cwd: None,
             title_manually_set: None,
+            layout: None,
+            active_leaf_id: None,
         }],
         title_manually_set: None,
         parent_session_id: None,

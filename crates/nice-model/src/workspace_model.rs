@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::pane_layout::Pane;
 use crate::term_window::{TermWindow, TermWindowKind};
 use crate::project::Project;
 use crate::session::Session;
@@ -1016,6 +1017,25 @@ impl WorkspaceModel {
             }
         }
         self.resolved_spawn_cwd(session)
+    }
+
+    /// Per-pane variant: prefer the pane's own last-observed cwd (OSC 7, per
+    /// leaf) when it is still on disk, else fall back to the window's
+    /// ([`resolved_spawn_cwd_for_window`](Self::resolved_spawn_cwd_for_window)).
+    /// A restored multi-pane pill puts each pane back where it was.
+    pub fn resolved_spawn_cwd_for_pane(
+        &self,
+        session: &Session,
+        window: &TermWindow,
+        pane: &Pane,
+    ) -> String {
+        if let Some(raw) = &pane.cwd {
+            let expanded = self.expand_tilde(raw);
+            if self.fs.exists(&expanded) {
+                return expanded;
+            }
+        }
+        self.resolved_spawn_cwd_for_window(session, window)
     }
 
     /// Resolve the cwd for a new window in `session`: an explicit `caller_provided`

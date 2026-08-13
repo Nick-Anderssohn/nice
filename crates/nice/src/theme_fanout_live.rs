@@ -270,7 +270,11 @@ fn terminal_theme_accent(
     window_host: &Entity<WindowHostView>,
     term_window_id: &str,
 ) -> Option<(TerminalTheme, nice_theme::color::Srgba)> {
-    let view = window_host.update(cx, |h, _| h.scenario_terminal_for(term_window_id))?;
+    // The host's view cache is pane-keyed since Phase 2: ask by pill and let it
+    // resolve the focused pane (the Main window here is never split, so that is
+    // its sole pane).
+    let view = window_host
+        .update(cx, |h, hcx| h.scenario_terminal_for_window(term_window_id, hcx))?;
     Some(view.update(cx, |v, _| (v.theme().clone(), v.accent())))
 }
 

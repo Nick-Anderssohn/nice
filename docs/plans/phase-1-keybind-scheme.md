@@ -1,5 +1,10 @@
 # Phase 1 — held-`^⌘` keybind scheme
 
+> **Phase 2 (2026-08-12) claimed the reserved rungs as planned** — `^⌥⌘hjkl`
+> resize and `^⌥⌘⇧hjkl` swap are real bindings now, the inert `^⌘⇧hjkl` focus
+> handlers are filled in, and `^⌘v`/`^⌘s` were freed rather than spent (Phase 2
+> D2 put splits on `^⌘-`/`^⌘\` instead). See `docs/plans/phase-2-splits.md`.
+
 ## Superseded (2026-08-11): hjkl ladder revision
 
 D1's and D3's **chord assignments** were revised right after ship. The modifier

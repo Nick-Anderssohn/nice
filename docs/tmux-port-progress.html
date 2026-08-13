@@ -154,7 +154,7 @@
 <header>
   <h1>Nice × tmux port</h1>
   <p class="sub">Bringing tmux's session / window / pane model into Nice, natively.</p>
-  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-11</span></p>
+  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-12</span></p>
 </header>
 
 <div class="overall">
@@ -234,16 +234,19 @@
     <h2>Phase 2 — splits</h2><span class="effort">L</span>
     <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
   </div>
-  <p class="blurb">The core investment: a split tree inside each upper-bar pill.</p>
+  <p class="blurb">The core investment: a split tree inside each upper-bar pill. A pane is one leaf of that tree; a pill that is never split behaves exactly as before.</p>
   <ul class="tasks">
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Model: layout tree per pill (leaves = pane ids, splits with ratios); <code>active_pane_id</code> = focused leaf</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t"><code>PaneHostView</code>: recursive render, N mounted <code>TerminalView</code>s, focused-pane affordance</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Divider drag-resize</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Multi-activation in <code>SessionManager</code>; validate independent refit/TIOCSWINSZ per mounted view</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Actions on the <kbd>^⌘</kbd> ladder: <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> split, <kbd>^⌘z</kbd> zoom, break-pane-to-pill — plus filling in the inert <kbd>^⌘⇧hjkl</kbd> focus handlers</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Claim the reserved ladder rungs as real bindings: <kbd>^⌥⌘hjkl</kbd> resize, <kbd>^⌥⌘⇧hjkl</kbd> swap</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Spatial close-refocus (nearest neighbor, not index neighbor)</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Persist layout in <code>PersistedTab</code> (schema bump, loader stays shape-tolerant)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Model: binary layout tree per pill (<code>PaneLayout</code> — leaves = panes, splits carry orientation + ratio); <code>active_pane_id</code> = focused leaf</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">One shared geometry — <code>leaf_rects</code>, <code>directional_neighbor</code>, <code>spatial_refocus</code> — used by render, focus, swap and close-refocus alike</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><code>WindowHostView</code>: recursive mount, N mounted <code>TerminalView</code>s, accent-border focused-pane affordance <span class="note">first-render focus grab suppressed so a tree mounting in one pass can't hand focus to the last leaf</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Divider drag-resize <span class="note">sidebar resize-handle pattern: cursor flip per orientation, root-level tracking, min clamp, double-click resets to half</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Pane-keyed pty layer: multi-spawn per pill, per-pane exit/hold/title/cwd routing, OR-across-leaves status and busy-close gate <span class="note">event subscriptions retained and re-keyable, not permanently detached</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Actions on the <kbd>^⌘</kbd> ladder: <kbd>^⌘-</kbd>/<kbd>^⌘\</kbd> split down/right <span class="note">D2 divider mnemonics — <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> freed instead</span>, <kbd>^⌘z</kbd> zoom, <kbd>^⌘b</kbd> break-pane-to-pill, and the inert <kbd>^⌘⇧hjkl</kbd> focus handlers filled in</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Claim the reserved ladder rungs as real bindings: <kbd>^⌥⌘hjkl</kbd> resize, <kbd>^⌥⌘⇧hjkl</kbd> swap <span class="note">12 new actions (22 → 34); <code>RESERVED_COMBOS</code> 20 → 9</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Spatial close-refocus (shared-edge neighbor, not index neighbor)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Persist layout in <code>PersistedTermWindow</code> <span class="note">optional <code>layout</code>/<code>activeLeafId</code>, written only for multi-pane pills; version stays 3, loader validates or falls back and never errors</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Live gate: the <code>splits</code> self-test scenario (every pane verb asserted on its model effect AND on zero pty bytes)</span></li>
+    <li data-status="deferred"><span class="chip">deferred</span><span class="t">Even-layout presets (tmux <code>select-layout</code>) — <span class="note">D3: revisit once the tree exists and the need is felt</span></span></li>
   </ul>
 </section>
 
@@ -296,7 +299,7 @@
     <tbody>
       <tr><td><strong>session</strong></td><td><code>Tab</code> — sidebar row (<code>tab.rs</code>)</td><td><code>Session</code></td><td>Named group of ptys, one active at a time</td></tr>
       <tr><td><strong>window</strong></td><td><code>Pane</code> — upper-bar pill, one pty (<code>pane.rs</code>)</td><td><code>TermWindow</code></td><td>Decided 2026-08-08 — avoids the <code>gpui::Window</code> collision</td></tr>
-      <tr><td><strong>pane</strong></td><td>— (doesn't exist yet)</td><td><code>Pane</code></td><td>Split-tree leaf, introduced in Phase 2</td></tr>
+      <tr><td><strong>pane</strong></td><td>— (didn't exist before Phase 2)</td><td><code>Pane</code></td><td>Split-tree leaf, introduced in Phase 2 ✓</td></tr>
       <tr><td><strong>client</strong></td><td>OS window (<code>WindowState</code>)</td><td>keep</td><td></td></tr>
       <tr><td><strong>server</strong></td><td>the app process</td><td>keep</td><td>No daemon; in-app detach is Phase 4</td></tr>
       <tr><td>—</td><td><code>Project</code> — sidebar section</td><td>keep</td><td>No tmux analogue (session group)</td></tr>
@@ -326,13 +329,19 @@
     <li><strong>D1</strong> — <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> become the <code>PrevWindow</code>/<code>NextWindow</code> <em>defaults</em> (frozen ids unchanged); <kbd>⌘⌥←</kbd>/<kbd>⌘⌥→</kbd> are freed, no dual-chord installs — <em>chords revised by the hjkl ladder below; the ids-stay-frozen rule still holds</em> <span class="d">2026-08-11</span></li>
     <li><strong>D2</strong> — <kbd>^⌘1-9</kbd> is ONE rebindable row (<code>windowByIndex</code>): the recorded modifier set applies to every digit; nine separate rows rejected <span class="d">2026-08-11</span></li>
     <li><strong>D3</strong> — the <code>FocusPaneLeft/Down/Up/Right</code> actions are named for their Phase 2 spatial meaning, so Phase 2 swaps handlers only — <em>the ladder moved them to <kbd>^⌘⇧hjkl</kbd>, where all four are inert; nothing aliases the pill strip any more</em> <span class="d">2026-08-11</span></li>
-    <li><strong>D4</strong> — the future-phase chords (<kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd>) go in the reserved-combo guard rather than shipping as no-op actions <span class="d">2026-08-11</span></li>
+    <li><strong>D4</strong> — the future-phase chords (<kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd>) go in the reserved-combo guard rather than shipping as no-op actions — <em>Phase 2 claimed <kbd>^⌘z</kbd> and the eight ladder rungs and freed <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd>, taking the table 20 → 9; only <kbd>^⌘/</kbd> is still held, for Phase 3</em> <span class="d">2026-08-11</span></li>
     <li><strong>D5</strong> — the hint overlay appears after ~200 ms of held <kbd>^⌘</kbd> and hides instantly on release or any change to the held set <span class="d">2026-08-11</span></li>
     <li><strong>hjkl ladder</strong> (revises D1/D3 post-ship) — the modifier set selects the verb: bare <kbd>^⌘</kbd> navigates containers (<kbd>h</kbd>/<kbd>l</kbd> pills, <kbd>j</kbd>/<kbd>k</kbd> sessions), <kbd>^⌘⇧</kbd> moves pane focus, <kbd>^⌥⌘</kbd> resizes, <kbd>^⌥⌘⇧</kbd> (Hyper) swaps. Sessions join the bare layer; <kbd>^⌘Space</kbd> for swap was rejected (macOS emoji picker, and Space is not a modifier). <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> and the <kbd>⌘⌥</kbd> arrows are freed <span class="d">2026-08-11</span></li>
     <li><strong>Half-page scroll moved to <kbd>^⌘↑</kbd>/<kbd>^⌘↓</kbd></strong> — real <kbd>^⌘D</kbd> keydowns are swallowed by the macOS dictionary hotkey before the app sees them (found in hand-testing; the gpui-level scenario injects downstream of the OS intercept and cannot detect it). <kbd>^⌘u</kbd>/<kbd>^⌘d</kbd> are freed, and <kbd>^⌘D</kbd> is a pure reserved entry again <span class="d">2026-08-11</span></li>
     <li>No shortcut-store migration for the D1 flip: a user who ever rebound anything keeps their stored combos and loads the new action ids unbound (frozen load rule 5) — accepted, not a bug <span class="d">2026-08-11</span></li>
     <li>Scrollback keys are Shift-variants only (<kbd>⇧PageUp</kbd>/<kbd>⇧PageDown</kbd>/<kbd>⇧Home</kbd>/<kbd>⇧End</kbd>); plain keys keep encoding to the pty; alt screen falls through to the TUI <span class="d">2026-08-10</span></li>
     <li><code>TERMINAL_MIN_WIDTH</code> = 300pt; sidebar max = viewport − 300pt (fixed 480pt cap retired) <span class="d">2026-08-10</span></li>
+    <li><strong>Phase 2 D1</strong> — any pill splits, and a new pane is always a plain shell in the focused pane's cwd. Nice never spawns Claude into a split pane, so the ≤1-running-Claude-per-session invariant is untouched; Claude in one pane with a shell beside it is the point <span class="d">2026-08-12</span></li>
+    <li><strong>Phase 2 D2</strong> — split chords are divider mnemonics: <kbd>^⌘-</kbd> splits down (stacked), <kbd>^⌘\</kbd> splits right (side by side). The words "vertical" and "horizontal" appear nowhere in UI, action names or ids — vim and tmux assign them opposite meanings. <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> end bound to nothing <span class="d">2026-08-12</span></li>
+    <li><strong>Phase 2 D3</strong> — scope is core plus break-pane (<kbd>^⌘b</kbd>); tmux <code>select-layout</code> even-layout presets deferred until the tree exists and the need is felt <span class="d">2026-08-12</span></li>
+    <li><strong>Pane identity stays off the frozen surfaces</strong> — pane ids are internal strings; every pane's pty keeps the pill's <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code>, so <code>paneId</code> permanently means "pill" and socket traffic still routes there. Pane-level addressing waits for Phase 5 <span class="d">2026-08-12</span></li>
+    <li><strong>Zoom is transient, focus does not wrap</strong> — <code>zoomed</code> is never persisted and any structural or focus change un-zooms first (tmux <code>select-pane</code> behavior); directional pane focus stops at the edges rather than wrapping or falling through to pill nav, since bare <kbd>^⌘h</kbd>/<kbd>^⌘l</kbd> is how you leave the pill <span class="d">2026-08-12</span></li>
+    <li><strong>Accepted wart</strong> — after break-pane the moved pty's <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code> still name the source pill (env is fixed at fork), so socket traffic from that shell targets the old pill. Same class of staleness as moving any live process <span class="d">2026-08-12</span></li>
   </ul>
 </section>
 
@@ -344,13 +353,14 @@
     <tbody>
       <tr><td><kbd>^⌘h</kbd> / <kbd>^⌘l</kbd></td><td>Prev / next upper-bar pill — the only pill pair</td><td>1 ✓</td></tr>
       <tr><td><kbd>^⌘j</kbd> / <kbd>^⌘k</kbd></td><td>Next / prev sidebar session (j = down the list)</td><td>1 ✓</td></tr>
-      <tr><td><kbd>^⌘⇧h/j/k/l</kbd></td><td>Directional pane focus (bound, inert until splits land)</td><td>1 ✓ → 2</td></tr>
-      <tr><td><kbd>^⌥⌘h/j/k/l</kbd></td><td>Resize split toward that edge (reserved, unbound)</td><td>2</td></tr>
-      <tr><td><kbd>^⌥⌘⇧h/j/k/l</kbd></td><td>Directional pane swap (reserved, unbound)</td><td>2</td></tr>
+      <tr><td><kbd>^⌘⇧h/j/k/l</kbd></td><td>Directional pane focus — no wrap, no fall-through to pill nav</td><td>2 ✓</td></tr>
+      <tr><td><kbd>^⌥⌘h/j/k/l</kbd></td><td>Resize the nearest matching-orientation split toward that edge (~40 px step, clamped)</td><td>2 ✓</td></tr>
+      <tr><td><kbd>^⌥⌘⇧h/j/k/l</kbd></td><td>Swap the focused pane with its neighbor there; focus follows the content</td><td>2 ✓</td></tr>
       <tr><td><kbd>^⌘1</kbd>–<kbd>^⌘9</kbd></td><td>Pill by index (one rebindable row)</td><td>1 ✓</td></tr>
       <tr><td><kbd>^⌘o</kbd></td><td>Last-active window</td><td>1 ✓</td></tr>
-      <tr><td><kbd>^⌘z</kbd></td><td>Zoom pane</td><td>2</td></tr>
-      <tr><td><kbd>^⌘v</kbd> / <kbd>^⌘s</kbd></td><td>Vertical / horizontal split</td><td>2</td></tr>
+      <tr><td><kbd>^⌘z</kbd></td><td>Zoom the focused pane (toggle; never persisted)</td><td>2 ✓</td></tr>
+      <tr><td><kbd>^⌘-</kbd> / <kbd>^⌘\</kbd></td><td>Split down / split right — divider mnemonics (D2). <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> are freed</td><td>2 ✓</td></tr>
+      <tr><td><kbd>^⌘b</kbd></td><td>Break the focused shell pane out into its own pill (refused on the Claude pane)</td><td>2 ✓</td></tr>
       <tr><td><kbd>^⌘↑</kbd> / <kbd>^⌘↓</kbd></td><td>Half-page scrollback up / down (inert on the alt screen)</td><td>1 ✓</td></tr>
       <tr><td><kbd>^⌘/</kbd></td><td>Scrollback search</td><td>3</td></tr>
       <tr><td><em>hold</em> <kbd>^⌘</kbd></td><td>Window-index badges on the pills while held (~200 ms)</td><td>1 ✓</td></tr>
@@ -371,7 +381,10 @@
   const phases = document.querySelectorAll("section.phase");
   let allDone = 0, allTotal = 0, allDoing = 0, currentPhase = null;
   phases.forEach(ph => {
-    const items = ph.querySelectorAll("li[data-status]");
+    // Deliberately-deferred work is not outstanding work, so it stays out of
+    // the denominator — otherwise a shipped phase never reads as complete and
+    // "current phase" sticks on it forever.
+    const items = ph.querySelectorAll('li[data-status]:not([data-status="deferred"])');
     const done  = ph.querySelectorAll('li[data-status="done"]').length;
     const doing = ph.querySelectorAll('li[data-status="doing"]').length;
     const total = items.length;
@@ -386,7 +399,7 @@
   // "Current phase" = first phase with unfinished work (started or not)
   if (currentPhase === null) {
     for (const ph of phases) {
-      const total = ph.querySelectorAll("li[data-status]").length;
+      const total = ph.querySelectorAll('li[data-status]:not([data-status="deferred"])').length;
       const done = ph.querySelectorAll('li[data-status="done"]').length;
       if (done < total) { currentPhase = ph.dataset.phase; break; }
     }

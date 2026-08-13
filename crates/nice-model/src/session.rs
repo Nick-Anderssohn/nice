@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::term_window::{TermWindow, TermWindowKind, SessionStatus};
+use crate::term_window::{TermWindow, SessionStatus};
 
 /// A session (one sidebar row). Fields mirror `Models.swift`'s `Tab`. Construct
 /// with [`Session::new`] and set `windows` / `active_window_id` directly.
@@ -17,7 +17,10 @@ use crate::term_window::{TermWindow, TermWindowKind, SessionStatus};
 ///
 /// `Session.branch` (vestigial, roadmap M5) is deliberately **not** ported into
 /// this struct.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// **No `Eq`/`Hash`** — the windows carry `f32` split ratios since tmux-port
+/// Phase 2; see [`TermWindow`]'s note. `PartialEq` stays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub title: String,
@@ -91,10 +94,24 @@ impl Session {
 
     /// The alive Claude windows on this session — the only windows the sidebar dot
     /// derives from, so it can't drift from the toolbar pill.
+    ///
+    /// "Alive" is the Claude **pane**'s liveness, not the pill's
+    /// ([`TermWindow::claude_pane_is_live`]): since Phase 2 a pill outlives its
+    /// Claude pane whenever a shell pane beside it keeps running, and a dead
+    /// Claude must stop lighting the sidebar the moment it dies. For a
+    /// never-split pill the two are the same fact.
     fn live_claude_windows(&self) -> impl Iterator<Item = &TermWindow> {
-        self.windows
-            .iter()
-            .filter(|w| w.kind == TermWindowKind::Claude && w.is_alive)
+        self.windows.iter().filter(|w| w.claude_pane_is_live())
+    }
+
+    /// The window whose split tree contains `pane_id`.
+    ///
+    /// A pane's events are routed by pane id alone, because break-pane can
+    /// re-home a pane under a different pill between two subscription sweeps —
+    /// so the owning window is resolved from the model at event time rather
+    /// than captured when the subscription was made.
+    pub fn window_for_pane(&self, pane_id: &str) -> Option<&TermWindow> {
+        self.windows.iter().find(|w| w.layout.contains(pane_id))
     }
 
     /// True if any alive window on this session is a Claude window (`Models.swift:215`).
@@ -231,6 +248,7 @@ fn parse_terminal_index(title: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term_window::TermWindowKind;
 
     fn claude(id: &str) -> TermWindow {
         TermWindow::new(id, "Claude", TermWindowKind::Claude)
@@ -621,6 +639,44 @@ mod tests {
             Session::recover_next_terminal_index(&["Terminal42"]),
             1,
             "No whitespace between 'Terminal' and digits must NOT parse."
+        );
+    }
+
+    // MARK: - window_for_pane
+    //
+    // The pane-keyed event subscription resolves a pane's owning pill through
+    // this at event time — a wrong answer routes a background/re-homed pane's
+    // titles, cwd, and exit onto the wrong pill.
+
+    #[test]
+    fn window_for_pane_resolves_the_owning_window_after_a_split() {
+        use crate::pane_layout::{Pane, SplitOrient};
+
+        let mut session = session_with(vec![claude("claude"), terminal("term")], Some("claude"));
+        let split = session.windows[1].layout.split(
+            "term",
+            SplitOrient::Beside,
+            Pane::new("leaf-2", TermWindowKind::Terminal),
+        );
+        assert!(split, "the split target is the window's own single leaf");
+
+        assert_eq!(
+            session.window_for_pane("claude").map(|w| w.id.as_str()),
+            Some("claude"),
+            "a single-leaf window resolves via its own pane id"
+        );
+        assert_eq!(
+            session.window_for_pane("term").map(|w| w.id.as_str()),
+            Some("term")
+        );
+        assert_eq!(
+            session.window_for_pane("leaf-2").map(|w| w.id.as_str()),
+            Some("term"),
+            "a split-added pane resolves to the window that contains it"
+        );
+        assert!(
+            session.window_for_pane("ghost").is_none(),
+            "a pane id absent from every tree resolves to no window"
         );
     }
 }

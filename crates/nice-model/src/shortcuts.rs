@@ -34,25 +34,29 @@
 /// case here extends [`ShortcutAction::ALL`] (which the completeness test pins
 /// against [`default_bindings`]) and the recorder list R24 iterates.
 ///
-/// The set is intentionally exactly these 22 — the actions Nice lets a user
+/// The set is intentionally exactly these 34 — the actions Nice lets a user
 /// rebind. Window-management accelerators that are *not* rebindable (New Window
 /// ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent: they live as fixed menu
 /// actions in `crates/nice`, not in this table.
 ///
-/// The trailing eight are the tmux-port Phase 1 held-`⌃⌘` scheme (roadmap
-/// "Phase 1 — held-modifier keybind scheme"): the four `FocusPane*` directions,
+/// Eight of them are the tmux-port Phase 1 held-`⌃⌘` scheme (roadmap "Phase 1 —
+/// held-modifier keybind scheme"): the four `FocusPane*` directions,
 /// [`LastActiveWindow`](ShortcutAction::LastActiveWindow), the two half-page
 /// scrollback actions, and the single
 /// [`WindowByIndex`](ShortcutAction::WindowByIndex) template row that covers all
 /// nine `⌃⌘1`…`⌃⌘9` chords (D2 — one settings row, not nine).
 ///
-/// ## The hjkl ladder (revised 2026-08-11)
+/// The trailing twelve are Phase 2 (splits): the two split verbs, zoom,
+/// break-pane, and the two directional rungs the ladder held in reserve.
+///
+/// ## The hjkl ladder (revised 2026-08-11, completed by Phase 2)
 ///
 /// The modifier SET selects the verb and the `hjkl` key selects the direction:
 /// bare `⌃⌘` navigates containers (`h`/`l` = prev/next pill, `j`/`k` = next/prev
-/// sidebar session), `⌃⌘⇧` moves pane focus (Phase 2), `⌃⌥⌘` resizes a split and
-/// `⌃⌥⌘⇧` swaps panes (both Phase 2, held in [`RESERVED_COMBOS`] rather than
-/// shipped as inert actions). The revision frees `⌃⌘[`/`⌃⌘]` and `⌘⌥↑`/`⌘⌥↓`.
+/// sidebar session), `⌃⌘⇧` moves pane focus, `⌃⌥⌘` resizes a split and `⌃⌥⌘⇧`
+/// swaps panes. Phase 1 shipped the first two rungs and held the last two in
+/// [`RESERVED_COMBOS`]; Phase 2 promotes them to real actions, which is why
+/// their reserved entries are gone (a chord may never be both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutAction {
     /// Cycle to the next sidebar session — `j`, down the sidebar list (⌃⌘J since
@@ -125,6 +129,46 @@ pub enum ShortcutAction {
     /// ([`WINDOW_INDEX_STORED_KEY`]), and the keymap expands it into nine
     /// bindings over [`WINDOW_INDEX_KEYS`].
     WindowByIndex,
+    // -- Phase 2 (tmux port): splits ----------------------------------------
+    /// Split the focused pane so the new one sits BELOW it (⌃⌘-) — tmux
+    /// `split-window -v`. D2: the chord is the divider's own glyph (`-` reads
+    /// like the rule the split draws), and the words "vertical"/"horizontal"
+    /// appear nowhere, because vim and tmux assign them opposite meanings.
+    SplitDown,
+    /// Split the focused pane so the new one sits to its RIGHT (⌃⌘\) — tmux
+    /// `split-window -h`. D2 again: `\` is the `|` key, and `|` is what the
+    /// divider looks like.
+    SplitRight,
+    /// Toggle "only the focused pane is painted, full size" (⌃⌘Z) — tmux
+    /// `resize-pane -Z`. Every pane's pty stays live underneath, and any
+    /// structural or focus change un-zooms first (P4).
+    ZoomPane,
+    /// Move the focused SHELL pane out into a pill of its own (⌃⌘B) — tmux
+    /// `break-pane`. Refused on the Claude pane and on a single-pane pill (P3).
+    BreakPane,
+    /// Walk the nearest enclosing side-by-side split's divider LEFT (⌃⌥⌘H) —
+    /// tmux `resize-pane -L`. The ladder's resize rung; Phase 1 held it in
+    /// [`RESERVED_COMBOS`] for exactly this.
+    ResizePaneLeft,
+    /// Walk the nearest enclosing stacked split's divider DOWN (⌃⌥⌘J) — tmux
+    /// `resize-pane -D`.
+    ResizePaneDown,
+    /// Walk the nearest enclosing stacked split's divider UP (⌃⌥⌘K) — tmux
+    /// `resize-pane -U`.
+    ResizePaneUp,
+    /// Walk the nearest enclosing side-by-side split's divider RIGHT (⌃⌥⌘L) —
+    /// tmux `resize-pane -R`.
+    ResizePaneRight,
+    /// Trade places with the pane to the LEFT (⌃⌥⌘⇧H) — tmux `swap-pane`.
+    /// Payloads swap, structure and ratios stay put, and focus follows the
+    /// content (P8).
+    SwapPaneLeft,
+    /// Trade places with the pane BELOW (⌃⌥⌘⇧J) — tmux `swap-pane` (P8).
+    SwapPaneDown,
+    /// Trade places with the pane ABOVE (⌃⌥⌘⇧K) — tmux `swap-pane` (P8).
+    SwapPaneUp,
+    /// Trade places with the pane to the RIGHT (⌃⌥⌘⇧L) — tmux `swap-pane` (P8).
+    SwapPaneRight,
 }
 
 /// The nine key tokens the single [`ShortcutAction::WindowByIndex`] row expands
@@ -149,7 +193,7 @@ impl ShortcutAction {
     /// Every action, in a stable order. Used by the completeness test and by
     /// R24's recorder (which renders one row per action). The order matches the
     /// enum declaration and Swift's `allCases`.
-    pub const ALL: [ShortcutAction; 22] = [
+    pub const ALL: [ShortcutAction; 34] = [
         ShortcutAction::NextSidebarSession,
         ShortcutAction::PrevSidebarSession,
         ShortcutAction::NextWindow,
@@ -172,6 +216,19 @@ impl ShortcutAction {
         ShortcutAction::ScrollHalfPageUp,
         ShortcutAction::ScrollHalfPageDown,
         ShortcutAction::WindowByIndex,
+        // Phase 2 (splits).
+        ShortcutAction::SplitDown,
+        ShortcutAction::SplitRight,
+        ShortcutAction::ZoomPane,
+        ShortcutAction::BreakPane,
+        ShortcutAction::ResizePaneLeft,
+        ShortcutAction::ResizePaneDown,
+        ShortcutAction::ResizePaneUp,
+        ShortcutAction::ResizePaneRight,
+        ShortcutAction::SwapPaneLeft,
+        ShortcutAction::SwapPaneDown,
+        ShortcutAction::SwapPaneUp,
+        ShortcutAction::SwapPaneRight,
     ];
 
     /// Human-readable label for the (future) recorder row. Ported verbatim from
@@ -200,6 +257,22 @@ impl ShortcutAction {
             ShortcutAction::ScrollHalfPageUp => "Scroll half page up",
             ShortcutAction::ScrollHalfPageDown => "Scroll half page down",
             ShortcutAction::WindowByIndex => "Window 1-9",
+            // Phase 2 (splits). D2 fixes the two split labels verbatim — "Split
+            // Down" / "Split Right", never "vertical"/"horizontal" — and the
+            // rest of the pane family follows that capitalization so the block
+            // reads as one family in the recorder.
+            ShortcutAction::SplitDown => "Split Down",
+            ShortcutAction::SplitRight => "Split Right",
+            ShortcutAction::ZoomPane => "Zoom Pane",
+            ShortcutAction::BreakPane => "Break Pane to Window",
+            ShortcutAction::ResizePaneLeft => "Resize Pane Left",
+            ShortcutAction::ResizePaneDown => "Resize Pane Down",
+            ShortcutAction::ResizePaneUp => "Resize Pane Up",
+            ShortcutAction::ResizePaneRight => "Resize Pane Right",
+            ShortcutAction::SwapPaneLeft => "Swap Pane Left",
+            ShortcutAction::SwapPaneDown => "Swap Pane Down",
+            ShortcutAction::SwapPaneUp => "Swap Pane Up",
+            ShortcutAction::SwapPaneRight => "Swap Pane Right",
         }
     }
 
@@ -259,6 +332,19 @@ impl ShortcutAction {
             ShortcutAction::ScrollHalfPageUp => "scrollHalfPageUp",
             ShortcutAction::ScrollHalfPageDown => "scrollHalfPageDown",
             ShortcutAction::WindowByIndex => "windowByIndex",
+            // Phase 2 (tmux port) — additive again, same load rule 5.
+            ShortcutAction::SplitDown => "splitDown",
+            ShortcutAction::SplitRight => "splitRight",
+            ShortcutAction::ZoomPane => "zoomPane",
+            ShortcutAction::BreakPane => "breakPane",
+            ShortcutAction::ResizePaneLeft => "resizePaneLeft",
+            ShortcutAction::ResizePaneDown => "resizePaneDown",
+            ShortcutAction::ResizePaneUp => "resizePaneUp",
+            ShortcutAction::ResizePaneRight => "resizePaneRight",
+            ShortcutAction::SwapPaneLeft => "swapPaneLeft",
+            ShortcutAction::SwapPaneDown => "swapPaneDown",
+            ShortcutAction::SwapPaneUp => "swapPaneUp",
+            ShortcutAction::SwapPaneRight => "swapPaneRight",
         }
     }
 
@@ -322,15 +408,15 @@ impl Modifiers {
         alt: false,
         shift: true,
     };
-    /// ⌃⌥⌘ — the ladder's "resize split" rung (Phase 2; reserved, not bound).
+    /// ⌃⌥⌘ — the ladder's "resize split" rung (Phase 2's `ResizePane*`).
     pub const CONTROL_ALT_COMMAND: Modifiers = Modifiers {
         command: true,
         control: true,
         alt: true,
         shift: false,
     };
-    /// ⌃⌥⌘⇧ (the "Hyper" cluster) — the ladder's "swap panes" rung (Phase 2;
-    /// reserved, not bound).
+    /// ⌃⌥⌘⇧ (the "Hyper" cluster) — the ladder's "swap panes" rung (Phase 2's
+    /// `SwapPane*`).
     pub const CONTROL_ALT_COMMAND_SHIFT: Modifiers = Modifiers {
         command: true,
         control: true,
@@ -389,7 +475,10 @@ impl KeyCombo {
 /// sidebar sessions (so both container axes sit on one held pair), while the
 /// `FocusPane*` family sits a rung up on `⌃⌘⇧`. `⌃⌘[`/`⌃⌘]` (the shipped D1
 /// spelling) and `⌘⌥↑`/`⌘⌥↓` are freed — nothing binds them.
-pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 22] {
+/// The Phase 2 rows finish the ladder: `⌃⌥⌘hjkl` resizes and `⌃⌥⌘⇧hjkl` swaps,
+/// with the pane verbs that have no direction (`⌃⌘-`, `⌃⌘\`, `⌃⌘z`, `⌃⌘b`) on
+/// the bare rung.
+pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 34] {
     use ShortcutAction::*;
     [
         // The ladder's bare-⌃⌘ rung, vertical axis: j = down the sidebar list
@@ -558,6 +647,101 @@ pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 22] {
             KeyCombo {
                 modifiers: Modifiers::CONTROL_COMMAND,
                 key: WINDOW_INDEX_STORED_KEY,
+            },
+        ),
+        // -- Phase 2 (tmux port): splits -------------------------------------
+        // D2's divider mnemonics on the bare ⌃⌘ rung: `-` is the rule a stacked
+        // split draws, `\` is the `|` key a side-by-side split looks like. Both
+        // keys are already spoken for under PLAIN ⌘ (font zoom out, nothing),
+        // which is why the modifier set matters and not the key alone.
+        (
+            SplitDown,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "-",
+            },
+        ),
+        (
+            SplitRight,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "\\",
+            },
+        ),
+        // ⌃⌘Z and ⌃⌘B were held as `FuturePhase` reserved entries until this
+        // phase; a chord may never be both reserved and a default, so those
+        // entries are gone (the disjointness test enforces it).
+        (
+            ZoomPane,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "z",
+            },
+        ),
+        (
+            BreakPane,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "b",
+            },
+        ),
+        // The ladder's top two rungs, claimed at last: ⌃⌥⌘ resizes the split,
+        // ⌃⌥⌘⇧ (the "Hyper" cluster) swaps panes — same hjkl directions as the
+        // rungs below them.
+        (
+            ResizePaneLeft,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND,
+                key: "h",
+            },
+        ),
+        (
+            ResizePaneDown,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND,
+                key: "j",
+            },
+        ),
+        (
+            ResizePaneUp,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND,
+                key: "k",
+            },
+        ),
+        (
+            ResizePaneRight,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND,
+                key: "l",
+            },
+        ),
+        (
+            SwapPaneLeft,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
+                key: "h",
+            },
+        ),
+        (
+            SwapPaneDown,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
+                key: "j",
+            },
+        ),
+        (
+            SwapPaneUp,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
+                key: "k",
+            },
+        ),
+        (
+            SwapPaneRight,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
+                key: "l",
             },
         ),
     ]
@@ -735,9 +919,12 @@ pub enum ReservedKind {
     /// Group (b) — claimed by macOS itself, so the chord may never even reach
     /// Nice (⌃⌘Q lock screen, ⌃⌘Space emoji picker, ⌃⌘D dictionary lookup).
     SystemReserved,
-    /// Group (c) — held for a later tmux-port phase (D4: ⌃⌘Z, ⌃⌘V, ⌃⌘S, ⌃⌘/,
-    /// plus the hjkl ladder's two Phase-2 rungs ⌃⌥⌘hjkl resize and ⌃⌥⌘⇧hjkl
-    /// swap), so nothing can squat on the chord before Phases 2/3 claim it.
+    /// Group (c) — held for a later tmux-port phase, so nothing can squat on
+    /// the chord before that phase claims it. Phase 2 emptied most of this
+    /// group: ⌃⌘Z and ⌃⌘B became real actions, the ⌃⌥⌘hjkl / ⌃⌥⌘⇧hjkl rungs
+    /// became the resize + swap families, and ⌃⌘V / ⌃⌘S were simply released
+    /// (D2 gave the split verbs the divider mnemonics instead). Only ⌃⌘/ is
+    /// still held, for Phase 3.
     FuturePhase,
 }
 
@@ -818,7 +1005,15 @@ pub const RESERVED_TOGGLE_FULL_SCREEN: ReservedCombo = ReservedCombo {
 /// sees it, so the binding never worked in the hand). It is a pure group-b entry
 /// again, and the `no_default_combo_is_reserved` test pins that the table and the
 /// defaults stay disjoint.
-pub const RESERVED_COMBOS: [ReservedCombo; 20] = [
+///
+/// **Phase 2 shrank this table 20 → 9.** Reserving a chord is a promise to claim
+/// it later, and the disjointness test makes good on that promise the only way it
+/// can: an entry must be REMOVED to become a default. So ⌃⌘Z (zoom), ⌃⌘B
+/// (break-pane) and the eight ⌃⌥⌘[⇧]hjkl rungs (resize + swap) left this table
+/// the moment they became actions, and ⌃⌘V / ⌃⌘S left with them — D2 spent the
+/// split verbs on the divider mnemonics ⌃⌘- / ⌃⌘\ instead, so those two are now
+/// ordinary free chords a user may record (the same end state ⌃⌘U reached).
+pub const RESERVED_COMBOS: [ReservedCombo; 9] = [
     // (a) Nice's own fixed accelerators.
     RESERVED_QUIT,
     RESERVED_NEW_WINDOW,
@@ -850,31 +1045,8 @@ pub const RESERVED_COMBOS: [ReservedCombo; 20] = [
         kind: ReservedKind::SystemReserved,
         reason: "Reserved: the macOS dictionary lookup",
     },
-    // (c) Held for later tmux-port phases (D4).
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_COMMAND,
-            key: "z",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_COMMAND,
-            key: "v",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_COMMAND,
-            key: "s",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature",
-    },
+    // (c) Held for a later tmux-port phase. One entry left after Phase 2 spent
+    // the rest: ⌃⌘/ is Phase 3's.
     ReservedCombo {
         combo: KeyCombo {
             modifiers: Modifiers::CONTROL_COMMAND,
@@ -882,73 +1054,6 @@ pub const RESERVED_COMBOS: [ReservedCombo; 20] = [
         },
         kind: ReservedKind::FuturePhase,
         reason: "Reserved for a future Nice feature",
-    },
-    // (c continued) The hjkl ladder's two Phase-2 rungs (2026-08-11 revision).
-    // Reserved rather than shipped as inert actions — same call as D4 — so the
-    // whole ⌃⌥⌘ / ⌃⌥⌘⇧ block is intact when splits land.
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND,
-            key: "h",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: resize the split toward the left edge",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND,
-            key: "j",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: resize the split toward the bottom edge",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND,
-            key: "k",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: resize the split toward the top edge",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND,
-            key: "l",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: resize the split toward the right edge",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
-            key: "h",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: swap this pane with the one to its left",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
-            key: "j",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: swap this pane with the one below it",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
-            key: "k",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: swap this pane with the one above it",
-    },
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_ALT_COMMAND_SHIFT,
-            key: "l",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature: swap this pane with the one to its right",
     },
 ];
 
@@ -972,11 +1077,11 @@ mod tests {
     #[test]
     fn table_is_complete_every_action_bound_exactly_once() {
         let table = default_bindings();
-        assert_eq!(table.len(), 22, "22 rebindable actions");
+        assert_eq!(table.len(), 34, "34 rebindable actions");
         assert_eq!(
             ShortcutAction::ALL.len(),
-            22,
-            "ALL enumerates all 22 actions"
+            34,
+            "ALL enumerates all 34 actions"
         );
         // Every action in ALL appears exactly once as a table key.
         for action in ShortcutAction::ALL {
@@ -1040,6 +1145,64 @@ mod tests {
         assert_eq!(combo(ShortcutAction::ScrollHalfPageDown), "cmd-ctrl-down");
         // D2: the template row stores the normalized digit.
         assert_eq!(combo(ShortcutAction::WindowByIndex), "cmd-ctrl-1");
+        // -- Phase 2 (splits) -------------------------------------------------
+        // D2's divider mnemonics. `cmd-ctrl--` is the trailing-minus format the
+        // token parser handles specially, so it is pinned here as well as in the
+        // round-trip test.
+        assert_eq!(combo(ShortcutAction::SplitDown), "cmd-ctrl--");
+        assert_eq!(combo(ShortcutAction::SplitRight), "cmd-ctrl-\\");
+        assert_eq!(combo(ShortcutAction::ZoomPane), "cmd-ctrl-z");
+        assert_eq!(combo(ShortcutAction::BreakPane), "cmd-ctrl-b");
+        // The ladder's resize rung (⌃⌥⌘) …
+        assert_eq!(combo(ShortcutAction::ResizePaneLeft), "cmd-ctrl-alt-h");
+        assert_eq!(combo(ShortcutAction::ResizePaneDown), "cmd-ctrl-alt-j");
+        assert_eq!(combo(ShortcutAction::ResizePaneUp), "cmd-ctrl-alt-k");
+        assert_eq!(combo(ShortcutAction::ResizePaneRight), "cmd-ctrl-alt-l");
+        // … and its swap rung (⌃⌥⌘⇧, the Hyper cluster).
+        assert_eq!(combo(ShortcutAction::SwapPaneLeft), "cmd-ctrl-alt-shift-h");
+        assert_eq!(combo(ShortcutAction::SwapPaneDown), "cmd-ctrl-alt-shift-j");
+        assert_eq!(combo(ShortcutAction::SwapPaneUp), "cmd-ctrl-alt-shift-k");
+        assert_eq!(combo(ShortcutAction::SwapPaneRight), "cmd-ctrl-alt-shift-l");
+    }
+
+    /// The pane family's ids, spelled out — they are persistence keys the moment
+    /// this ships, so a rename after that orphans a user's binding.
+    #[test]
+    fn phase_two_action_ids_are_spelled_out() {
+        for (action, id) in [
+            (ShortcutAction::SplitDown, "splitDown"),
+            (ShortcutAction::SplitRight, "splitRight"),
+            (ShortcutAction::ZoomPane, "zoomPane"),
+            (ShortcutAction::BreakPane, "breakPane"),
+            (ShortcutAction::ResizePaneLeft, "resizePaneLeft"),
+            (ShortcutAction::ResizePaneDown, "resizePaneDown"),
+            (ShortcutAction::ResizePaneUp, "resizePaneUp"),
+            (ShortcutAction::ResizePaneRight, "resizePaneRight"),
+            (ShortcutAction::SwapPaneLeft, "swapPaneLeft"),
+            (ShortcutAction::SwapPaneDown, "swapPaneDown"),
+            (ShortcutAction::SwapPaneUp, "swapPaneUp"),
+            (ShortcutAction::SwapPaneRight, "swapPaneRight"),
+        ] {
+            assert_eq!(action.id(), id);
+            assert_eq!(ShortcutAction::from_id(id), Some(action));
+        }
+    }
+
+    /// D2's naming ban, enforced on the surface a user actually reads: no label
+    /// says "vertical" or "horizontal" (vim and tmux mean opposite things by
+    /// them), and the two split labels are exactly the spellings D2 fixes.
+    #[test]
+    fn no_label_says_vertical_or_horizontal() {
+        for action in ShortcutAction::ALL {
+            let label = action.label().to_ascii_lowercase();
+            assert!(
+                !label.contains("vertical") && !label.contains("horizontal"),
+                "{action:?}'s label breaks D2: {:?}",
+                action.label()
+            );
+        }
+        assert_eq!(ShortcutAction::SplitDown.label(), "Split Down");
+        assert_eq!(ShortcutAction::SplitRight.label(), "Split Right");
     }
 
     /// The ⓘ tooltip contract: exactly `CommandCompose` and `WindowByIndex` carry
@@ -1362,19 +1525,16 @@ mod tests {
         }
     }
 
-    /// All three groups are represented, with the counts the plan names: five
-    /// fixed Nice accelerators, three macOS chords, twelve future-phase chords
-    /// (D4's four plus the hjkl ladder's eight Phase-2 rungs).
+    /// All three groups are represented, with the counts Phase 2 leaves behind:
+    /// five fixed Nice accelerators, three macOS chords, and the ONE remaining
+    /// future-phase chord (⌃⌘/, Phase 3's).
     #[test]
     fn reserved_table_covers_the_three_groups() {
         let count = |kind| RESERVED_COMBOS.iter().filter(|r| r.kind == kind).count();
         assert_eq!(count(ReservedKind::FixedAccelerator), 5, "⌘Q ⌘N ⌘W ⌘, ⌃⌘F");
         assert_eq!(count(ReservedKind::SystemReserved), 3, "⌃⌘Q ⌃⌘Space ⌃⌘D");
-        assert_eq!(
-            count(ReservedKind::FuturePhase),
-            12,
-            "⌃⌘Z ⌃⌘V ⌃⌘S ⌃⌘/ + ⌃⌥⌘hjkl resize + ⌃⌥⌘⇧hjkl swap"
-        );
+        assert_eq!(count(ReservedKind::FuturePhase), 1, "⌃⌘/ is Phase 3's");
+        assert_eq!(RESERVED_COMBOS.len(), 9, "the table is 9 entries after Phase 2");
 
         // The exact chord spellings, by token.
         let tokens: HashSet<String> = RESERVED_COMBOS
@@ -1390,53 +1550,109 @@ mod tests {
             "cmd-ctrl-q",
             "cmd-ctrl-space",
             "cmd-ctrl-d",
-            "cmd-ctrl-z",
-            "cmd-ctrl-v",
-            "cmd-ctrl-s",
             "cmd-ctrl-/",
-            // The ladder's resize rung (⌃⌥⌘) …
-            "cmd-ctrl-alt-h",
-            "cmd-ctrl-alt-j",
-            "cmd-ctrl-alt-k",
-            "cmd-ctrl-alt-l",
-            // … and its swap rung (⌃⌥⌘⇧, the Hyper cluster).
-            "cmd-ctrl-alt-shift-h",
-            "cmd-ctrl-alt-shift-j",
-            "cmd-ctrl-alt-shift-k",
-            "cmd-ctrl-alt-shift-l",
         ] {
             assert!(tokens.contains(token), "{token} must be reserved");
         }
         assert_eq!(tokens.len(), RESERVED_COMBOS.len(), "no duplicate entries");
     }
 
-    /// The ⌃⌘⇧ focus rung is BOUND (inert handlers), not reserved — the two
-    /// Phase-2 rungs above it are reserved and unbound. Pins the ladder's shape
-    /// so a later edit can't quietly reserve a chord that ships as an action.
+    /// The chords Phase 2 took off the reserved table are FREE to record now —
+    /// the two it turned into actions (⌃⌘Z zoom, ⌃⌘B break-pane), the eight
+    /// ladder rungs it turned into the resize + swap families, and the two D2
+    /// released outright (⌃⌘V, ⌃⌘S). "Free" here means the recorder's reserved
+    /// guard no longer refuses them; the ten that became actions are of course
+    /// held by those actions, which is the ordinary conflict path a user can
+    /// resolve, not a refusal they cannot.
     #[test]
-    fn the_focus_rung_is_bound_and_the_phase_two_rungs_are_reserved() {
-        for key in ["h", "j", "k", "l"] {
-            let focus = OwnedCombo {
-                modifiers: Modifiers::CONTROL_COMMAND_SHIFT,
+    fn phase_two_released_its_reserved_chords() {
+        for token in [
+            "cmd-ctrl-z",
+            "cmd-ctrl-b",
+            "cmd-ctrl-v",
+            "cmd-ctrl-s",
+            "cmd-ctrl-alt-h",
+            "cmd-ctrl-alt-j",
+            "cmd-ctrl-alt-k",
+            "cmd-ctrl-alt-l",
+            "cmd-ctrl-alt-shift-h",
+            "cmd-ctrl-alt-shift-j",
+            "cmd-ctrl-alt-shift-k",
+            "cmd-ctrl-alt-shift-l",
+        ] {
+            let combo = OwnedCombo::from_token(token).unwrap();
+            assert_eq!(
+                reserved_combo(&combo),
+                None,
+                "{token} is no longer reserved"
+            );
+        }
+        // ⌃⌘V and ⌃⌘S are bound to NOTHING — released, not re-spent (D2 gave the
+        // split verbs the divider mnemonics instead).
+        for token in ["cmd-ctrl-v", "cmd-ctrl-s"] {
+            let combo = OwnedCombo::from_token(token).unwrap();
+            assert!(
+                !default_bindings()
+                    .into_iter()
+                    .any(|(_, c)| OwnedCombo::from(c) == combo),
+                "{token} must stay bound to nothing"
+            );
+        }
+    }
+
+    /// Every rung of the hjkl ladder is BOUND, and to the action its modifier
+    /// set names: bare ⌃⌘ navigates containers, ⌃⌘⇧ moves pane focus, ⌃⌥⌘
+    /// resizes, ⌃⌥⌘⇧ swaps. Pins the ladder's shape so a later edit can't
+    /// quietly re-reserve a chord that ships as an action, or slide a direction
+    /// onto the wrong rung.
+    #[test]
+    fn every_ladder_rung_is_bound_to_its_own_verb() {
+        let holder = |modifiers, key: &str| -> Option<ShortcutAction> {
+            let combo = OwnedCombo {
+                modifiers,
                 key: key.to_string(),
             };
-            assert_eq!(reserved_combo(&focus), None, "⌃⌘⇧{key} ships as an action");
-            for modifiers in [
+            assert_eq!(
+                reserved_combo(&combo),
+                None,
+                "{} ships as an action, so it must not also be reserved",
+                combo.to_token()
+            );
+            default_bindings()
+                .into_iter()
+                .find(|(_, c)| OwnedCombo::from(*c) == combo)
+                .map(|(a, _)| a)
+        };
+        use ShortcutAction::*;
+        let rungs = [
+            (
+                Modifiers::CONTROL_COMMAND,
+                [PrevWindow, NextSidebarSession, PrevSidebarSession, NextWindow],
+            ),
+            (
+                Modifiers::CONTROL_COMMAND_SHIFT,
+                [FocusPaneLeft, FocusPaneDown, FocusPaneUp, FocusPaneRight],
+            ),
+            (
                 Modifiers::CONTROL_ALT_COMMAND,
+                [
+                    ResizePaneLeft,
+                    ResizePaneDown,
+                    ResizePaneUp,
+                    ResizePaneRight,
+                ],
+            ),
+            (
                 Modifiers::CONTROL_ALT_COMMAND_SHIFT,
-            ] {
-                let combo = OwnedCombo {
-                    modifiers,
-                    key: key.to_string(),
-                };
-                let entry = reserved_combo(&combo).expect("a Phase-2 rung is reserved");
-                assert_eq!(entry.kind, ReservedKind::FuturePhase);
-                assert!(
-                    !default_bindings()
-                        .into_iter()
-                        .any(|(_, c)| OwnedCombo::from(c) == combo),
-                    "{} must not also be a default binding",
-                    combo.to_token()
+                [SwapPaneLeft, SwapPaneDown, SwapPaneUp, SwapPaneRight],
+            ),
+        ];
+        for (modifiers, actions) in rungs {
+            for (key, action) in ["h", "j", "k", "l"].into_iter().zip(actions) {
+                assert_eq!(
+                    holder(modifiers, key),
+                    Some(action),
+                    "the {key} key of this rung belongs to {action:?}"
                 );
             }
         }

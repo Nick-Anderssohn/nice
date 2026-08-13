@@ -176,6 +176,11 @@ pub struct TerminalView {
     /// explicit ([`focus`](Self::focus), click-to-focus) so app chrome can hold
     /// focus without the terminal stealing it back per frame.
     focused_once: bool,
+    /// Whether that first-render grab actually takes focus (see
+    /// [`set_focus_on_first_render`](Self::set_focus_on_first_render)). Default
+    /// `true`; the split host clears it on the panes that must NOT steal focus
+    /// when a whole pane tree mounts in one pass.
+    focus_on_first_render: bool,
     /// The pure marked-text (preedit) state machine driven by the platform IME.
     ime: ImeState,
     /// Option-as-Meta policy (SwiftTerm-parity default `Both`). Consulted per
@@ -403,6 +408,7 @@ impl TerminalView {
             effective_metrics: snap_metrics_to_scale(metrics, 2.0),
             focus_handle: cx.focus_handle(),
             focused_once: false,
+            focus_on_first_render: true,
             ime: ImeState::new(),
             option_as_meta: OptionAsMeta::default(),
             keycode_probe: None,
@@ -575,6 +581,22 @@ impl TerminalView {
     /// pixel assertions key on the exact spawn grid).
     pub fn set_auto_refit(&mut self, on: bool) {
         self.auto_refit = on;
+    }
+
+    /// Opt this view OUT of the first-render focus grab (the grab in
+    /// [`Render::render`], see [`focused_once`](Self::focused_once)).
+    ///
+    /// Single-view hosting made "a fresh terminal takes key focus on its first
+    /// render" free. Splits break it: a pill whose whole pane tree mounts in
+    /// one pass would hand focus to whichever leaf rendered LAST rather than to
+    /// the pane the model says is focused. The host clears this on every
+    /// non-focused pane it mounts, then focuses the focused one explicitly
+    /// ([`focus`](Self::focus)).
+    ///
+    /// Default `true`, so an embedding that never calls it behaves exactly as
+    /// before. Only consulted on the first render; later calls change nothing.
+    pub fn set_focus_on_first_render(&mut self, on: bool) {
+        self.focus_on_first_render = on;
     }
 
     /// Live-recolor this pane (R21 theme fan-out): replace the render `theme` +
@@ -1772,9 +1794,14 @@ impl Render for TerminalView {
         // re-focuses it via the explicit `window.focus` in `on_mouse_down`
         // (gpui's tracked-focus mouse-down transfer can't be relied on — the
         // app-mouse-reporting path's `stop_propagation` suppresses it).
+        // The grab is skipped entirely for a pane the host mounted un-focused
+        // (`set_focus_on_first_render(false)`) — with several panes mounting in
+        // one pass, the last-rendered one would otherwise win the focus race.
         if !self.focused_once {
             self.focused_once = true;
-            window.focus(&self.focus_handle, cx);
+            if self.focus_on_first_render {
+                window.focus(&self.focus_handle, cx);
+            }
         }
 
         // Re-snap the cell box to THIS window's backing scale when it changes

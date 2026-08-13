@@ -5,7 +5,7 @@
 //!
 //! ## Layout
 //! One [`setting_row`](crate::settings::root::setting_row) per rebindable
-//! [`ShortcutAction`] (all 22, `ShortcutAction::ALL` order). Each row's control is a
+//! [`ShortcutAction`] (all 34, `ShortcutAction::ALL` order). Each row's control is a
 //! **recorder field**:
 //! * **Resting** — the bound combo rendered as key-pills (⌘⌥ symbols + the key), or
 //!   `"Not bound"` when the action is unbound; clicking it enters capture mode. A
@@ -1036,7 +1036,10 @@ mod tests {
     }
 
     /// One chord per group, spelled out — the guard is not just "whatever the
-    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS, ⌃⌘Z future).
+    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS, ⌃⌘/ future).
+    /// The future-phase example used to be ⌃⌘Z; Phase 2 spent that chord on Zoom
+    /// Pane, which is exactly why a reserved entry has to disappear when its
+    /// phase claims it.
     #[test]
     fn reserved_groups_are_each_covered() {
         let refuse = |token: &str, modifiers, key| {
@@ -1065,9 +1068,54 @@ mod tests {
             "Reserved: the macOS emoji picker"
         );
         assert_eq!(
-            refuse("cmd-ctrl-z", Modifiers::CONTROL_COMMAND, "z"),
+            refuse("cmd-ctrl-/", Modifiers::CONTROL_COMMAND, "/"),
             "Reserved for a future Nice feature"
         );
+    }
+
+    /// The chords Phase 2 took off the reserved table are recordable now. ⌃⌘V
+    /// and ⌃⌘S commit outright — D2 released them rather than spending them —
+    /// while the chords that became pane verbs report an ordinary Conflict with
+    /// the action holding them, which the user can Replace. Before Phase 2 all
+    /// twelve were flat refusals with no way through.
+    #[test]
+    fn phase_two_freed_chords_are_recordable() {
+        let capture = |modifiers, key: &str| {
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                modifiers,
+                key,
+                false,
+                &default_bindings_vec(),
+            )
+        };
+        for key in ["v", "s"] {
+            assert_eq!(
+                capture(Modifiers::CONTROL_COMMAND, key),
+                CaptureOutcome::Commit(combo(&format!("cmd-ctrl-{key}"))),
+                "⌃⌘{key} is free to record"
+            );
+        }
+        assert_eq!(
+            capture(Modifiers::CONTROL_COMMAND, "z"),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-z"),
+                other: ShortcutAction::ZoomPane,
+            },
+            "⌃⌘Z is held by an action now, not refused by the guard"
+        );
+        assert_eq!(
+            capture(Modifiers::CONTROL_ALT_COMMAND, "h"),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-alt-h"),
+                other: ShortcutAction::ResizePaneLeft,
+            },
+        );
+        // ⌃⌘/ is the one still held for a later phase.
+        assert!(matches!(
+            capture(Modifiers::CONTROL_COMMAND, "/"),
+            CaptureOutcome::Reserved { .. }
+        ));
     }
 
     /// The guard runs BEFORE the conflict check. No SHIPPED default sits on a

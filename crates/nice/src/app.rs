@@ -3868,6 +3868,21 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "splits",
+            open: crate::input_live::open_splits_window,
+            gate: Gate::SelfReported {
+                // ~30 dispatched chords with settles, two real `zsh` panes to
+                // bring up and shut down (poll-bounded), and a session-store
+                // round trip. Needs NO Accessibility grant (in-process
+                // `dispatch_keystroke`, not CGEvents). Registered BEFORE
+                // `multiwindow` for the same reason `keybind-scheme` is: it
+                // only `register`s its window, so closing it never trips the
+                // quit-when-empty terminus.
+                budget: Duration::from_secs(90),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "compose-live",
             open: crate::compose_live::open_compose_live_window,
             gate: Gate::SelfReported {

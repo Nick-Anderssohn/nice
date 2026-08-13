@@ -54,8 +54,9 @@ sidebar request actually decomposes into:
    in `sidebar_shell.rs`), and the committed width lives in `SidebarModel`,
    persisted as the optional `sidebarWidth` slot in `PersistedWindow`
    alongside `sidebar_collapsed`/`sidebar_mode`.
-2. **Real side-by-side terminals** — that's Phase 2 (splits), in the terminal
-   area where it belongs.
+2. **Real side-by-side terminals** — DONE in Phase 2 (splits), in the
+   terminal area where it belongs. The sidebar itself is still not a pane,
+   and deliberately so.
 
 ## 3. What Nice already has (more than expected)
 
@@ -95,7 +96,16 @@ sidebar request actually decomposes into:
 
 ## 4. The genuinely hard parts
 
-### Splits (the big one)
+### Splits (the big one) — SOLVED in Phase 2
+
+The survey below is the pre-Phase-R reading that sized the work (old type
+names, old line numbers); it is kept for the archaeology. What it got right
+is the shape of the fix — a layout tree, `active_pane_id` as focused leaf,
+per-view refit — and that is what shipped. What it under-counted is event
+routing: subscriptions were window-keyed AND permanently detached, so
+pane-keying them (and retaining them, so they can be dropped and re-keyed)
+turned out to be load-bearing for background-pane exits and for break-pane.
+
 Ten places hard-code one-visible-terminal-per-tab; the load-bearing ones:
 
 1. `active_pane_target` returns a single `(tab_id, pane_id)` — `app_shell.rs:485-489`
@@ -202,9 +212,12 @@ chords): nothing binds them.
 | Rung | `h` | `j` | `k` | `l` | Verb | Phase |
 |---|---|---|---|---|---|---|
 | `^⌘` | prev pill | next session | prev session | next pill | navigate containers | 1 |
-| `^⌘⇧` | focus pane left | down | up | right | move pane focus (`FocusPane*`, bound but inert) | 2 |
-| `^⌥⌘` | resize left | down | up | right | resize split (reserved, unbound) | 2 |
-| `^⌥⌘⇧` | swap left | down | up | right | directional pane swap (reserved, unbound) | 2 |
+| `^⌘⇧` | focus pane left | down | up | right | move pane focus (`FocusPane*`) | 2 |
+| `^⌥⌘` | resize left | down | up | right | resize split (`ResizePane*`) | 2 |
+| `^⌥⌘⇧` | swap left | down | up | right | directional pane swap (`SwapPane*`) | 2 |
+
+All three pane rungs are live as of Phase 2; the `^⌘⇧` handlers were bound
+but inert through Phase 1, and the other two rungs were reserved-unbound.
 
 Everything else on the scheme is unchanged:
 
@@ -213,7 +226,8 @@ Everything else on the scheme is unchanged:
 | `^⌘1-9` | Window by index — **D2**: ONE rebindable row (`windowByIndex`, "Window 1-9") whose recorded modifier set applies to all nine digits; nine separate rows were rejected | 1 |
 | `^⌘o` | Last-active window (tmux `last-window`, a single bounce slot — not an MRU stack) | 1 |
 | `^⌘z` | Zoom pane | 2 |
-| `^⌘v` / `^⌘s` | Vertical / horizontal split | 2 |
+| `^⌘-` / `^⌘\` | Split Down / Split Right — **Phase 2 D2**: divider mnemonics. The `^⌘v`/`^⌘s` penciled in here are FREED and bind to nothing | 2 |
+| `^⌘b` | Break pane out to its own window | 2 |
 | `^⌘↑` / `^⌘↓` | Half-page scrollback up / down (no-op on the alternate screen) — moved off `^⌘u`/`^⌘d` on 2026-08-11; both of those are now bound to nothing | 1 |
 | `^⌘/` | Scrollback search | 3 |
 | *hold* `^⌘` | Window-index badges on the pills — **D5**, ~200 ms debounce | 1 |
@@ -230,15 +244,22 @@ ids never moved, only the default combos.
 
 Reserved — never bind: `^⌘Q` (macOS lock screen, system-intercepted),
 `^⌘F` (fullscreen, in Nice's protected set), `^⌘Space` (emoji picker),
-`^⌘D` (macOS dictionary lookup). **D4**: the four Phase 2/3 chords
-(`^⌘z`, `^⌘v`, `^⌘s`, `^⌘/`) join them in the guard rather than shipping
-as no-op actions, so nothing can squat on them before those phases land —
-and the revision puts the ladder's two Phase 2 rungs (`^⌥⌘hjkl` resize,
-`^⌥⌘⇧hjkl` swap, eight chords) in the same group for the same reason.
-All twenty live in one `RESERVED_COMBOS` table in `nice-model`; the
-recorder refuses them with a per-entry reason, and `keymap` installs the
-five fixed accelerators FROM those same entries so guard and install
-cannot drift.
+`^⌘D` (macOS dictionary lookup). **D4**: the Phase 2/3 chords join them in
+the guard rather than shipping as no-op actions, so nothing can squat on
+them before those phases land — and the 2026-08-11 revision put the
+ladder's two Phase 2 rungs (`^⌥⌘hjkl` resize, `^⌥⌘⇧hjkl` swap, eight
+chords) in the same group for the same reason. They all live in one
+`RESERVED_COMBOS` table in `nice-model`; the recorder refuses them with a
+per-entry reason, and `keymap` installs the five fixed accelerators FROM
+those same entries so guard and install cannot drift.
+
+**Phase 2 shrank that table from 20 entries to 9.** A chord may never be
+both reserved and a default — a test pins the two sets disjoint — so
+claiming a reserved chord means deleting its reserved entry in the same
+change. Phase 2 claimed `^⌘z` and all eight ladder rungs, and freed
+`^⌘v`/`^⌘s` outright (D2 spent the split verbs on the divider mnemonics
+instead), leaving the five fixed accelerators, `^⌘Q`/`^⌘Space`/`^⌘D`, and
+`^⌘/` held for Phase 3.
 
 - **Hold-to-hint overlay (D5, shipped):** holding `^⌘` for ~200 ms with no
   chord committed paints the jump digit on each of the first nine pills;
@@ -262,19 +283,120 @@ cannot drift.
 Full implementation plan: `docs/plans/phase-1-keybind-scheme.md`. Live
 gate: the `keybind-scheme` self-test scenario.
 
-### Phase 2 — splits (L, the core investment)
-- Model: layout tree per upper-bar pill (leaves = pane ids, splits with
-  ratios); `active_pane_id` = focused leaf.
-- `PaneHostView`: recursive render, N mounted views, dividers with
-  drag-resize, focused-pane affordance.
-- Actions (all on the Phase-1 `^⌘` ladder): split h/v, zoom toggle,
-  break-pane-to-new-pill, even-layout presets — plus the three `hjkl`
-  rungs the ladder already assigns: fill in the inert `^⌘⇧hjkl` focus
-  handlers, and claim the reserved `^⌥⌘hjkl` (resize) / `^⌥⌘⇧hjkl` (swap)
-  chords as real bindings.
-- Spatial close-refocus; multi-activation in `SessionManager`.
-- Persist `layout` in `PersistedTab` (version bump; loader stays
-  shape-tolerant).
+### Phase 2 — splits (L, the core investment) — SHIPPED
+
+A **pane** is one leaf of a pill's split tree — the name Phase R freed for
+exactly this. Pre-splits every pill is a single-leaf tree, and a pill that
+is never split behaves, renders, and persists exactly as it did before.
+
+What shipped:
+
+- **Model** (`nice-model/src/pane_layout.rs`): `PaneLayout` is a binary
+  tree, `Leaf(Pane)` or `Split { orient, ratio, first, second }`.
+  `TermWindow` grows `layout`, `active_pane_id` (the focused leaf) and a
+  never-persisted `zoomed` flag. One geometry function set — `leaf_rects`,
+  `directional_neighbor`, `spatial_refocus` — is shared by render,
+  keyboard focus, swap and close-refocus, so paint and keyboard can't
+  disagree about which pane is where.
+- **Pty layer**: `WindowPty` holds a `pane_id → handle` map. Exits, holds,
+  titles, cwds and status all route by pane; event subscriptions are
+  pane-keyed and retained (droppable and re-keyable) rather than
+  permanently detached, so a background pane's exit routes and break-pane
+  can re-home a live pty.
+- **Host view**: `WindowHostView` mounts the active pill's whole tree as
+  nested flex rows/columns landing on exactly the rects `leaf_rects`
+  computes. Dividers follow the sidebar resize-handle pattern (cursor flip
+  per orientation, root-level drag tracking, min clamp, double-click reset
+  to half). The focused pane in a split pill carries an accent border.
+- **Actions**: twelve new rebindable actions — `^⌘-` Split Down, `^⌘\`
+  Split Right, `^⌘z` Zoom Pane, `^⌘b` Break Pane to Window, plus the
+  `^⌥⌘hjkl` resize and `^⌥⌘⇧hjkl` swap rungs. The `^⌘⇧hjkl` focus handlers
+  that Phase 1 bound inert are now filled in. `ALL` went 22 → 34 actions
+  and `RESERVED_COMBOS` 20 → 9.
+- **Persistence**: `PersistedTermWindow` grows optional `layout` /
+  `activeLeafId`, written only for multi-pane pills, so a never-split
+  user's `sessions.json` is byte-identical. `CURRENT_VERSION` stays 3 (the
+  loader is tolerant by shape, not by version) and hydration validates or
+  falls back to a single leaf — it never errors.
+
+**Deferred** (D3): tmux `select-layout` even-layout presets. Revisit once
+the tree exists and the need is felt.
+
+#### Decisions
+
+Product decisions (Nick, 2026-08-12):
+
+- **D1 — any pill splits; panes are plain shells.** Both Claude and
+  terminal pills can be split. A new pane always runs a plain shell in the
+  focused pane's cwd; Nice never spawns Claude into a split pane, so the
+  ≤1-running-Claude-per-session invariant is untouched. Claude in one pane
+  with a working shell beside it is the core use case.
+- **D2 — divider-mnemonic split chords; the words "vertical" and
+  "horizontal" appear nowhere.** `^⌘-` splits Down (stacked — the divider
+  looks like `-`); `^⌘\` splits Right (side by side — the `|` key). vim
+  and tmux assign those two words opposite meanings, so the scheme
+  sidesteps the war entirely. `^⌘v`/`^⌘s` end bound to nothing.
+- **D3 — scope: core plus break-pane.** Ships split, directional focus,
+  directional resize, directional swap, zoom, break-pane-to-new-pill,
+  spatial close-refocus and layout persistence. Even-layout presets wait.
+
+Plan-level decisions:
+
+- **P1 — binary tree.** Every split bisects one leaf. tmux's model is
+  equivalent in practice, and geometry, resize and persistence all stay
+  simple. Orientation is `SplitOrient::{Beside, Stacked}` per D2.
+- **P2 — pane identity stays OFF the frozen surfaces.** Pane ids are plain
+  strings internal to the model and pty map. Every pane's pty gets the
+  same `NICE_TAB_ID`/`NICE_PANE_ID` as before, so `paneId`/`NICE_PANE_ID`
+  permanently mean "pill" and socket traffic from any pane still routes to
+  the pill, which is where status lives. Pane-level addressing waits for
+  Phase 5's `select-pane`.
+- **P3 — break-pane is `^⌘b`, refused on the Claude pane.** It extracts
+  the focused shell pane into a new terminal-kind pill after the current
+  one, moving the live pty rather than respawning; focus follows, matching
+  tmux `break-pane`. No-op on a Claude leaf (pill kind stays coherent) or
+  on a single-leaf pill.
+- **P4 — zoom is a transient render flag.** Never persisted, all ptys stay
+  live, only the focused pane paints. Any structural or focus change
+  un-zooms first, then applies — tmux's `select-pane`-unzooms behavior,
+  generalized. `^⌘z` toggles.
+- **P5 — directional focus does not wrap and does not fall through to
+  pill nav.** `^⌘⇧h` with nothing to the left is a no-op; bare `^⌘h`/`^⌘l`
+  stays the way to leave the pill.
+- **P6 — min pane size refuses, resize clamps.** `PANE_MIN_WIDTH` 120 px /
+  `PANE_MIN_HEIGHT` 80 px. A split that would produce a pane under the
+  mins is a no-op; divider drags and `^⌥⌘hjkl` clamp against them. The
+  window-level `TERMINAL_MIN_WIDTH` is unchanged.
+- **P7 — resize moves the nearest matching ancestor.** `^⌥⌘h`/`^⌥⌘l` move
+  the nearest `Beside` ancestor's divider, `^⌥⌘j`/`^⌥⌘k` the nearest
+  `Stacked` one; no match is a no-op. Which side of the ratio moves
+  follows which child the focused pane sits in, so "resize left" always
+  moves the focused pane's own edge left — tmux `resize-pane -L/-D/-U/-R`.
+  The step is a fixed ~40 px converted against exactly the px that divider
+  divides, so a chord moves the same distance regardless of tree depth.
+- **P8 — swap swaps leaves, not subtrees.** `^⌥⌘⇧hjkl` finds the
+  directional neighbor with the same algorithm focus uses and trades the
+  two `Pane` payloads in place; ratios and structure don't move. Focus
+  follows the content, as tmux `swap-pane` does.
+- **P9 — pill title follows the active pane; status aggregates by OR.**
+  Busy/thinking status ORs across all the pill's panes, so a manually-run
+  `claude` in a shell pane still lights the pill, while `kind` and
+  `is_claude_running` stay driven by the Claude leaf. Session-level
+  aggregation is untouched — it still reads per-`TermWindow` fields.
+
+Accepted warts, recorded rather than fixed:
+
+- After break-pane the moved pty's `NICE_TAB_ID`/`NICE_PANE_ID` still name
+  the SOURCE pill — env is fixed at fork and can't change. Socket traffic
+  from that shell targets the old pill. Same class of staleness as moving
+  any live process; Phase 5's pane addressing is where to revisit it.
+- A clean Claude exit inside a multi-pane pill removes the Claude leaf and
+  flips the pill's kind to Terminal. That is what makes the invariant "at
+  most one Claude leaf, and kind == Claude iff one exists" hold. A HELD
+  exit keeps the pill Claude-kind with the corpse in its own pane.
+
+Full implementation plan: `docs/plans/phase-2-splits.md`. Live gate: the
+`splits` self-test scenario.
 
 ### Phase 3 — copy mode + scrollback search (M)
 - Keyboard selection state machine over the existing selection API; vi keys.

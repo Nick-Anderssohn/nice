@@ -42,6 +42,10 @@ keys — `h`/`l` step the window pills, `j`/`k` step the sidebar sessions. Hold 
 for a moment without pressing anything and each window pill shows the digit that
 jumps to it.
 
+Adding modifiers climbs a ladder: the modifier set picks the verb, `hjkl` picks
+the direction. `⌃⌘` navigates containers, `⌃⌘⇧` moves focus between split panes,
+`⌃⌥⌘` resizes them, `⌃⌥⌘⇧` swaps them.
+
 | Shortcut | Action |
 |---|---|
 | `⌃⌘L` / `⌃⌘H` | Next / previous window within a session |
@@ -49,6 +53,12 @@ jumps to it.
 | `⌃⌘1`–`⌃⌘9` | Jump to a window by its position |
 | `⌃⌘O` | Back to the last window you were in |
 | `⌃⌘↑` / `⌃⌘↓` | Half-page through terminal scrollback |
+| `⌃⌘-` / `⌃⌘\` | Split the window down / to the right |
+| `⌃⌘⇧HJKL` | Move focus to the pane in that direction |
+| `⌃⌥⌘HJKL` | Resize the current split in that direction |
+| `⌃⌥⌘⇧HJKL` | Swap the focused pane with its neighbor in that direction |
+| `⌃⌘Z` | Zoom the focused pane to fill the window (toggle) |
+| `⌃⌘B` | Break the focused pane out into a window of its own |
 | `⌘T` | New terminal window |
 | `⌘B` | Toggle sidebar |
 | `⌘⇧B` | Toggle sidebar mode (sessions ↔ file browser) |
