@@ -197,7 +197,7 @@ impl SidebarProbe {
                 if self.collapsed_projects.contains(&p.id) {
                     Vec::new()
                 } else {
-                    p.sessions.iter().map(|t| t.id.clone()).collect()
+                    p.sessions.iter().map(|s| s.id.clone()).collect()
                 }
             })
             .collect()
@@ -243,7 +243,7 @@ impl SidebarProbe {
     }
 
     /// Mirror of the shipped `NextSidebarSession` keymap handler (`keymap.rs`, the R10
-    /// keyboard session-cycle ⌘⌥↓): advance the model's active session, then re-sync the
+    /// keyboard session-cycle ⌃⌘J): advance the model's active session, then re-sync the
     /// selection's active mirror — `WindowState::sync_selection_to_active_session`, the
     /// fix. The handler previously mutated only the model, leaving the prior-active
     /// row a stale selection-set member (the faint-highlight residue). Mouse paths
@@ -685,10 +685,10 @@ fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
 }
 
 // ============================================================================
-// keyboard sidebar-nav re-syncs the selection (the ⌘⌥↓ residue fix)
+// keyboard sidebar-nav re-syncs the selection (the ⌃⌘J residue fix)
 // ============================================================================
 
-/// Keyboard sidebar-nav (`NextSidebarSession`, ⌘⌥↓) collapses the multi-selection to
+/// Keyboard sidebar-nav (`NextSidebarSession`, ⌃⌘J) collapses the multi-selection to
 /// the new active session: the previously-active/selected rows must NOT linger in the
 /// selection set (the faint `SELECTED_DIM_FACTOR` highlight residue). This is the
 /// gap the file's mouse-only cases missed — the shipped keymap handler mutated the

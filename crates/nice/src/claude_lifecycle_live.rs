@@ -428,7 +428,7 @@ async fn run_claude_lifecycle(
                     let parent = parent.expect("parent id just polled must resolve");
                     let orig = orig.expect("originating promote-tab must still exist");
                     // Sibling parent: deferred (not running), pinned to OLD id, at ROOT.
-                    let parent_claude = parent.windows.iter().find(|p| p.kind == TermWindowKind::Claude);
+                    let parent_claude = parent.windows.iter().find(|w| w.kind == TermWindowKind::Claude);
                     if parent_claude.map(|w| w.is_claude_running) != Some(false) {
                         failures.push("(f) branch: sibling parent's claude window must be is_claude_running == false (deferred)".into());
                     }
@@ -481,8 +481,8 @@ async fn run_claude_lifecycle(
                     let parent_claude = parent
                         .windows
                         .iter()
-                        .find(|p| p.kind == TermWindowKind::Claude)
-                        .map(|p| p.id.clone());
+                        .find(|w| w.kind == TermWindowKind::Claude)
+                        .map(|w| w.id.clone());
                     match parent_claude {
                         None => failures
                             .push("(f) branch-overlay: the sibling parent has no Claude window".into()),
@@ -963,7 +963,7 @@ async fn poll_new_session(
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let now = all_session_ids(cx, state);
-        if let Some(new) = now.iter().find(|t| !before.contains(t)) {
+        if let Some(new) = now.iter().find(|s| !before.contains(s)) {
             return Some(new.clone());
         }
     }
@@ -993,8 +993,8 @@ fn window_is_claude_running(
     state.update(cx, |s, _cx| {
         s.workspace
             .session_for(session_id)
-            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-            .map(|p| p.is_claude_running)
+            .and_then(|t| t.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.is_claude_running)
             .unwrap_or(false)
     })
 }
@@ -1133,8 +1133,8 @@ async fn poll_window_promoted(
         let ok = state.update(cx, |s, _cx| {
             s.workspace
                 .session_for(session_id)
-                .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-                .map(|p| p.kind == TermWindowKind::Claude && p.is_claude_running)
+                .and_then(|t| t.windows.iter().find(|w| w.id == term_window_id))
+                .map(|w| w.kind == TermWindowKind::Claude && w.is_claude_running)
                 .unwrap_or(false)
         });
         if ok {
@@ -1155,7 +1155,7 @@ async fn poll_window_gone(
         let gone = state.update(cx, |s, _cx| {
             s.workspace
                 .session_for(session_id)
-                .map(|t| !t.windows.iter().any(|p| p.id == term_window_id))
+                .map(|t| !t.windows.iter().any(|w| w.id == term_window_id))
                 .unwrap_or(true)
         });
         if gone {

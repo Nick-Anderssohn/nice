@@ -322,7 +322,7 @@ fn window_title_changed_terminal_window_updates_window_title() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap();
     assert_eq!(term_window.title, "nvim foo.rb");
 }
@@ -337,7 +337,7 @@ fn window_title_changed_terminal_window_empty_title_ignored() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap()
         .title
         .clone();
@@ -349,7 +349,7 @@ fn window_title_changed_terminal_window_empty_title_ignored() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap()
         .title
         .clone();
@@ -374,7 +374,7 @@ fn window_title_changed_terminal_window_manually_set_ignores_osc_title() {
             .unwrap()
             .windows
             .iter()
-            .find(|p| p.id == terminal_id)
+            .find(|w| w.id == terminal_id)
             .unwrap()
             .title_manually_set,
         "Pre-condition: rename must flip the lock."
@@ -387,7 +387,7 @@ fn window_title_changed_terminal_window_manually_set_ignores_osc_title() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap();
     assert_eq!(
         term_window.title, "build watcher",
@@ -410,7 +410,7 @@ fn window_title_changed_terminal_empty_submit_releases_lock_then_accepts_osc() {
             .unwrap()
             .windows
             .iter()
-            .find(|p| p.id == terminal_id)
+            .find(|w| w.id == terminal_id)
             .unwrap()
             .title_manually_set,
         "Pre-condition: empty submit must clear the lock."
@@ -423,7 +423,7 @@ fn window_title_changed_terminal_empty_submit_releases_lock_then_accepts_osc() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap();
     assert_eq!(
         term_window.title, "vim x.swift",
@@ -445,7 +445,7 @@ fn window_title_changed_terminal_window_clips_at_40_chars() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap();
     assert_eq!(
         term_window.title.chars().count(),
@@ -492,7 +492,7 @@ fn window_title_changed_claude_deferred_resume_ignores_shell_title() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.title, "Claude");
 }
@@ -515,7 +515,7 @@ fn window_title_changed_claude_deferred_resume_ignores_status_prefix() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(
         term_window.status,
@@ -539,8 +539,8 @@ fn window_title_changed_claude_deferred_resume_ignores_status_prefix() {
 fn seed_running_claude_session(model: &mut WorkspaceModel, session_id: &str) -> (String, String) {
     let (claude_id, terminal_id) = seed_claude_session(model, session_id);
     model.mutate_session(session_id, |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
-            p.is_claude_running = true;
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == claude_id) {
+            w.is_claude_running = true;
         }
     });
     model.select_session(session_id);
@@ -562,7 +562,7 @@ fn window_title_changed_claude_braille_spinner_sets_thinking_and_humanizes_title
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Thinking);
     assert_eq!(model.session_for("t1").unwrap().title, "Fix top bar height");
@@ -582,7 +582,7 @@ fn window_title_changed_claude_sparkle_sets_waiting() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Waiting);
 }
@@ -621,7 +621,7 @@ fn window_title_changed_claude_unknown_prefix_treated_as_label() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Idle, "no prefix ⇒ no status change");
     assert_eq!(model.session_for("t1").unwrap().title, "Refactor auth layer");
@@ -637,9 +637,9 @@ fn window_title_changed_claude_manually_set_window_still_flips_status() {
     let mut model = seeded();
     let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
     model.mutate_session("t1", |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
-            p.title = "deploy session".to_string();
-            p.title_manually_set = true;
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == claude_id) {
+            w.title = "deploy session".to_string();
+            w.title_manually_set = true;
         }
     });
 
@@ -650,7 +650,7 @@ fn window_title_changed_claude_manually_set_window_still_flips_status() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Thinking, "status still flips");
     assert_eq!(term_window.title, "deploy session", "the user's custom pill name survives");
@@ -677,8 +677,8 @@ fn window_title_changed_claude_accepts_title_after_promotion() {
 
     // Simulate the socket-handshake promotion that flips the flag.
     model.mutate_session("t1", |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
-            p.is_claude_running = true;
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == claude_id) {
+            w.is_claude_running = true;
         }
     });
 
@@ -689,7 +689,7 @@ fn window_title_changed_claude_accepts_title_after_promotion() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Thinking, "status fires once the gate releases");
     assert_eq!(model.session_for("t1").unwrap().title, "Fix bug", "auto-title applies once the gate releases");
@@ -712,7 +712,7 @@ fn set_active_window_acknowledges_waiting_window_when_session_is_viewed() {
     // Claude window enters waiting while the companion terminal is active.
     model.mutate_session("t1", |session| {
         session.active_window_id = Some(terminal_id.clone());
-        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        let term_window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
         term_window.apply_status_transition(nice_model::SessionStatus::Waiting, false);
     });
     assert!(
@@ -721,7 +721,7 @@ fn set_active_window_acknowledges_waiting_window_when_session_is_viewed() {
             .unwrap()
             .windows
             .iter()
-            .find(|p| p.id == claude_id)
+            .find(|w| w.id == claude_id)
             .unwrap()
             .waiting_acknowledged
     );
@@ -734,7 +734,7 @@ fn set_active_window_acknowledges_waiting_window_when_session_is_viewed() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert_eq!(term_window.status, nice_model::SessionStatus::Waiting);
     assert!(
@@ -751,7 +751,7 @@ fn set_active_window_does_not_acknowledge_when_session_not_viewed() {
     // Main is the viewed session, not t1.
     model.select_session(WorkspaceModel::MAIN_TERMINAL_SESSION_ID);
     model.mutate_session("t1", |session| {
-        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        let term_window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
         term_window.apply_status_transition(nice_model::SessionStatus::Waiting, false);
     });
 
@@ -762,7 +762,7 @@ fn set_active_window_does_not_acknowledge_when_session_not_viewed() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert!(
         !term_window.waiting_acknowledged,
@@ -808,7 +808,7 @@ fn route_title_changed_updates_terminal_window_pill() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap();
     assert_eq!(term_window.title, "nvim foo.rb");
 }
@@ -846,7 +846,7 @@ fn route_title_reset_and_output_started_leave_the_pill() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap()
         .title
         .clone();
@@ -871,7 +871,7 @@ fn route_title_reset_and_output_started_leave_the_pill() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == terminal_id)
+        .find(|w| w.id == terminal_id)
         .unwrap()
         .title
         .clone();
@@ -1029,7 +1029,7 @@ fn window_held_flips_is_alive_and_idles_status() {
     let mut model = seeded();
     let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p", "t1", true);
     model.mutate_session("t1", |session| {
-        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        let term_window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
         term_window.status = SessionStatus::Thinking;
         term_window.waiting_acknowledged = false;
     });
@@ -1041,7 +1041,7 @@ fn window_held_flips_is_alive_and_idles_status() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_id)
+        .find(|w| w.id == claude_id)
         .unwrap();
     assert!(!term_window.is_alive, "paneHeld flips is_alive to false");
     assert_eq!(term_window.status, SessionStatus::Idle, "paneHeld idles the status out");
@@ -1071,7 +1071,7 @@ fn window_held_keeps_window_in_session_windows_array() {
         "paneHeld must not remove the window — that's paneExited's job"
     );
     assert!(
-        session.windows.iter().any(|p| p.id == claude_id),
+        session.windows.iter().any(|w| w.id == claude_id),
         "the held window must still be findable by id"
     );
 }
@@ -1378,7 +1378,7 @@ fn close_session_held_claude_window_with_unspawned_companion_dissolves() {
     let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p1", "t1", false);
     seed_claude_session_in(&mut model, "p2", "t2", false);
     model.mutate_session("t1", |session| {
-        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        let term_window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
         term_window.is_alive = false;
         term_window.is_claude_running = false;
     });
@@ -2550,6 +2550,28 @@ fn parse_title_braille_range_boundaries_set_thinking() {
     assert_eq!(parse_claude_title("\u{28FF}x").0, Some(SessionStatus::Thinking));
 }
 
+/// Claude Code 2.1.228 swapped the title busy spinner from braille to the
+/// half-shaded circles ◐◑ ("Updated terminal title busy-spinner glyphs to
+/// reduce tab-bar jitter"); the whole ◐◓◑◒ quad (U+25D0..=U+25D3) ⇒ Thinking.
+#[test]
+fn parse_title_half_shaded_circle_spinner_sets_thinking() {
+    // The observed 2.1.228 title shape: "◐ <label>".
+    let (status, label) = parse_claude_title("\u{25D0} count-to-three");
+    assert_eq!(status, Some(SessionStatus::Thinking));
+    assert_eq!(label, " count-to-three");
+    // Every phase of the quad, inclusive at both ends.
+    for c in ['\u{25D0}', '\u{25D1}', '\u{25D2}', '\u{25D3}'] {
+        assert_eq!(
+            parse_claude_title(&format!("{c}x")).0,
+            Some(SessionStatus::Thinking),
+            "{c:?} must map to Thinking"
+        );
+    }
+    // Neighbours just outside the quad stay plain labels.
+    assert_eq!(parse_claude_title("\u{25CF}x").0, None); // ● black circle
+    assert_eq!(parse_claude_title("\u{25D4}x").0, None); // ◔ quadrant circle
+}
+
 /// The sparkle ✳ (U+2733) ⇒ Waiting.
 #[test]
 fn parse_title_sparkle_sets_waiting() {
@@ -2772,34 +2794,34 @@ fn claude_display_command_resume_hides_uuid() {
     );
 }
 
-// handoff_title — the locked "[HANDOFF] …" label (R26). Strip a single existing
+// handoff_title — the locked "[H] …" label (R26). Strip a single existing
 // prefix (no stacking), trim, blank → "Session".
 
 #[test]
 fn handoff_title_prefixes_a_plain_title() {
-    assert_eq!(handoff_title(Some("Foo")), "[HANDOFF] Foo");
+    assert_eq!(handoff_title(Some("Foo")), "[H] Foo");
 }
 
 #[test]
 fn handoff_title_does_not_stack_an_existing_prefix() {
-    // A handoff fired FROM a handoff session reads "[HANDOFF] Foo", not doubled.
-    assert_eq!(handoff_title(Some("[HANDOFF] Foo")), "[HANDOFF] Foo");
+    // A handoff fired FROM a handoff session reads "[H] Foo", not doubled.
+    assert_eq!(handoff_title(Some("[H] Foo")), "[H] Foo");
 }
 
 #[test]
 fn handoff_title_none_falls_back_to_session() {
-    assert_eq!(handoff_title(None), "[HANDOFF] Session");
+    assert_eq!(handoff_title(None), "[H] Session");
 }
 
 #[test]
 fn handoff_title_whitespace_only_falls_back_to_session() {
-    // A whitespace-only title would otherwise yield a ragged "[HANDOFF]    ".
-    assert_eq!(handoff_title(Some("   ")), "[HANDOFF] Session");
+    // A whitespace-only title would otherwise yield a ragged "[H]    ".
+    assert_eq!(handoff_title(Some("   ")), "[H] Session");
 }
 
 #[test]
 fn handoff_title_trims_surrounding_whitespace() {
-    assert_eq!(handoff_title(Some("  Bar  ")), "[HANDOFF] Bar");
+    assert_eq!(handoff_title(Some("  Bar  ")), "[H] Bar");
 }
 
 // handoff_prompt — always points at the notes file; blank instructions get the
@@ -2862,23 +2884,23 @@ fn handoff_extra_args_model_and_effort_then_prompt_last() {
     );
 }
 
-// dispatch_title — the locked "[DISPATCH] <worktree-name>" label.
+// dispatch_title — the locked "[D] <worktree-name>" label.
 
 #[test]
 fn dispatch_title_prefixes_the_worktree_name() {
-    assert_eq!(dispatch_title("fix-tabs"), "[DISPATCH] fix-tabs");
+    assert_eq!(dispatch_title("fix-tabs"), "[D] fix-tabs");
 }
 
 #[test]
 fn dispatch_title_trims_surrounding_whitespace() {
-    assert_eq!(dispatch_title("  fix-tabs  "), "[DISPATCH] fix-tabs");
+    assert_eq!(dispatch_title("  fix-tabs  "), "[D] fix-tabs");
 }
 
 #[test]
 fn dispatch_title_blank_name_falls_back_to_session() {
     // The socket parser rejects an EMPTY worktreeName, but " " gets through and
-    // would otherwise render a ragged "[DISPATCH]  ".
-    assert_eq!(dispatch_title("   "), "[DISPATCH] Session");
+    // would otherwise render a ragged "[D]  ".
+    assert_eq!(dispatch_title("   "), "[D] Session");
 }
 
 // dispatch_prompt — always points at the task file and tells the child to START

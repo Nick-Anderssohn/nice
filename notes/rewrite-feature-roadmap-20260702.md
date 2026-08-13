@@ -47,7 +47,7 @@ own test harness.)
 | M1 | Projects → Tabs (sessions) → Panes tree; a pinned, non-removable "Terminals" project at index 0; new Claude tabs auto-bucket into a project by cwd; ≤1 Claude pane per tab invariant | `Sources/Nice/State/TabModel.swift`, `Sources/Nice/State/Models.swift` |
 | M2 | Pane/tab status model: thinking / waiting / idle + waiting-acknowledgment ("stop pulsing once the user looked") | `Models.swift` (`TabStatus`, `applyStatusTransition`, `needsAttention`) |
 | M3 | Tab/pane titles: OSC auto-titles vs. manual rename lock (`titleManuallySet`); auto-numbered "Terminal N" (monotonic counter, persisted); "Main"/"Main N" for Terminals tabs | `Models.swift`, `TabModel.swift` (`applyAutoTitle`, rename paths), `SessionsModel.swift` (`createTerminalTab`) |
-| M4 | Tab lineage (depth-1 tree): `/branch` parents and `[HANDOFF]` children render one indent under a root tab | `Models.swift` (`Tab.parentTabId`), `TabModel.swift` (`insertBranchParent`, `insertHandoffChild`) |
+| M4 | Tab lineage (depth-1 tree): `/branch` parents and `[H]` children render one indent under a root tab | `Models.swift` (`Tab.parentTabId`), `TabModel.swift` (`insertBranchParent`, `insertHandoffChild`) |
 | M5 | Vestigial: `Tab.branch` (git branch field) exists in the model and persistence schema but is never populated or rendered — **do not carry** | `Models.swift:126`, `SessionStore.swift` (`PersistedTab.branch`) |
 
 ### C. Claude / shell integration
@@ -62,7 +62,7 @@ own test harness.)
 | C6 | SessionStart hook: installed script (`~/.nice/nice-claude-hook.sh` + `~/.claude/settings.json` entry) relays session-id/cwd rotations (`/clear`, `/branch`, `--fork-session`) back to the socket; refuses to clobber foreign settings | `Sources/Nice/Process/ClaudeHookInstaller.swift` |
 | C7 | `/branch` tracking: a `source=resume` rotation with an id change materializes a sibling "parent" tab pinned to the pre-branch session so the original conversation stays resumable | `SessionsModel.swift` (`handleClaudeSessionUpdate`, `materializeBranchParent`), `TabModel.swift` (`insertBranchParent`) |
 | C8 | Worktree awareness: `claude -w <name>` → project buckets under the original cwd while `Tab.cwd` follows the worktree (`/`→`+` sanitization); mid-session cwd swaps reported by the hook update `Tab.cwd` | `SessionsModel.swift` (`createTabFromMainTerminal`, `updateTabCwd`), `TabModel.swift` (`extractWorktreeName`, `adoptTabCwd`) |
-| C9 | Handoff: `/nice-handoff` skill (+ `~/.nice/nice-handoff.sh`) installed/removed per a Settings toggle with a one-time first-launch prompt; socket `handoff` opens a nested `[HANDOFF] <title>` tab running a fresh Claude seeded with a prompt pointing at the notes file, matching `--model`/`--effort` | `Sources/Nice/Process/SkillInstaller.swift`, `SessionsModel.swift` (`handleHandoffRequest`, `createHandoffTab`, `handoffPrompt`), `Tweaks.swift` (`installHandoffSkill`, `handoffSkillPromptSeen`) |
+| C9 | Handoff: `/nice-handoff` skill (+ `~/.nice/nice-handoff.sh`) installed/removed per a Settings toggle with a one-time first-launch prompt; socket `handoff` opens a nested `[H] <title>` tab running a fresh Claude seeded with a prompt pointing at the notes file, matching `--model`/`--effort` | `Sources/Nice/Process/SkillInstaller.swift`, `SessionsModel.swift` (`handleHandoffRequest`, `createHandoffTab`, `handoffPrompt`), `Tweaks.swift` (`installHandoffSkill`, `handoffSkillPromptSeen`) |
 | C10 | Claude theme sync: mirrors the active terminal theme to `~/.claude/themes/nice.json` (live-reloaded by Claude) and passes `--settings ~/.nice/claude-theme-settings.json` only to Nice-launched Claudes; `_niceManaged` marker prevents clobbering user files; Settings toggle (default ON) | `Sources/Nice/Process/ClaudeThemeSync.swift`, `TabPtySession.swift` (settings flag), `SessionsModel.swift` (in-place reply 3rd field) |
 | C11 | `claude` binary resolution via background login-shell `which` at launch (never blocks scene init) | `Sources/Nice/State/NiceServices.swift` (`runWhich`, `bootstrap`) |
 | C12 | Orphan shell reaper: on launch, SIGKILL zshes with PPID 1 + `NICE_TAB_ID` in env (crash debris) so the 511-pty cap can't starve `forkpty` | `Sources/Nice/Process/OrphanShellReaper.swift` |
@@ -436,7 +436,7 @@ windows is deliberately gone (§2).
 ### Stage 8 — Ecosystem & polish
 
 - **R26. Handoff.** C9: skill installer + first-launch prompt + socket
-  handler + nested `[HANDOFF]` tab with model/effort flags. Size **M**.
+  handler + nested `[H]` tab with model/effort flags. Size **M**.
   Deps: R16, R18, R23 (toggle).
 - **R27. Update checker + pill.** U1 + P7: `reqwest`/`ureq` + serde against
   GitHub releases, version compare, cached tag, popover with brew commands.

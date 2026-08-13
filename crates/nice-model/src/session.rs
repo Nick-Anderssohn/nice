@@ -34,6 +34,15 @@ pub struct Session {
     /// spelling.
     #[serde(rename = "active_pane_id")]
     pub active_window_id: Option<String>,
+    /// The window that was active before [`active_window_id`](Self::active_window_id)
+    /// — tmux `last-window`'s single "previous" slot, NOT an MRU stack. Written
+    /// only by [`switch_active_window`](Self::switch_active_window) (the USER-switch
+    /// paths: pill click, prev/next step, window-by-index, and the last-active
+    /// bounce itself); structural/seed writes to `active_window_id` deliberately
+    /// leave it alone. `#[serde(skip)]` — runtime-only, so no key appears in
+    /// `sessions.json` (the [`crate::TermWindow::is_claude_running`] precedent).
+    #[serde(skip)]
+    pub prev_active_window_id: Option<String>,
     /// True once the session label was filled from Claude's OSC-set title rather
     /// than left as "New session".
     pub title_auto_generated: bool,
@@ -71,6 +80,7 @@ impl Session {
             cwd: cwd.into(),
             windows: Vec::new(),
             active_window_id: None,
+            prev_active_window_id: None,
             title_auto_generated: false,
             title_manually_set: false,
             claude_session_id: None,
@@ -84,7 +94,7 @@ impl Session {
     fn live_claude_windows(&self) -> impl Iterator<Item = &TermWindow> {
         self.windows
             .iter()
-            .filter(|p| p.kind == TermWindowKind::Claude && p.is_alive)
+            .filter(|w| w.kind == TermWindowKind::Claude && w.is_alive)
     }
 
     /// True if any alive window on this session is a Claude window (`Models.swift:215`).
@@ -99,13 +109,45 @@ impl Session {
     /// only the running one trips this. Keys on [`TermWindow::is_claude_running`],
     /// exactly like the Swift promotion guard (`SessionsModel.swift:855-859`).
     pub fn has_running_claude(&self) -> bool {
-        self.live_claude_windows().any(|p| p.is_claude_running)
+        self.live_claude_windows().any(|w| w.is_claude_running)
+    }
+
+    /// Point `active_window_id` at `term_window_id`, remembering the window it
+    /// displaced in [`prev_active_window_id`](Self::prev_active_window_id) — the
+    /// single choke point for a **user** window switch (tmux `last-window`
+    /// semantics). Returns whether the active window actually moved.
+    ///
+    /// Selecting the already-active window is a no-op that does NOT rewrite the
+    /// previous slot, so mashing the same pill can't erase the bounce target.
+    /// Callers must have verified `term_window_id` is on this session — the helper
+    /// does not re-check membership, because every call site already does (and
+    /// `PtyManager::set_active_window` needs the found window anyway).
+    ///
+    /// Deliberately NOT used by structural / seed writes (add_window, lineage
+    /// insert, rename repair, restore seeding): opening a window or restoring a
+    /// saved layout is not a switch the user can bounce back from.
+    pub fn switch_active_window(&mut self, term_window_id: &str) -> bool {
+        if self.active_window_id.as_deref() == Some(term_window_id) {
+            return false;
+        }
+        self.prev_active_window_id = self.active_window_id.take();
+        self.active_window_id = Some(term_window_id.to_string());
+        true
+    }
+
+    /// The bounce target for tmux `last-window`: the previously-active window's id,
+    /// but only when that window is still on the session. A closed window's id is
+    /// cleared eagerly by [`crate::WorkspaceModel::extract_window`]; this is the
+    /// second line of defense for any other removal path.
+    pub fn last_active_window_id(&self) -> Option<&str> {
+        let id = self.prev_active_window_id.as_deref()?;
+        self.windows.iter().any(|w| w.id == id).then_some(id)
     }
 
     /// The window currently focused, if any (`Models.swift:220-223`).
     pub fn active_window(&self) -> Option<&TermWindow> {
         let id = self.active_window_id.as_ref()?;
-        self.windows.iter().find(|p| &p.id == id)
+        self.windows.iter().find(|w| &w.id == id)
     }
 
     /// Whether any window in `offscreen_ids` currently needs attention — used by
@@ -117,7 +159,7 @@ impl Session {
         }
         self.windows
             .iter()
-            .any(|p| offscreen_ids.contains(&p.id) && p.needs_attention())
+            .any(|w| offscreen_ids.contains(&w.id) && w.needs_attention())
     }
 
     /// Aggregate status shown in the sidebar dot. Derived from live Claude
@@ -125,10 +167,10 @@ impl Session {
     /// the toolbar pill. Written defensively for transient multi-window states
     /// during creation/teardown (`Models.swift:242-247`).
     pub fn status(&self) -> SessionStatus {
-        if self.live_claude_windows().any(|p| p.status == SessionStatus::Thinking) {
+        if self.live_claude_windows().any(|w| w.status == SessionStatus::Thinking) {
             return SessionStatus::Thinking;
         }
-        if self.live_claude_windows().any(|p| p.status == SessionStatus::Waiting) {
+        if self.live_claude_windows().any(|w| w.status == SessionStatus::Waiting) {
             return SessionStatus::Waiting;
         }
         SessionStatus::Idle
@@ -142,7 +184,7 @@ impl Session {
         let mut any_waiting = false;
         for window in self
             .live_claude_windows()
-            .filter(|p| p.status == SessionStatus::Waiting)
+            .filter(|w| w.status == SessionStatus::Waiting)
         {
             any_waiting = true;
             if !window.waiting_acknowledged {
@@ -332,7 +374,7 @@ mod tests {
 
         // Claude "emits" thinking while the terminal is active.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Thinking, false);
         }
         assert_eq!(
@@ -343,7 +385,7 @@ mod tests {
 
         // Claude transitions to waiting — the moment the sidebar used to freeze.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Waiting, false);
         }
         assert_eq!(
@@ -366,7 +408,7 @@ mod tests {
         // Claude window is active AND the session is being viewed → waiting lands
         // already acknowledged.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Waiting, true);
         }
         assert_eq!(session.status(), SessionStatus::Waiting);
@@ -395,10 +437,10 @@ mod tests {
             session.active_window_id = Some(active.to_string());
             let being_viewed = active == "claude";
             {
-                let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+                let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
                 c.apply_status_transition(new_status, being_viewed);
             }
-            let claude_status = session.windows.iter().find(|p| p.id == "claude").unwrap().status;
+            let claude_status = session.windows.iter().find(|w| w.id == "claude").unwrap().status;
             assert_eq!(session.status(), expected, "session.status (sidebar source) drifted");
             assert_eq!(
                 session.status(),
@@ -455,6 +497,81 @@ mod tests {
             !session.has_running_claude(),
             "A deferred-resume Claude (not yet running) must NOT trip the promotion-refusal predicate."
         );
+    }
+
+    // MARK: - switch_active_window / prev_active_window_id (tmux `last-window`)
+
+    #[test]
+    fn switch_active_window_records_the_displaced_window() {
+        let mut session = session_with(vec![terminal("a"), terminal("b")], Some("a"));
+        assert_eq!(session.prev_active_window_id, None, "nothing displaced yet");
+
+        assert!(session.switch_active_window("b"), "the active window moved");
+        assert_eq!(session.active_window_id.as_deref(), Some("b"));
+        assert_eq!(session.prev_active_window_id.as_deref(), Some("a"));
+        assert_eq!(session.last_active_window_id(), Some("a"));
+    }
+
+    #[test]
+    fn switch_active_window_to_the_same_window_is_a_noop() {
+        let mut session = session_with(vec![terminal("a"), terminal("b")], Some("a"));
+        session.switch_active_window("b");
+
+        assert!(!session.switch_active_window("b"), "re-selecting b does not move");
+        assert_eq!(
+            session.prev_active_window_id.as_deref(),
+            Some("a"),
+            "mashing the active pill must not erase the bounce target"
+        );
+    }
+
+    #[test]
+    fn switch_active_window_bounces_between_the_last_two() {
+        // tmux `last-window` semantics: a→b→(bounce)→a→(bounce)→b, forever.
+        let mut session = session_with(vec![terminal("a"), terminal("b"), terminal("c")], Some("a"));
+        session.switch_active_window("b");
+        session.switch_active_window("c");
+        assert_eq!(session.last_active_window_id(), Some("b"), "single slot, not an MRU stack");
+
+        let target = session.last_active_window_id().unwrap().to_string();
+        session.switch_active_window(&target);
+        assert_eq!(session.active_window_id.as_deref(), Some("b"));
+        assert_eq!(session.last_active_window_id(), Some("c"), "the bounce swaps the pair");
+
+        let target = session.last_active_window_id().unwrap().to_string();
+        session.switch_active_window(&target);
+        assert_eq!(session.active_window_id.as_deref(), Some("c"));
+        assert_eq!(session.last_active_window_id(), Some("b"));
+    }
+
+    #[test]
+    fn last_active_window_id_skips_a_window_that_is_gone() {
+        let mut session = session_with(vec![terminal("a"), terminal("b")], Some("a"));
+        session.switch_active_window("b");
+        session.windows.retain(|w| w.id != "a");
+        assert_eq!(
+            session.last_active_window_id(),
+            None,
+            "a stale previous id must never be offered as a bounce target"
+        );
+    }
+
+    /// `prev_active_window_id` is runtime-only: `#[serde(skip)]` keeps it out of
+    /// `sessions.json` entirely (no new persisted key), and a decode defaults it.
+    #[test]
+    fn prev_active_window_id_is_not_serialized() {
+        let mut session = session_with(vec![terminal("a"), terminal("b")], Some("a"));
+        session.switch_active_window("b");
+
+        let json = serde_json::to_string(&session).expect("session serializes");
+        assert!(
+            !json.contains("prev_active"),
+            "no prev-active key may appear in the persisted session: {json}"
+        );
+
+        let decoded: Session = serde_json::from_str(&json).expect("session round-trips");
+        assert_eq!(decoded.active_window_id.as_deref(), Some("b"));
+        assert_eq!(decoded.prev_active_window_id, None, "the slot defaults on load");
     }
 
     // MARK: - recover_next_terminal_index (pure helper)

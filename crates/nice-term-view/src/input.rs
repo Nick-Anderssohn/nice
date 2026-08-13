@@ -104,6 +104,52 @@ pub fn kitty_forwards_super(mode: TermMode) -> bool {
     mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC)
 }
 
+/// A scrollback navigation a keystroke drives on Nice's viewport instead of
+/// encoding to the pty (Phase 0 keyboard scrollback — see
+/// [`scrollback_key_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbackAction {
+    /// One screen toward history (Shift+PageUp).
+    PageUp,
+    /// One screen toward the bottom (Shift+PageDown).
+    PageDown,
+    /// Jump to the oldest scrollback line (Shift+Home).
+    Top,
+    /// Jump back to the live bottom (Shift+End).
+    Bottom,
+}
+
+/// Which scrollback navigation a keystroke drives, if any (Phase 0 keyboard
+/// scrollback; scrolling was wheel-only before). Shift+PageUp/PageDown page
+/// through history and Shift+Home/End jump to the ends — the alacritty/Ghostty
+/// convention; the PLAIN keys keep encoding (`\e[5~`…, which less/vim/etc.
+/// depend on). Two gates:
+///
+/// * Shift must be the only chord modifier — a ctrl/alt/⌘-bearing chord stays
+///   terminal input. (macOS sets the `function` flag on every navigation key
+///   itself, so `function` deliberately does not disqualify.)
+/// * Not on the alternate screen: a fullscreen TUI has no scrollback and owns
+///   its keys, so there even the Shift variants encode.
+pub fn scrollback_key_action(
+    key: &str,
+    m: gpui::Modifiers,
+    mode: TermMode,
+) -> Option<ScrollbackAction> {
+    if !m.shift || m.control || m.alt || m.platform {
+        return None;
+    }
+    if mode.contains(TermMode::ALT_SCREEN) {
+        return None;
+    }
+    match key {
+        "pageup" => Some(ScrollbackAction::PageUp),
+        "pagedown" => Some(ScrollbackAction::PageDown),
+        "home" => Some(ScrollbackAction::Top),
+        "end" => Some(ScrollbackAction::Bottom),
+        _ => None,
+    }
+}
+
 /// Map a gpui [`Keystroke::key`] name to a functional [`NamedKey`], or `None` if
 /// it is an ordinary printable (a `Key::Char`). gpui's macOS backend names these
 /// exactly (`gpui_macos::events::parse_keystroke`): `"up"`, `"pagedown"`,
@@ -527,6 +573,63 @@ mod tests {
             platform,
             function: false,
         }
+    }
+
+    // MARK: - scrollback_key_action (Phase 0 keyboard scrollback)
+
+    #[test]
+    fn shift_nav_keys_scroll_on_the_primary_screen() {
+        let shift = mods(true, false, false, false);
+        assert_eq!(
+            scrollback_key_action("pageup", shift, TermMode::NONE),
+            Some(ScrollbackAction::PageUp)
+        );
+        assert_eq!(
+            scrollback_key_action("pagedown", shift, TermMode::NONE),
+            Some(ScrollbackAction::PageDown)
+        );
+        assert_eq!(
+            scrollback_key_action("home", shift, TermMode::NONE),
+            Some(ScrollbackAction::Top)
+        );
+        assert_eq!(
+            scrollback_key_action("end", shift, TermMode::NONE),
+            Some(ScrollbackAction::Bottom)
+        );
+        // macOS sets `function` on navigation keys itself — must not disqualify.
+        let mut shift_fn = shift;
+        shift_fn.function = true;
+        assert_eq!(
+            scrollback_key_action("pageup", shift_fn, TermMode::NONE),
+            Some(ScrollbackAction::PageUp)
+        );
+    }
+
+    #[test]
+    fn plain_and_multi_modifier_nav_keys_stay_terminal_input() {
+        // Plain PageUp keeps encoding (\e[5~ — less/vim depend on it).
+        assert_eq!(scrollback_key_action("pageup", mods(false, false, false, false), TermMode::NONE), None);
+        // Any additional chord modifier belongs to the terminal/app.
+        assert_eq!(scrollback_key_action("pageup", mods(true, false, true, false), TermMode::NONE), None);
+        assert_eq!(scrollback_key_action("home", mods(true, true, false, false), TermMode::NONE), None);
+        assert_eq!(scrollback_key_action("end", mods(true, false, false, true), TermMode::NONE), None);
+        // Non-navigation keys never scroll.
+        assert_eq!(scrollback_key_action("a", mods(true, false, false, false), TermMode::NONE), None);
+    }
+
+    #[test]
+    fn alt_screen_declines_so_the_tui_gets_the_keys() {
+        // A fullscreen TUI (vim, less) has no scrollback: even the Shift
+        // variants encode to the app there.
+        let shift = mods(true, false, false, false);
+        assert_eq!(scrollback_key_action("pageup", shift, TermMode::ALT_SCREEN), None);
+        assert_eq!(scrollback_key_action("end", shift, TermMode::ALT_SCREEN), None);
+        // Kitty flags WITHOUT the alt screen still scroll (Claude Code's
+        // inline TUI keeps normal-screen scrollback).
+        assert_eq!(
+            scrollback_key_action("pageup", shift, TermMode::DISAMBIGUATE_ESC_CODES),
+            Some(ScrollbackAction::PageUp)
+        );
     }
 
     #[test]

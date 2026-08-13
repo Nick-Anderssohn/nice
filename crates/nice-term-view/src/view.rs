@@ -70,6 +70,11 @@
 //!   core's `bracketed_paste_active()`, then written to the pty.
 //! * **⌘C copy** — a live selection is rendered to a string and written to the
 //!   pasteboard (only while kitty is off; under kitty ⌘C forwards `ESC[99;9u`).
+//! * **Shift+PageUp/PageDown/Home/End scrollback** (Phase 0) — consumed before
+//!   the key encoder and driven on the viewport
+//!   ([`crate::input::scrollback_key_action`]); plain variants still encode,
+//!   and on the alternate screen even the Shift chords go to the app. Works on
+//!   a held pane too (the read-gesture carve-out beside held ⌘C).
 //! * **DECSET-1004 focus in/out** — a change in the combined focus predicate
 //!   (`is_focused && window active`, the same value the caret uses) emits
 //!   `ESC[I` / `ESC[O` when the app enabled focus reporting.
@@ -108,7 +113,7 @@ use crate::hyperlink::{hover_changed, UrlOpener, UrlRegexCache};
 use crate::mouse::{link_click_verdict, LinkClickVerdict};
 use crate::input::{
     build_key_input, build_modifier_input, encoder_config, kitty_forwards_super, named_key_for,
-    KeyCodeProbe,
+    scrollback_key_action, KeyCodeProbe, ScrollbackAction,
 };
 use crate::mouse;
 use crate::overlay::{
@@ -937,6 +942,22 @@ impl TerminalView {
         });
     }
 
+    /// Drive one keyboard-scrollback navigation on the viewport (Phase 0).
+    /// Navigation, not typing: deliberately NO `snap_to_bottom_on_input` (same
+    /// carve-out as ⌘C), and the repaint notifies through the session handle's
+    /// context — the wheel path's discipline.
+    fn perform_scrollback(&mut self, action: ScrollbackAction, cx: &mut Context<Self>) {
+        self.handle.update(cx, |handle, hcx| {
+            match action {
+                ScrollbackAction::PageUp => handle.scroll_page_up(),
+                ScrollbackAction::PageDown => handle.scroll_page_down(),
+                ScrollbackAction::Top => handle.scroll_to_top(),
+                ScrollbackAction::Bottom => handle.scroll_to_bottom(),
+            }
+            hcx.notify();
+        });
+    }
+
     /// gpui key-down: the terminal's typed-input entry point.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
@@ -962,6 +983,16 @@ impl TerminalView {
         if self.held.is_held() {
             if m.platform && !m.control && !m.alt && keystroke.key == "c" && self.copy_selection(cx)
             {
+                cx.stop_propagation();
+                return;
+            }
+            // Phase 0: keyboard scrollback stays live on a held pane — same
+            // class as ⌘C above (a read gesture over the dead child's output,
+            // which is the pane's whole purpose; wheel scrolling already
+            // works). The mode still gates alt-screen via the term's frozen
+            // final state.
+            if let Some(action) = scrollback_key_action(&keystroke.key, m, self.current_mode(cx)) {
+                self.perform_scrollback(action, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1080,6 +1111,18 @@ impl TerminalView {
     fn dispatch_key(&mut self, keystroke: &Keystroke, event: KeyEventType, cx: &mut Context<Self>) {
         let mode = self.current_mode(cx);
         let m = keystroke.modifiers;
+
+        // Phase 0 keyboard scrollback: Shift+PageUp/PageDown/Home/End drive the
+        // viewport through scrollback instead of encoding (on the alternate
+        // screen the policy declines and the keys encode to the TUI as before).
+        // Applies to Press AND Repeat, so holding Shift+PageUp keeps paging.
+        // The held-pane gate in `on_key_down` performs the same interception
+        // for a dead child (keys never reach here in that state).
+        if let Some(action) = scrollback_key_action(&keystroke.key, m, mode) {
+            self.perform_scrollback(action, cx);
+            cx.stop_propagation();
+            return;
+        }
 
         // ⌥-as-Meta: gpui does not report which Option key is held, so the
         // per-side policy is resolved best-effort (Both/Off are side-independent;

@@ -211,6 +211,7 @@ mod tests {
             active_session_id: Some("t".to_string()),
             sidebar_collapsed: false,
             sidebar_mode: None,
+            sidebar_width: None,
             projects: vec![PersistedProject {
                 id: "terminals".to_string(),
                 name: "Terminals".to_string(),

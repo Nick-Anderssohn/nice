@@ -100,10 +100,12 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::Scroll;
+// `Dimensions` brings `Term::screen_lines()` into scope for the half-page delta.
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
+use alacritty_terminal::term::TermMode;
 use anyhow::Result;
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, Task};
 
@@ -645,6 +647,81 @@ impl TerminalSessionHandle {
         }
     }
 
+    /// Jump to the top (oldest scrollback line), discarding any sub-line
+    /// remainder (Phase 0: Shift+Home). Caller should `cx.notify()` to repaint.
+    /// No-op if not yet spawned.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::Top);
+        }
+    }
+
+    /// Page the viewport one screen toward history (Phase 0: Shift+PageUp) —
+    /// the core derives the page size from the current grid height and clamps
+    /// at the history end. Discards any sub-line wheel remainder. Caller should
+    /// `cx.notify()` to repaint. No-op if not yet spawned.
+    pub fn scroll_page_up(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::PageUp);
+        }
+    }
+
+    /// Page the viewport one screen toward the bottom (Phase 0:
+    /// Shift+PageDown); clamps at offset 0. Discards any sub-line wheel
+    /// remainder. Caller should `cx.notify()` to repaint. No-op if not yet
+    /// spawned.
+    pub fn scroll_page_down(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::PageDown);
+        }
+    }
+
+    /// Scroll the viewport half a screen toward history (Phase 1: ⌃⌘↑) — tmux
+    /// copy-mode `halfpage-up`. `alacritty_terminal::grid::Scroll` has no
+    /// half-page variant at this pin, so the delta is computed from the live grid
+    /// height by [`half_page_lines`]. Discards any sub-line wheel remainder like
+    /// the other jump methods. Caller should `cx.notify()` to repaint. No-op if
+    /// not yet spawned, so a held (pre-spawn) session is safe.
+    pub fn scroll_half_page_up(&mut self) {
+        self.scroll_half_page(true);
+    }
+
+    /// Scroll the viewport half a screen toward the bottom (Phase 1: ⌃⌘↓); clamps
+    /// at offset 0. The [`scroll_half_page_up`](Self::scroll_half_page_up)
+    /// counterpart.
+    pub fn scroll_half_page_down(&mut self) {
+        self.scroll_half_page(false);
+    }
+
+    /// Shared half-page body — the delta (magnitude AND sign) comes from the pure
+    /// [`half_page_delta`]. The core clamps the resulting offset to
+    /// `[0, history]`, so over-scroll at either end is a no-op.
+    fn scroll_half_page(&mut self, toward_history: bool) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            let mut term = term_arc.lock();
+            let delta = half_page_delta(term.screen_lines(), toward_history);
+            term.scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    /// Whether the terminal is on the alternate screen (vim, less, any full-screen
+    /// TUI). The Phase 1 half-page chords no-op there: they are keymap bindings, so
+    /// they never encode to the pty and there is nothing to fall through TO — and
+    /// the alt screen has no scrollback to page through. `false` before the session
+    /// spawns.
+    pub fn is_alt_screen(&self) -> bool {
+        self.session
+            .term()
+            // `Term::mode()` returns a `&TermMode`; read it out under the brief
+            // lock and drop the guard (the `current_mode` pattern in `view.rs`).
+            .map(|term_arc| term_arc.lock().mode().contains(TermMode::ALT_SCREEN))
+            .unwrap_or(false)
+    }
+
     /// The current scrollback display offset in lines (0 == parked at the bottom).
     /// Locks the `Term` briefly to read it; 0 if not yet spawned.
     pub fn display_offset(&self) -> usize {
@@ -753,6 +830,31 @@ fn take_scroll_steps(accum: &mut f32, delta: f32) -> i32 {
     let whole = accum.trunc();
     *accum -= whole;
     whole as i32
+}
+
+/// How many lines "half a page" is for a grid `screen_lines` tall — the magnitude
+/// the Phase 1 ⌃⌘↑/⌃⌘↓ chords step the display by (`alacritty_terminal`'s `Scroll`
+/// has no half-page variant at this pin, so the delta is computed here).
+///
+/// Integer division truncates, and the result is floored at **1** so a
+/// pathologically short grid (1 row, or a 0-row grid during a resize) still moves
+/// by a line instead of silently doing nothing. `screen_lines` never exceeds
+/// `i32::MAX` in practice; the cast is saturating anyway.
+pub fn half_page_lines(screen_lines: usize) -> i32 {
+    i32::try_from(screen_lines / 2).unwrap_or(i32::MAX).max(1)
+}
+
+/// The signed [`Scroll::Delta`] for one half-page step on a grid `screen_lines`
+/// tall: **positive** toward history (⌃⌘↑), **negative** toward the bottom (⌃⌘↓)
+/// — the same sign convention the wheel path
+/// ([`TerminalSessionHandle::scroll_lines`]) uses.
+pub fn half_page_delta(screen_lines: usize, toward_history: bool) -> i32 {
+    let lines = half_page_lines(screen_lines);
+    if toward_history {
+        lines
+    } else {
+        -lines
+    }
 }
 
 /// Build a [`DrainSignal`] and spawn `spec`'s session wired to wake it: the
@@ -944,8 +1046,8 @@ async fn drain_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        present_gate, take_scroll_steps, to_terminal_event, DrainReady, DrainSignal, PresentGate,
-        TerminalEvent, PRESENT_THROTTLE,
+        half_page_delta, half_page_lines, present_gate, take_scroll_steps, to_terminal_event,
+        DrainReady, DrainSignal, PresentGate, TerminalEvent, PRESENT_THROTTLE,
     };
     use nice_term_core::{ExitStatus, SessionEvent};
     use std::future::Future;
@@ -1795,5 +1897,39 @@ mod tests {
         // `topmost_line` internally, so asserting against it would be circular.
         assert_eq!(start, Point::new(Line(-5), Column(0)), "start clamped to grid top");
         assert_eq!(end, Point::new(Line(-3), Column(5)), "end rotated with its content");
+    }
+
+    // ---- Half-page scrollback delta (Phase 1: ⌃⌘↑ / ⌃⌘↓) --------------------
+
+    /// The magnitude is `screen_lines / 2`, truncating.
+    #[test]
+    fn half_page_lines_is_half_the_grid_height() {
+        assert_eq!(half_page_lines(40), 20);
+        assert_eq!(half_page_lines(24), 12);
+        // Odd heights truncate (tmux `halfpage-up` does the same).
+        assert_eq!(half_page_lines(25), 12);
+        assert_eq!(half_page_lines(3), 1);
+    }
+
+    /// Floored at one line, so a degenerate grid still moves instead of silently
+    /// doing nothing (a 0-row grid is reachable mid-resize).
+    #[test]
+    fn half_page_lines_floors_at_one() {
+        assert_eq!(half_page_lines(2), 1);
+        assert_eq!(half_page_lines(1), 1);
+        assert_eq!(half_page_lines(0), 1, "a 0-row grid must not yield a 0-line step");
+    }
+
+    /// Sign per direction: positive toward history (⌃⌘↑), negative toward the
+    /// bottom (⌃⌘↓) — the wheel path's `Scroll::Delta` convention.
+    #[test]
+    fn half_page_delta_signs_by_direction() {
+        assert_eq!(half_page_delta(40, true), 20, "⌃⌘U pages toward history");
+        assert_eq!(half_page_delta(40, false), -20, "⌃⌘D pages toward the bottom");
+        // Same magnitude both ways, so up-then-down returns to the start.
+        assert_eq!(half_page_delta(37, true) + half_page_delta(37, false), 0);
+        // The floor applies to both directions.
+        assert_eq!(half_page_delta(1, true), 1);
+        assert_eq!(half_page_delta(1, false), -1);
     }
 }

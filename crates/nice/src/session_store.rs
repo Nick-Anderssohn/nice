@@ -10,7 +10,9 @@
 //! The window envelope (`PersistedState`/`PersistedWindow`/`PersistedFrame`)
 //! lives here; the model-shaped leaves (`PersistedTermWindow`/`PersistedSession`/
 //! `PersistedProject`) live gpui-free in `nice-model`. The schema is Swift's v3
-//! **minus `branch`** (M5), tolerant by SHAPE: no version gate on read, unknown
+//! **minus `branch`** (M5) plus two Nice-only optional per-window slots —
+//! `sidebarMode` (R19) and `sidebarWidth` (Phase 0) — tolerant by SHAPE: no
+//! version gate on read, unknown
 //! fields ignored (NO `deny_unknown_fields`), nil-omitted optionals. A
 //! missing/corrupt/shape-mismatched file decodes to `{version:3, windows:[]}` —
 //! never an error, so the app always launches. Writes are `version: 3`.
@@ -120,6 +122,12 @@ pub struct PersistedWindow {
     /// slot and is its sole writer/reader (the DO-NOT-SIMPLIFY seam split).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_mode: Option<nice_model::SidebarMode>,
+    /// Phase 0: the user-resized docked sidebar width (pt), restored per window.
+    /// OPTIONAL — absent for never-resized windows and every pre-Phase-0 file
+    /// (absent ⇒ the default width), so the shape-tolerant schema stays
+    /// non-breaking; a double-click width reset writes it back to absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f64>,
     pub projects: Vec<PersistedProject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<PersistedFrame>,

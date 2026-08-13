@@ -1156,7 +1156,7 @@ pub fn run() {
         cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
         ));
-        // R12: the app-wide shortcut keymap — the 14 rebindable actions + ⌃⌘F
+        // R12: the app-wide shortcut keymap — the rebindable actions + ⌃⌘F
         // generated from `nice_model::shortcuts`, their handlers, and the hoisted
         // process-level `FontSettings` every window shares. Must run before the
         // first window opens: `open_managed_window` reads the shared font entity.
@@ -1171,7 +1171,7 @@ pub fn run() {
         ));
         // R24 (G7): re-apply the just-loaded map over the default keymap that
         // `install_shortcuts` bound — `rebuild_keymap` clears every binding and
-        // re-emits the 14 LIVE combos plus the PROTECTED non-rebindable set, so a
+        // re-emits the LIVE combos plus the PROTECTED non-rebindable set, so a
         // persisted rebind (or explicit unbind) is live from boot. Harmless when the
         // section is absent (the store is at defaults, so the board is unchanged).
         crate::keymap::rebuild_keymap(cx);
@@ -1693,8 +1693,8 @@ pub(crate) fn open_managed_window_with(
         let session = ws.workspace.active_session_id().map(str::to_owned);
         let term_window = session
             .as_deref()
-            .and_then(|t| ws.workspace.session_for(t))
-            .and_then(|t| t.active_window_id.clone());
+            .and_then(|s| ws.workspace.session_for(s))
+            .and_then(|s| s.active_window_id.clone());
         session.zip(term_window)
     };
 
@@ -3905,6 +3905,32 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "scrollback-keys",
+            open: crate::input_live::open_scrollback_keys_window,
+            gate: Gate::SelfReported {
+                // Seed render poll + five dispatched chords with settles + the
+                // alt-screen round trip; generous headroom. Needs NO
+                // Accessibility grant (in-process `dispatch_keystroke`, not
+                // CGEvents).
+                budget: Duration::from_secs(30),
+            },
+            activate: true,
+        },
+        Scenario {
+            name: "keybind-scheme",
+            open: crate::input_live::open_keybind_scheme_window,
+            gate: Gate::SelfReported {
+                // Ten nav chords + the seed render poll + four half-page chords +
+                // the alt-screen round trip, each with its settle. Needs NO
+                // Accessibility grant (in-process `dispatch_keystroke`, not
+                // CGEvents). Registered BEFORE `multiwindow`: it only `register`s
+                // its window (no `WindowRegistry::install`), so closing it never
+                // trips the quit-when-empty terminus.
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "compose-live",
             open: crate::compose_live::open_compose_live_window,
             gate: Gate::SelfReported {
@@ -4235,10 +4261,10 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // build_window_root) over a real control socket + real ptys: the installer
         // round-trips the two -rs files against INJECTED scratch dirs (never the
         // real ~/.claude / ~/.nice); a socket `handoff` naming a seeded originating
-        // Claude session opens a nested [HANDOFF]-titled session (locked, parented under the
+        // Claude session opens a nested [H]-titled session (locked, parented under the
         // originating session) whose stub argv carries --session-id/--model/--effort +
         // the prompt last; a miss (empty tabId) still replies `ok` and opens a
-        // top-level [HANDOFF] session; and empty model/effort omit both flags.
+        // top-level [H] session; and empty model/effort omit both flags.
         // The stub `claude` is seeded via the ResolvedClaudePath Global with
         // NICE_CLAUDE_OVERRIDE UNSET (so is_override stays false and the flags emit);
         // no real claude spawns. Sandbox HOME (no rc) for the driver's lifetime.
@@ -4259,7 +4285,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // The dispatch gate — the `/nice-dispatch` twin of `handoff`, likewise on
         // the SHIPPED window over a real control socket + real ptys with a stub
         // `claude` (never the real one) and a sandboxed HOME. Two legs: a raw
-        // `dispatch` message opens a nested, UNSELECTED `[DISPATCH] <worktree>` session
+        // `dispatch` message opens a nested, UNSELECTED `[D] <worktree>` session
         // (locked title, parented under the seeded dispatcher, spawned from the
         // PAYLOAD cwd — never the dispatcher's own) whose argv carries
         // `--add-dir <brief dir>` immediately followed by `--worktree <name>` then
@@ -4310,7 +4336,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // update pill appears on the SHIPPED toolbar off the injected fetcher and a
         // guarded global-HID click opens its popover; (b) a real guarded global-HID
         // drag commits an R25 pill reorder on the shipped strip; (c) a socket
-        // `handoff` opens a nested [HANDOFF]-titled session on the shipped window (stub
+        // `handoff` opens a nested [H]-titled session on the shipped window (stub
         // claude, never real) and ⌘, opens R23's shipped settings window exposing
         // the Claude section (the R26 handoff toggle's home). The R25 drag + R27
         // click post via the NEW guarded global-HID seams (activate + raise +
@@ -4397,7 +4423,7 @@ pub fn run_selftest(selector: String) {
         // R24 (G6): the rebindable-shortcut store with DEFAULTS + a throwaway temp
         // path — never the real `ui_settings.json` (the launch-time read +
         // default-path resolution stay in `run`). A scenario that rebinds a shortcut
-        // writes only this temp file; a fresh scenario reads all 14 defaults.
+        // writes only this temp file; a fresh scenario reads all the defaults.
         let shortcuts_path = std::env::temp_dir().join(format!(
             "nice-selftest-shortcuts-{}.json",
             std::process::id()
@@ -4709,7 +4735,7 @@ mod tests {
             .iter()
             .flat_map(|w| w.projects.clone())
             .flat_map(|p| p.sessions)
-            .find(|t| t.id == session_id)
+            .find(|s| s.id == session_id)
     }
 
     /// Acceptance #1 (BUGS.md #8 site 1 — `sidebar_shell.rs` `commit_rename`): a
@@ -4733,7 +4759,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_session(&store, &session_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|s| s.title),
             Some("Renamed Tab".to_string()),
             "the session rename persisted through the wired observer, not a per-site save"
         );
@@ -4760,8 +4786,8 @@ mod tests {
                 let term_window_id = ws
                     .workspace
                     .session_for(&session_id)
-                    .and_then(|t| t.windows.first())
-                    .map(|p| p.id.clone())
+                    .and_then(|s| s.windows.first())
+                    .map(|w| w.id.clone())
                     .unwrap();
                 (session_id, term_window_id)
             };
@@ -4777,7 +4803,7 @@ mod tests {
         cx.run_until_parked();
         {
             let session = persisted_session(&store, &session_id).expect("session persisted");
-            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
             assert_eq!(term_window.title, "Deploy", "the custom window label persisted");
             assert_eq!(term_window.title_manually_set, Some(true), "the rename lock persisted");
             assert_eq!(
@@ -4794,7 +4820,7 @@ mod tests {
         cx.run_until_parked();
         {
             let session = persisted_session(&store, &session_id).expect("session persisted");
-            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
             assert_eq!(term_window.title, "Terminal 2", "empty submit reset to the auto-default");
             assert_eq!(
                 session.next_terminal_index,
@@ -4823,8 +4849,8 @@ mod tests {
                 let term_window_id = ws
                     .workspace
                     .session_for(&session_id)
-                    .and_then(|t| t.windows.first())
-                    .map(|p| p.id.clone())
+                    .and_then(|s| s.windows.first())
+                    .map(|w| w.id.clone())
                     .unwrap();
                 (session_id, term_window_id)
             };
@@ -4841,7 +4867,7 @@ mod tests {
         cx.run_until_parked();
 
         let session = persisted_session(&store, &session_id).expect("session persisted");
-        let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+        let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
         assert_eq!(
             term_window.cwd.as_deref(),
             Some("/tmp/newcwd"),
@@ -4921,7 +4947,7 @@ mod tests {
 
         let session = persisted_session(&store, &session_id).expect("session persisted");
         assert!(
-            session.windows.iter().any(|p| p.id == "new-pane-id"),
+            session.windows.iter().any(|w| w.id == "new-pane-id"),
             "the newly-created window persisted through the observer"
         );
         assert_eq!(
@@ -4961,7 +4987,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_session(&store, &session_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|s| s.title),
             Some("Lease Safe".to_string()),
             "the deferred drain saved outside the lease — no double-lease abort"
         );

@@ -125,7 +125,7 @@ fn make_persisted_session(id: &str) -> PersistedSession {
 }
 
 fn make_window(id: &str, sessions: Vec<PersistedSession>) -> PersistedWindow {
-    let active_session_id = sessions.first().map(|t| t.id.clone());
+    let active_session_id = sessions.first().map(|s| s.id.clone());
     let projects = if sessions.is_empty() {
         vec![]
     } else {
@@ -141,6 +141,7 @@ fn make_window(id: &str, sessions: Vec<PersistedSession>) -> PersistedWindow {
         active_session_id,
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects,
         frame: None,
     }
@@ -171,6 +172,7 @@ fn make_session_window(id: &str, claude_session_id: &str) -> PersistedWindow {
         active_session_id: Some(session.id.clone()),
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects: vec![PersistedProject {
             id: format!("project-{id}"),
             name: format!("Project {id}"),
@@ -210,6 +212,32 @@ fn sidebar_mode_round_trips_and_defaults_absent() {
     let legacy = r#"{"version":3,"windows":[{"id":"w","sidebarCollapsed":false,"projects":[]}]}"#;
     let decoded: PersistedState = serde_json::from_str(legacy).unwrap();
     assert_eq!(decoded.windows[0].sidebar_mode, None);
+}
+
+/// Phase 0: the optional per-window `sidebarWidth` field serializes under its
+/// camelCase key, and an absent field (pre-Phase-0 / never-resized) decodes to
+/// `None` — the same shape-tolerant slot pattern as `sidebarMode` above.
+#[test]
+fn sidebar_width_round_trips_and_defaults_absent() {
+    let mut w = make_window("w", vec![]);
+    w.sidebar_width = Some(320.0);
+    let state = PersistedState {
+        version: CURRENT_VERSION,
+        windows: vec![w],
+    };
+    let bytes = serialize_state(&state).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.contains("\"sidebarWidth\": 320.0"),
+        "sidebar_width serializes under the camelCase key: {text}"
+    );
+
+    let decoded: PersistedState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded.windows[0].sidebar_width, Some(320.0));
+
+    let legacy = r#"{"version":3,"windows":[{"id":"w","sidebarCollapsed":false,"projects":[]}]}"#;
+    let decoded: PersistedState = serde_json::from_str(legacy).unwrap();
+    assert_eq!(decoded.windows[0].sidebar_width, None);
 }
 
 fn first_session_claude_id(window: &PersistedWindow) -> Option<String> {
@@ -532,6 +560,7 @@ fn round_trip_preserves_every_field() {
         active_session_id: Some("t1".into()),
         sidebar_collapsed: true,
         sidebar_mode: None,
+        sidebar_width: Some(320.0),
         projects: vec![PersistedProject {
             id: "nice".into(),
             name: "Nice".into(),
@@ -583,6 +612,7 @@ fn round_trip_preserves_nil_optionals() {
         active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects: vec![PersistedProject {
             id: "terminals".into(),
             name: "Terminals".into(),
@@ -619,6 +649,7 @@ fn persisted_window_round_trip_with_frame() {
         active_session_id: Some("t1".into()),
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects: vec![PersistedProject {
             id: "p".into(),
             name: "P".into(),
@@ -950,8 +981,7 @@ fn re_serializing_pre_rename_fixture_is_byte_identical() {
     fs::write(&path, PRE_RENAME_SESSIONS_V3).unwrap();
 
     let state = read_state(&path);
-    let mut bytes = serialize_state(&state).expect("serialize");
-    bytes.push(b'\n'); // the fixture is stored with a trailing newline
+    let bytes = serialize_state(&state).expect("serialize");
     let round_tripped = String::from_utf8(bytes).unwrap();
     assert_eq!(
         round_tripped, PRE_RENAME_SESSIONS_V3,

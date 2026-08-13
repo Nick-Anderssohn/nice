@@ -6,7 +6,8 @@
 //! ## What lives here (R24 slice 1)
 //!
 //! * [`ShortcutBindings`] — the gpui `Global` wrapping a
-//!   `HashMap<ShortcutAction, Option<OwnedCombo>>` (always all 14 keys present; a
+//!   `HashMap<ShortcutAction, Option<OwnedCombo>>` (always every `ShortcutAction::ALL`
+//!   key present; a
 //!   value of `None` means the action is explicitly unbound) plus the injected file
 //!   path. `load(path)` is fail-soft to defaults; `with_defaults(path)` is the
 //!   `run_selftest` seam (defaults + a temp path, no disk read). The read accessors
@@ -14,14 +15,14 @@
 //!   and the mutators [`set_binding`](ShortcutBindings::set_binding) /
 //!   [`reset`](ShortcutBindings::reset) are the store API R24's recorder pane drives.
 //! * The `shortcuts`-section decode/encode over the shared **read-merge-write**
-//!   writer ([`write_ui_settings_merged`]) — each mutator persists the FULL 14-entry
+//!   writer ([`write_ui_settings_merged`]) — each mutator persists the FULL
 //!   map (chord string or JSON `null`) then rebuilds the keymap, so a rebind survives
 //!   relaunch and every co-writer's section (`appearance` / `fonts` / `file_browser_sort`
 //!   / any unknown key) rides along untouched.
 //!
 //! ## The frozen load rules (Swift parity, `KeyboardShortcuts.swift:283-310`)
 //!
-//! 1. The `shortcuts` section absent entirely ⇒ all 14 defaults.
+//! 1. The `shortcuts` section absent entirely ⇒ all defaults.
 //! 2. Malformed JSON (whole file or a mistyped section) ⇒ defaults (fail-soft, log).
 //! 3. An unknown action key ⇒ dropped silently ([`ShortcutAction::from_id`] rejects it).
 //! 4. An action key present with `null` ⇒ that action is UNBOUND.
@@ -69,7 +70,8 @@ struct DocForShortcuts {
     shortcuts: Option<HashMap<String, Option<String>>>,
 }
 
-/// The map every action starts at (all 14 present) with its default combo owned.
+/// The map every action starts at (every `ShortcutAction::ALL` key present) with
+/// its default combo owned.
 fn default_map() -> HashMap<ShortcutAction, Option<OwnedCombo>> {
     default_bindings()
         .into_iter()
@@ -274,7 +276,7 @@ mod tests {
         OwnedCombo::from_token(token).unwrap()
     }
 
-    /// A missing file loads all 14 defaults (fresh-install path, load rule 1).
+    /// A missing file loads all defaults (fresh-install path, load rule 1).
     #[test]
     fn missing_file_loads_defaults() {
         let path = temp_path("missing");
@@ -353,8 +355,8 @@ mod tests {
         assert_eq!(raw["version"], 1);
     }
 
-    /// The write rule: the persisted section carries ALL 14 keys, each a chord
-    /// string or explicit `null` (a self-describing, diffable file).
+    /// The write rule: the persisted section carries EVERY action's key, each a
+    /// chord string or explicit `null` (a self-describing, diffable file).
     #[test]
     fn write_persists_full_map_with_explicit_null() {
         let path = temp_path("fullmap");
@@ -364,7 +366,11 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let section = raw["shortcuts"].as_object().expect("shortcuts is an object");
-        assert_eq!(section.len(), 14, "all 14 keys persisted");
+        assert_eq!(
+            section.len(),
+            ShortcutAction::ALL.len(),
+            "every action's key is persisted"
+        );
         // The unbound action is an explicit JSON null.
         assert!(section["toggleSidebar"].is_null());
         // A bound action is its chord string.
@@ -372,7 +378,7 @@ mod tests {
     }
 
     /// Load rule 1: an absent `shortcuts` section (even with a sibling section
-    /// present) loads all 14 defaults.
+    /// present) loads all defaults.
     #[test]
     fn absent_section_loads_all_defaults() {
         let path = temp_path("absent");
@@ -601,9 +607,18 @@ mod pre_rename_compat_tests {
 
     /// Every action id serializes to its pre-rename spelling. The variants moved;
     /// the on-disk keys did not.
+    ///
+    /// The frozen fourteen are pinned as the LEADING slice of
+    /// [`ShortcutAction::ALL`] — later phases append actions (tmux Phase 1 added
+    /// eight) — but nothing may reorder, rename, or drop the original ids, because
+    /// they are the persistence keys in every existing `ui_settings.json`.
     #[test]
     fn shortcut_action_ids_are_frozen_across_the_rename() {
-        assert_eq!(ShortcutAction::ALL, FROZEN_IDS.map(|(a, _)| a));
+        assert_eq!(
+            ShortcutAction::ALL[..FROZEN_IDS.len()],
+            FROZEN_IDS.map(|(a, _)| a),
+            "the original fourteen must stay first, in order"
+        );
         for (action, id) in FROZEN_IDS {
             assert_eq!(action.id(), id, "{action:?} id must stay frozen");
             assert_eq!(ShortcutAction::from_id(id), Some(action));
@@ -643,11 +658,30 @@ mod pre_rename_compat_tests {
             );
         }
         // The unknown `somethingRemovedLongAgo` key was dropped, not mapped.
-        assert_eq!(store.bindings().len(), 14);
+        assert_eq!(store.bindings().len(), ShortcutAction::ALL.len());
+
+        // Frozen load rule 5 for the tmux Phase 1 additions (the plan's accepted
+        // store-migration consequence, explicitly NOT seeded): ids absent from a
+        // PRESENT section load UNBOUND, so a user who ever rebound anything keeps
+        // their old board and picks the new chords up by hand.
+        for action in [
+            ShortcutAction::FocusPaneLeft,
+            ShortcutAction::LastActiveWindow,
+            ShortcutAction::ScrollHalfPageUp,
+            ShortcutAction::WindowByIndex,
+        ] {
+            assert_eq!(
+                store.binding(action),
+                None,
+                "{action:?} is absent from the pre-Phase-1 file, so it loads unbound"
+            );
+        }
     }
 
-    /// Round-trip: persisting the freshly-loaded map rewrites the SAME 14 ids with
-    /// the SAME values, and leaves every co-writer's section alone.
+    /// Round-trip: persisting the freshly-loaded map rewrites every frozen id with
+    /// the SAME value, drops the unknown key, and leaves every co-writer's section
+    /// alone. (The write rule persists the FULL map, so ids added after the fixture
+    /// was written appear too — as explicit `null`, per load rule 5.)
     #[test]
     fn pre_rename_shortcuts_section_round_trips_with_identical_ids() {
         let path = scratch_ui_settings("roundtrip");
@@ -668,12 +702,23 @@ mod pre_rename_compat_tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let written = after["shortcuts"].as_object().expect("shortcuts section");
 
-        // Exactly the 14 frozen ids — the unknown key is not re-emitted.
+        // Exactly the current action id set — the unknown key is not re-emitted,
+        // and every frozen id is still there.
         let mut keys: Vec<&str> = written.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let mut want: Vec<&str> = FROZEN_IDS.iter().map(|(_, id)| *id).collect();
+        let mut want: Vec<&str> = ShortcutAction::ALL.iter().map(|a| a.id()).collect();
         want.sort_unstable();
-        assert_eq!(keys, want, "the persisted key set is the frozen id set");
+        assert_eq!(keys, want, "the persisted key set is the full action id set");
+        for (_, id) in FROZEN_IDS {
+            assert!(keys.contains(&id), "the frozen id {id} must survive the rewrite");
+        }
+        assert!(
+            !keys.contains(&"somethingRemovedLongAgo"),
+            "an unknown key must not be re-emitted"
+        );
+        // The ids added after this fixture was written persist as explicit nulls
+        // (load rule 5: absent from a present section ⇒ unbound).
+        assert!(written["windowByIndex"].is_null());
 
         // Every value that was in the pre-rename file round-trips unchanged.
         let read_section = before["shortcuts"].as_object().unwrap();

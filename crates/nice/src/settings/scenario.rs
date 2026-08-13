@@ -1156,7 +1156,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_window(cx));
     settle(cx, 300).await;
     let after_ids = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
-    match after_ids.into_iter().find(|p| !before_ids.contains(p)) {
+    match after_ids.into_iter().find(|w| !before_ids.contains(w)) {
         Some(busy_window) => {
             cx.update(|app| {
                 state.update(app, |s, _| {

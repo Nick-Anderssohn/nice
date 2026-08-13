@@ -437,7 +437,7 @@ async fn sessions_partial_cancel_leg(
     let busy_window = state.update(cx, |s, _| {
         s.workspace
             .session_for(&busy_session)
-            .and_then(|t| t.windows.first().map(|p| p.id.clone()))
+            .and_then(|t| t.windows.first().map(|w| w.id.clone()))
     });
     let Some(busy_window) = busy_window else {
         failures.push("(c) the busy session has no seeded window to mark busy".into());
@@ -504,7 +504,7 @@ async fn add_spawned_window(
     let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_window(cx));
     settle(cx, 300).await;
     let after = toolbar_window_ids(cx, toolbar);
-    let term_window = after.into_iter().find(|p| !before.contains(p))?;
+    let term_window = after.into_iter().find(|w| !before.contains(w))?;
     // Poll spawned + push a readiness echo through so the interactive shell is live.
     for _ in 0..READY_POLLS {
         if state.update(cx, |s, _| s.ptys.has_window(session, &term_window)) {

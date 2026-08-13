@@ -347,7 +347,7 @@ impl FileBrowserView {
             let cwd = ws
                 .workspace
                 .session_for(&session_id)
-                .map(|t| t.cwd.clone())
+                .map(|s| s.cwd.clone())
                 .unwrap_or_default();
             (session_id, cwd)
         };
@@ -494,7 +494,7 @@ impl FileBrowserView {
         let cwd = ws
             .workspace
             .session_for(&session_id)
-            .map(|t| t.cwd.clone())
+            .map(|s| s.cwd.clone())
             .unwrap_or_default();
         Some((session_id, cwd))
     }

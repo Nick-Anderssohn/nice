@@ -41,6 +41,9 @@ pub(crate) struct WindowSeed {
     /// [`SidebarModel`](nice_model::SidebarModel) by
     /// [`WindowState::with_seed`](crate::window_state::WindowState::with_seed).
     pub(crate) sidebar_mode: Option<nice_model::SidebarMode>,
+    /// Phase 0: the saved user-resized sidebar width (pt), or `None` ⇒ the
+    /// default width (a pre-Phase-0 save, or a never-resized window).
+    pub(crate) sidebar_width: Option<f64>,
     /// The saved on-screen frame (Cocoa points), or `None` ⇒ default placement.
     pub(crate) frame: Option<PersistedFrame>,
 }
@@ -65,6 +68,7 @@ pub(crate) fn hydrate_seed(window: &PersistedWindow) -> WindowSeed {
         active_session_id: window.active_session_id.clone(),
         sidebar_collapsed: window.sidebar_collapsed,
         sidebar_mode: window.sidebar_mode,
+        sidebar_width: window.sidebar_width,
         frame: window.frame.clone(),
     }
 }
@@ -85,10 +89,10 @@ pub(crate) fn heal_model_cwds(model: &mut WorkspaceModel, projects_root: &Path) 
         .projects
         .iter()
         .flat_map(|p| p.sessions.iter())
-        .filter_map(|t| {
-            t.claude_session_id
+        .filter_map(|s| {
+            s.claude_session_id
                 .as_ref()
-                .map(|sid| (t.id.clone(), sid.clone(), t.cwd.clone()))
+                .map(|sid| (s.id.clone(), sid.clone(), s.cwd.clone()))
         })
         .collect();
 
@@ -114,6 +118,7 @@ mod tests {
             active_session_id: None,
             sidebar_collapsed: false,
             sidebar_mode: None,
+            sidebar_width: None,
             projects,
             frame: None,
         }
@@ -159,10 +164,12 @@ mod tests {
         w.id = "win-abc".into();
         w.sidebar_collapsed = true;
         w.active_session_id = Some("t1".into());
+        w.sidebar_width = Some(320.0);
         let seed = hydrate_seed(&w);
         assert_eq!(seed.window_id, "win-abc");
         assert!(seed.sidebar_collapsed);
         assert_eq!(seed.active_session_id.as_deref(), Some("t1"));
+        assert_eq!(seed.sidebar_width, Some(320.0), "the persisted width rides the seed");
         assert_eq!(seed.projects.len(), 1);
         assert_eq!(seed.projects[0].sessions[0].id, "t1");
     }

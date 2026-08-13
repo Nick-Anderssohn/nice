@@ -73,7 +73,7 @@
 //!   the `cx.subscribe` that feeds [`route_terminal_event`] from a live entity,
 //!   the live arming of the launch-overlay `LaunchDeadline`, and the
 //!   `session-lifecycle` live scenario — **slice 3**.
-//! * Claude status parsing (braille/✳ → thinking/waiting), session auto-title from
+//! * Claude status parsing (braille or ◐◑ / ✳ → thinking/waiting), session auto-title from
 //!   the OSC label, socket, promotion, persistence — **R15/R18** (breadcrumbs
 //!   below).
 //!
@@ -444,7 +444,7 @@ impl PtyManager {
     ) -> bool {
         let mut changed = false;
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                 if term_window.cwd.as_deref() != Some(cwd) {
                     term_window.cwd = Some(cwd.to_string());
                     changed = true;
@@ -484,7 +484,7 @@ impl PtyManager {
         let Some(session) = model.session_for(session_id) else {
             return false;
         };
-        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
+        let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return false;
         };
         let kind = term_window.kind;
@@ -506,7 +506,7 @@ impl PtyManager {
                 let clipped = clip_title(trimmed, WINDOW_TITLE_MAX);
                 let mut changed = false;
                 model.mutate_session(session_id, |session| {
-                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                    if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                         if term_window.title != clipped {
                             term_window.title = clipped;
                             changed = true;
@@ -516,8 +516,9 @@ impl PtyManager {
                 changed
             }
             TermWindowKind::Claude => {
-                // R15 T5: the Claude branch — split the braille-spinner (U+2800..
-                // U+28FF → thinking) / sparkle (U+2733 → waiting) status prefix via
+                // R15 T5: the Claude branch — split the busy-spinner (braille
+                // U+2800..U+28FF, or ◐◑ U+25D0..U+25D3 from Claude 2.1.228, →
+                // thinking) / sparkle (U+2733 → waiting) status prefix via
                 // [`parse_claude_title`], apply the status transition, and feed the
                 // trailing label into the session auto-title (dropping the "Claude Code"
                 // placeholder). Gated on `is_claude_running`: a deferred-resume
@@ -538,7 +539,7 @@ impl PtyManager {
                     let viewing = model.active_session_id() == Some(session_id);
                     model.mutate_session(session_id, |session| {
                         let is_active_window = session.active_window_id.as_deref() == Some(term_window_id);
-                        if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                        if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                             term_window.apply_status_transition(new_status, viewing && is_active_window);
                         }
                     });
@@ -656,10 +657,12 @@ impl PtyManager {
     pub(crate) fn set_active_window(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
         let viewing = model.active_session_id() == Some(session_id);
         model.mutate_session(session_id, |session| {
-            if session.windows.iter().any(|p| p.id == term_window_id) {
-                session.active_window_id = Some(term_window_id.to_string());
+            if session.windows.iter().any(|w| w.id == term_window_id) {
+                // A user switch — routed through the choke point that records the
+                // tmux `last-window` bounce target (Phase 1's ⌃⌘O).
+                session.switch_active_window(term_window_id);
                 if viewing {
-                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                    if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                         term_window.mark_acknowledged_if_waiting();
                     }
                 }
@@ -698,7 +701,7 @@ impl PtyManager {
         let Some(active) = session.active_window_id.clone() else {
             return;
         };
-        let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
+        let Some(cur) = session.windows.iter().position(|w| w.id == active) else {
             return;
         };
         // `((i + off) % n + n) % n`, expressed with rem_euclid.
@@ -826,7 +829,7 @@ impl PtyManager {
         self.clear_window_launch(term_window_id);
         // (2) model removal + neighbor refocus.
         model.mutate_session(session_id, |session| {
-            if let Some(idx) = session.windows.iter().position(|p| p.id == term_window_id) {
+            if let Some(idx) = session.windows.iter().position(|w| w.id == term_window_id) {
                 session.windows.remove(idx);
                 if session.active_window_id.as_deref() == Some(term_window_id) {
                     session.active_window_id = WorkspaceModel::neighbor_active_window_id(idx, &session.windows);
@@ -870,7 +873,7 @@ impl PtyManager {
     pub(crate) fn window_held(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
         self.clear_window_launch(term_window_id);
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                 term_window.is_alive = false;
                 // A held-dead window is not thinking or waiting regardless of its
                 // last OSC title; idle it and clear the ack so a future fresh
@@ -1039,13 +1042,13 @@ impl PtyManager {
             // Drop unspawned rows up front (before terminating spawned ones).
             let drop: HashSet<String> = unspawned.into_iter().collect();
             model.mutate_session(session_id, |session| {
-                session.windows.retain(|p| !drop.contains(&p.id));
+                session.windows.retain(|w| !drop.contains(&w.id));
                 let active_dropped = session
                     .active_window_id
                     .as_deref()
                     .is_some_and(|a| drop.contains(a));
                 if active_dropped {
-                    session.active_window_id = session.windows.first().map(|p| p.id.clone());
+                    session.active_window_id = session.windows.first().map(|w| w.id.clone());
                 }
             });
         }
@@ -1636,7 +1639,7 @@ impl PtyManager {
     ///   activation, as before.
     /// * **(D4) the title is fixed AND locked** — set to `title` up front with
     ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
-    ///   the `[HANDOFF] …` / `[DISPATCH] …` label once the fresh session names
+    ///   the `[H] …` / `[D] …` label once the fresh session names
     ///   itself (unlike an ordinary claude session, which keeps auto-title).
     /// * **(D3) placement nests one indent under the originating session** — via
     ///   [`WorkspaceModel::insert_handoff_child`] (depth-1 lineage, the invariant
@@ -1680,7 +1683,7 @@ impl PtyManager {
         ];
         session.active_window_id = Some(claude_window_id.clone());
         session.claude_session_id = Some(claude_session_id.clone());
-        // (D4) Lock the "[HANDOFF] …" / "[DISPATCH] …" title against Claude's OSC
+        // (D4) Lock the "[H] …" / "[D] …" title against Claude's OSC
         // auto-title.
         session.title_manually_set = true;
         session.next_terminal_index = 2;
@@ -1859,7 +1862,7 @@ impl PtyManager {
         let Some(term_window_id) = session.active_window_id.clone() else {
             return;
         };
-        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
+        let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return;
         };
         if !self.session_has_pty(session_id) || self.has_window(session_id, &term_window_id) {
@@ -2385,9 +2388,13 @@ fn compose_id_reply(verb: &str, session_id: &str, settings_path: Option<&str>) -
 }
 
 /// Split a Claude OSC title into its status prefix and the trailing label,
-/// per the T5 grammar. Pure port of the status-prefix extraction in Swift
-/// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`): the
-/// first Unicode scalar in `U+2800..=U+28FF` (braille spinner) ⇒
+/// per the T5 grammar. Ported from the status-prefix extraction in Swift
+/// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`), extended
+/// for Claude Code 2.1.228's busy-glyph change: a first Unicode scalar in
+/// `U+2800..=U+28FF` (braille spinner, Claude ≤ 2.1.227) OR
+/// `U+25D0..=U+25D3` (◐◑◒◓ half-shaded circles, the busy spinner from 2.1.228's
+/// "reduce tab-bar jitter" glyph update — the title alternates ◐/◑; the
+/// four-phase quad is accepted whole in case the cycle widens) ⇒
 /// [`Thinking`](SessionStatus::Thinking); exactly `U+2733` (✳ sparkle) ⇒
 /// [`Waiting`](SessionStatus::Waiting); anything else ⇒ no status change and the
 /// whole string is the label.
@@ -2401,7 +2408,7 @@ pub(crate) fn parse_claude_title(title: &str) -> (Option<SessionStatus>, &str) {
         return (None, title);
     };
     let cp = first as u32;
-    if (0x2800..=0x28FF).contains(&cp) {
+    if (0x2800..=0x28FF).contains(&cp) || (0x25D0..=0x25D3).contains(&cp) {
         (Some(SessionStatus::Thinking), &title[first.len_utf8()..])
     } else if cp == 0x2733 {
         (Some(SessionStatus::Waiting), &title[first.len_utf8()..])
@@ -2538,17 +2545,17 @@ fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]
 
 /// The prefix on every handoff-session title — Swift `handoffTitlePrefix`
 /// (`SessionsModel.swift:1161`). A single existing occurrence is stripped before
-/// re-prefixing so a handoff-fired-from-a-handoff reads `[HANDOFF] Foo`, not
-/// `[HANDOFF] [HANDOFF] Foo`.
-const HANDOFF_TITLE_PREFIX: &str = "[HANDOFF] ";
+/// re-prefixing so a handoff-fired-from-a-handoff reads `[H] Foo`, not
+/// `[H] [H] Foo`.
+const HANDOFF_TITLE_PREFIX: &str = "[H] ";
 
-/// Build the locked `[HANDOFF] …` title for a handoff session from the originating
+/// Build the locked `[H] …` title for a handoff session from the originating
 /// session's current title — pure port of Swift `handoffTitle`
 /// (`SessionsModel.swift:1173-1181`), unit-tested directly like
-/// [`build_claude_exec_command`]. Strips a single leading `[HANDOFF] ` (no
+/// [`build_claude_exec_command`]. Strips a single leading `[H] ` (no
 /// stacking), trims whitespace/newlines, and falls back to `Session` when the
 /// result is empty (a `None` / blank / whitespace-only originating title — which
-/// would otherwise yield a ragged `[HANDOFF]    `).
+/// would otherwise yield a ragged `[H]    `).
 pub(crate) fn handoff_title(originating_title: Option<&str>) -> String {
     let raw = originating_title.unwrap_or("");
     // `strip_prefix` mirrors Swift's `hasPrefix` + `dropFirst(prefix.count)`.
@@ -2602,13 +2609,13 @@ pub(crate) fn handoff_extra_args(model: &str, effort: &str, prompt: &str) -> Vec
 /// The prefix on every dispatch-session title. Unlike [`HANDOFF_TITLE_PREFIX`] there
 /// is no stripping rule: a dispatch title is built from the WORKTREE NAME, not
 /// from another session's title, so it can never stack.
-const DISPATCH_TITLE_PREFIX: &str = "[DISPATCH] ";
+const DISPATCH_TITLE_PREFIX: &str = "[D] ";
 
-/// Build the locked `[DISPATCH] <worktree-name>` title for a dispatch session. The
+/// Build the locked `[D] <worktree-name>` title for a dispatch session. The
 /// locked title keeps the sidebar's session→worktree mapping stable against Claude's
 /// OSC auto-title. Trims and falls back to `Session` on a blank name exactly as
 /// [`handoff_title`] does, so a whitespace-only name can't render a ragged
-/// `[DISPATCH]    ` (the socket parser only rejects a truly empty
+/// `[D]    ` (the socket parser only rejects a truly empty
 /// `worktreeName`).
 pub(crate) fn dispatch_title(worktree_name: &str) -> String {
     let trimmed = worktree_name.trim();
