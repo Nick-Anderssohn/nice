@@ -66,9 +66,10 @@ pub enum ShortcutAction {
     UndoFileOperation,
     /// Redo the last file operation (⌘⇧Z). Deferred handler — R20.
     RedoFileOperation,
-    /// Command Compose (⌘↩): rewrite the plain-English text in zsh's line buffer
-    /// into a real command via `claude -p`. Fires only at an idle interactive
-    /// prompt — the Nice-side gate and the ZLE widget live in `crates/nice`.
+    /// Command Compose (⌘↩): rewrite the plain-English text in the shell's line
+    /// buffer into a real command via `claude -p`. Fires only at an idle
+    /// interactive prompt — the Nice-side gate and the shell-side handler (zsh's
+    /// ZLE widget, bash's `bind -x`) live in `crates/nice`.
     /// The first Rust-only action: it has no Swift-prod `rawValue` counterpart.
     CommandCompose,
 }
@@ -118,10 +119,15 @@ impl ShortcutAction {
     /// Explanatory tooltip text for the recorder row's ⓘ affordance, or `None`
     /// for the actions whose label is self-explanatory. Only `CommandCompose`
     /// carries one today — its label alone doesn't say what the feature does.
+    ///
+    /// Shell-neutral by construction: `info` is a `&'static str` on a plain enum
+    /// in a crate that does not (and must not) depend on `nice`, so it cannot
+    /// name the active shell. The Settings ▸ Claude copy, which lives in `nice`
+    /// and *can* read the active profile, is the dynamic one.
     pub fn info(self) -> Option<&'static str> {
         match self {
             ShortcutAction::CommandCompose => Some(
-                "Turns plain English typed at a zsh prompt into a real command \
+                "Turns plain English typed at a shell prompt into a real command \
                  using Claude Code. The command is placed at the prompt for \
                  review — press Enter yourself to run it. Does nothing while a \
                  program is running in the window.",
@@ -479,6 +485,28 @@ pub fn conflicting_action<'a>(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// No shortcut string names a shell. Nice runs whichever shell the user
+    /// picked (Settings ▸ Advanced), and this crate cannot read that choice —
+    /// so its copy must not claim one. A regression here is invisible in a
+    /// screenshot but wrong for every bash user.
+    #[test]
+    fn no_shortcut_copy_names_a_shell() {
+        for action in ShortcutAction::ALL {
+            assert!(
+                !action.label().contains("zsh"),
+                "{action:?}'s label names zsh: {}",
+                action.label()
+            );
+            if let Some(info) = action.info() {
+                assert!(!info.contains("zsh"), "{action:?}'s info names zsh: {info}");
+                assert!(!info.contains("bash"), "{action:?}'s info names bash: {info}");
+            }
+        }
+        // The one action that carries info still explains itself.
+        let compose = ShortcutAction::CommandCompose.info().unwrap();
+        assert!(compose.contains("shell prompt"), "{compose}");
+    }
 
     #[test]
     fn table_is_complete_every_action_bound_exactly_once() {

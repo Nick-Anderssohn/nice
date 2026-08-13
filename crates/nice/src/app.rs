@@ -1417,7 +1417,46 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
     }
     // 4. Kick off the C11 claude-binary probe (last, per the sweep→reap→shell→
     //    probe ordering). Delivers to a process-global the Claude spawn path reads.
-    kickoff_claude_probe(cx);
+    //    At bootstrap there is nothing to protect, so a `None` result is
+    //    delivered as-is (see the `replace_only_on_success` parameter).
+    kickoff_claude_probe(cx, false);
+}
+
+/// Rewrite every live window's shell inject-env pairs to the ACTIVE profile's,
+/// after a Settings ▸ Advanced pick replaced the [`ShellRuntime`] global
+/// (`settings::advanced_pane::perform_pick_shell`).
+///
+/// Pane ARGV already follows the global — it is rebuilt from it at every spawn —
+/// so this is not what makes a new pane run the newly-picked binary. What is
+/// frozen per window is [`WindowShellEnv::inject_pairs`](crate::pty_manager::WindowShellEnv),
+/// set once at [`arm_window_control_socket`]. Leaving those stale is a
+/// correctness bug in both directions: a zsh→bash window would keep handing
+/// Nice's zsh `ZDOTDIR` to any zsh started inside its new bash panes, and a
+/// bash→zsh window would spawn zsh panes with NO `ZDOTDIR` — no `claude()`
+/// shadow, no OSC 7, no compose binding — while the pane's snapshot advertises
+/// compose as available.
+///
+/// Only the pairs are rewritten: `socket_path` and `compose_conf` were minted
+/// per window and stay exactly as armed. A window that never armed a socket
+/// (scenarios / itests, `window_shell_env == None`) is left injecting nothing,
+/// which is what it asked for.
+pub(crate) fn refresh_window_inject_env(cx: &mut App) {
+    let pairs = cx
+        .try_global::<ShellRuntime>()
+        .map(crate::shell::window_inject_pairs)
+        .unwrap_or_default();
+    for state in WindowRegistry::all_states(cx) {
+        state.update(cx, |ws, _cx| {
+            let Some(existing) = ws.ptys.window_shell_env() else {
+                return;
+            };
+            let refreshed = crate::pty_manager::WindowShellEnv {
+                inject_pairs: pairs.clone(),
+                ..existing.clone()
+            };
+            ws.ptys.set_window_shell_env(refreshed);
+        });
+    }
 }
 
 /// The C11 claude-binary probe (Swift `NiceServices.bootstrap`'s
@@ -1428,7 +1467,15 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
 /// `waitUntilExit`) and delivers its result to the same process-global on the
 /// foreground when it completes. The spawn path also re-reads the override at spawn
 /// time, so a scenario's stub resolves even though `run_selftest` skips this.
-fn kickoff_claude_probe(cx: &mut App) {
+///
+/// `replace_only_on_success` guards the delivery: with it set, a probe that comes
+/// back empty leaves the existing global alone. The bootstrap passes `false` (it
+/// is the first probe — there is nothing to protect, and `None` IS the answer).
+/// The Settings ▸ Advanced shell pick re-runs the probe because PATH lives in the
+/// shell's own rc files, so a zsh→bash switch can move `claude` — and passes
+/// `true`, so a transient failure of that re-probe can never downgrade a working
+/// install to "Claude not installed".
+pub(crate) fn kickoff_claude_probe(cx: &mut App, replace_only_on_success: bool) {
     use crate::pty_manager::ResolvedClaudePath;
     if let Ok(over) = std::env::var("NICE_CLAUDE_OVERRIDE") {
         if !over.is_empty() {
@@ -1448,7 +1495,12 @@ fn kickoff_claude_probe(cx: &mut App) {
             .background_executor()
             .spawn(async move { run_which_claude(&argv) })
             .await;
-        let _ = acx.update(|app| app.set_global(ResolvedClaudePath(resolved)));
+        let _ = acx.update(|app| match resolved {
+            Some(path) => app.set_global(ResolvedClaudePath(Some(path))),
+            // An empty re-probe keeps whatever the last successful one found.
+            None if replace_only_on_success => {}
+            None => app.set_global(ResolvedClaudePath(None)),
+        });
     })
     .detach();
 }

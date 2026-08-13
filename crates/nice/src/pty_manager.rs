@@ -1404,6 +1404,18 @@ impl PtyManager {
         self.window_shell_env = Some(env);
     }
 
+    /// This window's shell-injection env, or `None` when the window never
+    /// bootstrapped a control socket (scenarios / itests).
+    ///
+    /// The read half of [`set_window_shell_env`](Self::set_window_shell_env),
+    /// for the Settings ▸ Advanced shell pick: a new profile changes only the
+    /// `inject_pairs`, so the refresh reads the armed env and rewrites that one
+    /// field — `socket_path` and `compose_conf` were minted per window and must
+    /// survive untouched.
+    pub(crate) fn window_shell_env(&self) -> Option<&WindowShellEnv> {
+        self.window_shell_env.as_ref()
+    }
+
     /// The per-window terminal env pairs this window injects into every pty
     /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` (when
     /// set) + the active profile's injection pairs (zsh: `ZDOTDIR` +

@@ -42,8 +42,9 @@ struct FontsSection {
 /// the shell-abstraction migration's `shell` key (design §4 step 2). `shell`
 /// absent, or an empty string, means
 /// [`crate::shell::resolve::ShellSetting::Automatic`]; a non-empty string is a
-/// `Path` override. No Settings UI writes this key yet (migration step 6) — it
-/// round-trips only through a hand-edited `ui_settings.json` for now.
+/// `Path` override. Written by the Settings ▸ Advanced ▸ Shell picker
+/// ([`SettingsPrefsStore::set_shell`], migration step 6), and still tolerant of
+/// a hand-edited `ui_settings.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AdvancedSection {
     #[serde(default)]
@@ -128,13 +129,24 @@ impl SettingsPrefsStore {
     /// The persisted `advanced.shell` choice, as a
     /// [`crate::shell::resolve::ShellSetting`]. Absent, or an empty string
     /// (defensive — an empty value should never win a resolution hop), reads
-    /// as `Automatic`. No setter in this slice: the Settings ▸ Advanced row is
-    /// migration step 6, and the shell bootstrap only ever reads this.
+    /// as `Automatic`. This is what the shell bootstrap consults.
     pub fn shell_setting(&self) -> crate::shell::resolve::ShellSetting {
         match &self.advanced.shell {
             Some(s) if !s.is_empty() => crate::shell::resolve::ShellSetting::Path(s.clone()),
             _ => crate::shell::resolve::ShellSetting::Automatic,
         }
+    }
+
+    /// The persisted `advanced.shell` value as a RAW path (`None` ⇒ Automatic),
+    /// applying [`Self::shell_setting`]'s empty-string rule. The picker needs
+    /// the raw string rather than the `ShellSetting`: a path Nice cannot offer
+    /// as a row is shown verbatim as its own trailing choice, never silently
+    /// dropped.
+    pub fn shell(&self) -> Option<String> {
+        self.advanced
+            .shell
+            .clone()
+            .filter(|s: &String| !s.is_empty())
     }
 
     /// The injected file path (test hook).
@@ -190,6 +202,19 @@ impl SettingsPrefsStore {
             return Ok(false);
         }
         self.advanced.smooth_scroll = on;
+        self.write()?;
+        Ok(true)
+    }
+
+    /// Persist the `advanced.shell` choice, write-through only-if-changed.
+    /// `None` ⇒ Automatic, and the key is then omitted from the JSON entirely
+    /// rather than written as `null` (the section's `skip_serializing_if`), so a
+    /// user who goes back to Automatic leaves no residue behind.
+    pub fn set_shell(&mut self, path: Option<String>) -> std::io::Result<bool> {
+        if self.advanced.shell == path {
+            return Ok(false);
+        }
+        self.advanced.shell = path;
         self.write()?;
         Ok(true)
     }
@@ -388,6 +413,101 @@ mod tests {
             store.shell_setting(),
             crate::shell::resolve::ShellSetting::Automatic
         );
+    }
+
+    /// The picker's round-trip: Automatic → a path → Automatic, through the
+    /// file each time, with `shell()` and `shell_setting()` agreeing.
+    #[test]
+    fn set_shell_round_trips_through_the_file() {
+        let path = temp_path("shell-set");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        assert_eq!(store.shell(), None, "absent key ⇒ Automatic");
+
+        assert!(store.set_shell(Some("/bin/bash".to_string())).unwrap());
+        let reloaded = SettingsPrefsStore::load(path.clone());
+        assert_eq!(reloaded.shell(), Some("/bin/bash".to_string()));
+        assert_eq!(
+            reloaded.shell_setting(),
+            crate::shell::resolve::ShellSetting::Path("/bin/bash".to_string())
+        );
+
+        let mut store = reloaded;
+        assert!(store.set_shell(None).unwrap(), "back to Automatic writes");
+        let reloaded = SettingsPrefsStore::load(path);
+        assert_eq!(reloaded.shell(), None);
+        assert_eq!(
+            reloaded.shell_setting(),
+            crate::shell::resolve::ShellSetting::Automatic
+        );
+    }
+
+    /// Automatic omits the key entirely — never `"shell": null`, which a
+    /// hand-editing user would read as a broken setting.
+    #[test]
+    fn set_shell_none_omits_the_key() {
+        let path = temp_path("shell-omit");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        store.set_shell(Some("/bin/bash".to_string())).unwrap();
+        store.set_shell(None).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw["advanced"].get("shell").is_none(),
+            "Automatic must leave no `shell` key: {raw}"
+        );
+    }
+
+    /// only-if-changed: re-picking the same shell performs no second write.
+    #[test]
+    fn set_same_shell_does_not_rewrite() {
+        let path = temp_path("shell-noop");
+        let mut store = SettingsPrefsStore::load(path);
+        assert!(
+            store.set_shell(Some("/bin/bash".to_string())).unwrap(),
+            "first pick writes"
+        );
+        assert!(
+            !store.set_shell(Some("/bin/bash".to_string())).unwrap(),
+            "re-picking the identical shell must not rewrite"
+        );
+        assert!(
+            store.set_shell(None).unwrap(),
+            "Automatic is a different value, so it does write"
+        );
+    }
+
+    /// A shell write goes through the shared read-merge-write writer, so R21's
+    /// `appearance` and R19's `file_browser_sort` survive it.
+    #[test]
+    fn co_owner_sections_survive_a_shell_write() {
+        let path = temp_path("shell-cowriter");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"appearance":{"scheme":"dark","accent":"ocean"},"file_browser_sort":{"criterion":"name","ascending":true}}"#,
+        )
+        .unwrap();
+
+        let mut store = SettingsPrefsStore::load(path.clone());
+        store.set_shell(Some("/bin/bash".to_string())).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["advanced"]["shell"], "/bin/bash");
+        assert_eq!(raw["appearance"]["scheme"], "dark");
+        assert_eq!(raw["appearance"]["accent"], "ocean");
+        assert_eq!(raw["file_browser_sort"]["criterion"], "name");
+        assert_eq!(raw["version"], 1);
+    }
+
+    /// A hand-edited empty string reads as Automatic through the raw accessor
+    /// too, so the picker never renders an empty passthrough row.
+    #[test]
+    fn shell_empty_string_reads_as_absent() {
+        let path = temp_path("shell-raw-empty");
+        std::fs::write(&path, br#"{"version":1,"advanced":{"shell":""}}"#).unwrap();
+        let store = SettingsPrefsStore::load(path);
+        assert_eq!(store.shell(), None);
     }
 
     /// `advanced.shell` survives a write of an unrelated advanced field

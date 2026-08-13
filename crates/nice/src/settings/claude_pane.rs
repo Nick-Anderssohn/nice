@@ -101,6 +101,13 @@ pub(crate) fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView
     // `run_selftest` render never reads the real CFPrefs domain (D7). Absent
     // gate ⇒ OFF.
     let handoff_on = crate::app::handoff_skill_gate_on(cx);
+    // The Compose rows describe the shell the user actually runs, and lead with
+    // WHY they do nothing when that shell can't compose — a stock `/bin/bash`
+    // 3.2 leaves both dropdowns live for a feature it will never fire.
+    let compose_model_info = crate::shell::choices::compose_model_info(
+        &crate::shell::active_display_name(cx),
+        crate::shell::pane_shell(cx).compose == crate::shell::ComposeSupport::Trigger,
+    );
 
     div()
         .flex()
@@ -136,9 +143,7 @@ pub(crate) fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView
         ))
         .child(setting_row_info(
             "Command Compose model",
-            "The Claude model that turns plain English at a zsh prompt into a real \
-             command (the Compose command shortcut). Sonnet balances speed and \
-             quality; CLI default uses whatever your claude is configured with.",
+            compose_model_info,
             compose_dropdown(
                 "settings.claude.composeModel",
                 &crate::compose_conf::MODEL_CHOICES,

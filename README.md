@@ -16,7 +16,7 @@ brew install --cask Nick-Anderssohn/nice/nice
 
 You don't organize your Claude sessions. Nice does.
 
-Type `claude <args>` in any shell, from any project directory — a new session opens in Nice, auto-grouped under the right project, running in its own long-lived pty with a plain `zsh` window alongside.
+Type `claude <args>` in any shell, from any project directory — a new session opens in Nice, auto-grouped under the right project, running in its own long-lived pty with a plain shell window alongside.
 
 ## The themes are lit 🔥
 
@@ -54,7 +54,8 @@ All rebindable in Settings (`⌘,`).
 ## Requirements
 
 - macOS 14 (Sonoma) or later
-- [Claude Code](https://github.com/anthropics/claude-code) on your `$PATH` — optional; sessions fall back to a plain `zsh` if it's missing
+- zsh or bash; Nice runs your login shell (pick it in Settings ▸ Advanced). Other shells run fine as plain terminals, without Nice's shell integration.
+- [Claude Code](https://github.com/anthropics/claude-code) on your `$PATH` — optional; sessions fall back to a plain shell if it's missing
 
 ## Install
 

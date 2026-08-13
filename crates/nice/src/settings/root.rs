@@ -566,8 +566,11 @@ fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyEl
     crate::settings::claude_pane::claude_pane(window, cx)
 }
 
-/// Advanced pane (The spec §Advanced) — the persisted-inert smooth-scroll toggle.
-fn advanced_pane(window: &mut Window, cx: &mut App) -> AnyElement {
+/// Advanced pane (The spec §Advanced) — the Shell picker over the
+/// persisted-inert smooth-scroll toggle. Takes the root-view `Context` (not a
+/// bare `App`) because the Shell dropdown's open-menu state lives on the root
+/// view, exactly like the Claude / Font / Appearance panes.
+fn advanced_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     crate::settings::advanced_pane::advanced_pane(window, cx)
 }
 

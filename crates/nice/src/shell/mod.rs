@@ -9,7 +9,7 @@
 //! argv, kernel comm name, display copy — lives behind it, one implementation per
 //! shell ([`zsh::ZshProfile`] today).
 //!
-//! Migration state (design §9): **steps 1 and 2 are complete.** Step 1 was the
+//! Migration state (design §9): **all six steps are complete.** Step 1 was the
 //! pure extraction — the trait and `ZshProfile`, byte-frozen against the old
 //! inline `shell_inject` module, with every call site routed through the
 //! profile. Step 2 turned the abstraction on: [`resolve`](resolve::resolve) runs
@@ -19,17 +19,22 @@
 //! gates Command Compose, the orphan reaper prefilters on the comm-name union
 //! ([`reaper_comm_names`]), rc files live under `shellrc/<shell>/`, and the
 //! deferred-resume prefill var is gated on the profile's
-//! [`PrefillStrategy`]. **Step 3 is complete too**: [`bash::BashProfile`] brings
-//! the `--rcfile` spawn shapes, a generated `nice.bashrc`, and `"bash"` in
-//! [`all_known_comm_names`].
-//!
-//! Next (design §9 step 5): Command Compose for bash — the ≥ 4.3 version probe
-//! and the `bind -x` handler, which is what lets `BashProfile` report anything
-//! other than [`ComposeSupport::None`].
+//! [`PrefillStrategy`]. Step 3 added [`bash::BashProfile`]: the `--rcfile` spawn
+//! shapes, a generated `nice.bashrc`, and `"bash"` in
+//! [`all_known_comm_names`]. Step 4 gave bash its
+//! [`PrefillStrategy::AppTyped`] prefill (no `print -z`, so Nice types the
+//! command itself once the shell reports readiness) and its binary discovery.
+//! Step 5 landed Command Compose for bash — the `BASH_VERSINFO` ≥ 4.3 probe and
+//! the `bind -x` handler, so a modern bash reports
+//! [`ComposeSupport::Trigger`] while stock 3.2 stays
+//! [`ComposeSupport::None`]. Step 6 is the user-facing half: the Settings ▸
+//! Advanced **Shell** picker ([`choices`]) writing `advanced.shell`, applied to
+//! live windows, plus display copy that reads
+//! [`ShellProfile::display_name`] instead of saying "zsh".
 
 // Carried over from the `shell_inject` module this replaces, for the same
 // reason and one more. The trait surface is a CONTRACT (design §2) implemented
-// in full by every profile, but its consumers arrive across migration steps
+// in full by every profile, but its consumers arrived across migration steps
 // 1–6 — and some items never get a production consumer at all
 // (`COMPOSE_TRIGGER_BINDKEY` is the shell-side spelling, asserted only by the
 // script-pinning tests). Warning on the gap would train the eye to ignore
@@ -37,6 +42,7 @@
 #![allow(dead_code)]
 
 pub mod bash;
+pub mod choices;
 pub mod fallback;
 pub mod resolve;
 pub mod zsh;
@@ -301,7 +307,12 @@ pub fn install_shell_runtime(cx: &mut gpui::App, setting: &resolve::ShellSetting
     let inject = match profile.write_rc_files(&rc_dir_for(profile.as_ref())) {
         Ok(paths) => Some(paths),
         Err(e) => {
-            eprintln!("nice: ZDOTDIR inject failed: {e} (windows still get NICE_SOCKET)");
+            // Shell-neutral wording on purpose: this path runs for whichever
+            // profile is active, and since the Settings ▸ Advanced shell pick
+            // calls this installer, a user action can produce the line. "ZDOTDIR
+            // inject failed" would name a zsh-only concept for a failed
+            // `nice.bashrc` write.
+            eprintln!("nice: shell rc write failed: {e} (windows still get NICE_SOCKET)");
             None
         }
     };
@@ -355,6 +366,19 @@ pub fn pane_shell(cx: &gpui::App) -> PaneShell {
             kind: ShellKind::Zsh,
             compose: ComposeSupport::Trigger,
         },
+    }
+}
+
+/// The active profile's display name, for settings and help copy.
+///
+/// Owned rather than the trait's borrowed `&str` (design §2): the fallback
+/// profile's name is a runtime basename, and a clone at tooltip-build time costs
+/// nothing. Same absent-runtime rule as [`pane_shell`] — no runtime
+/// (`run_selftest` / scenarios) reads as zsh, which is what those panes run.
+pub fn active_display_name(cx: &gpui::App) -> String {
+    match cx.try_global::<ShellRuntime>() {
+        Some(runtime) => runtime.profile.display_name().to_string(),
+        None => "zsh".to_string(),
     }
 }
 
@@ -581,6 +605,37 @@ mod tests {
             window_inject_pairs(&fallback),
             Vec::<(String, String)>::new()
         );
+    }
+
+    /// Settings copy names the shell the user actually runs — and falls back to
+    /// zsh only where no runtime is installed, which is exactly where panes run
+    /// zsh anyway (`run_selftest`, scenarios).
+    #[gpui::test]
+    fn active_display_name_follows_the_installed_profile(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(active_display_name(cx), "zsh", "no runtime ⇒ zsh");
+
+            cx.set_global(zsh_runtime(Some("/managed/z"), None));
+            assert_eq!(active_display_name(cx), "zsh");
+
+            cx.set_global(ShellRuntime {
+                profile: Box::new(bash::BashProfile::new("/opt/homebrew/bin/bash")),
+                inject: None,
+                user_env: UserShellEnv::default(),
+            });
+            assert_eq!(active_display_name(cx), "bash");
+
+            cx.set_global(ShellRuntime {
+                profile: Box::new(fallback::FallbackProfile::new("/usr/local/bin/fish")),
+                inject: None,
+                user_env: UserShellEnv::default(),
+            });
+            assert_eq!(
+                active_display_name(cx),
+                "fish",
+                "the fallback's name is its runtime basename"
+            );
+        });
     }
 
     /// The production spawn sites all read their argv from here. With a zsh
