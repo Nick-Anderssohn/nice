@@ -291,7 +291,7 @@ terminal; never block, never garble.
 | `compose_support` | `None` — ⌘↩ falls through to `ForwardCmdEnter`/`Noop`, exactly the pre-feature behavior; no stray bytes (finding 6) |
 | `prefill` | `Off` — deferred-resume pane opens at a bare prompt. Acceptable: strictly better than today (today the user gets a *zsh* they didn't ask for) |
 | `probe_argv` | `[path, "-i", "-l", "-c", probe_cmd]` — `command -v` is POSIX and fish/tcsh support it; if the probe fails, the existing "Claude not installed ⇒ plain shell" fallback applies |
-| `comm_name` | basename of `path`, truncated to 15 bytes (MAXCOMLEN) |
+| `comm_name` | basename of `path`, truncated to 16 bytes (`MAXCOMLEN`, which does *not* count the NUL — XNU's `p_comm` is `char[MAXCOMLEN + 1]`, so kernel comms run to 16 visible bytes and `pbi_comm` is `[c_char; 16]`) |
 | `display_name` | the basename (e.g. "fish") |
 
 Net effect for a fish user: their actual shell with their actual config, correct PATH, working

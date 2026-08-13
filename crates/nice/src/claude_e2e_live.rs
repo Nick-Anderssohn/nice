@@ -51,7 +51,7 @@
 //! `~/.claude` / `~/.nice`, or Application Support. It installs no `WindowRegistry`
 //! close observer (its `build_window_root` only `register`s), so it is registered
 //! BEFORE `multiwindow` (which owns the quit-when-empty terminus and must be last);
-//! at teardown it resets the scenario `ShellInjectConfig` so `multiwindow`'s windows
+//! at teardown it resets the scenario `ShellRuntime` so `multiwindow`'s windows
 //! fork socket-only exactly as before.
 
 use std::io::Write;
@@ -207,7 +207,7 @@ impl Fixture {
 /// (self-reported gate). Before opening, it (1) writes the theme + pointer files
 /// against sandbox paths (the bootstrap-write mirror `run_selftest` skips), (2)
 /// installs the theme-sync gate ON so the SHIPPED provider fill lights up, and (3)
-/// installs the scenario `ShellInjectConfig` so the Main window forks WITH the
+/// installs the scenario `ShellRuntime` so the Main window forks WITH the
 /// `claude()` shadow. `HOME` is sandboxed only around `open_managed_window` (the
 /// Main window inherits it at fork), then restored.
 pub fn open_claude_e2e_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {

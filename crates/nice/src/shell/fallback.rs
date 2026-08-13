@@ -24,9 +24,13 @@ use super::{
     ComposeSupport, InjectPaths, PrefillStrategy, ShellKind, ShellProfile, SpawnCtx, UserShellEnv,
 };
 
-/// `MAXCOMLEN` (BSD/Darwin) is 16 bytes including the NUL terminator, so a
-/// kernel `comm` string tops out at 15 visible bytes.
-const MAX_COMM_BYTES: usize = 15;
+/// `MAXCOMLEN` (BSD/Darwin) is 16 and does *not* count the NUL: XNU declares
+/// `p_comm` as `char[MAXCOMLEN + 1]`, so a kernel `comm` string carries up to
+/// 16 visible bytes. `libc::proc_bsdinfo::pbi_comm` is `[c_char; MAXCOMLEN]`
+/// and the reaper's `comm_name()` reads all 16 when the buffer is unterminated,
+/// so truncating to 15 here would make the reaper's exact-match prefilter miss
+/// every orphan of a shell whose basename is ≥ 16 bytes.
+const MAX_COMM_BYTES: usize = 16;
 
 /// Truncate `s` to at most `max` bytes, backing off to the nearest earlier
 /// UTF-8 character boundary so the result is always valid `str`.
@@ -246,14 +250,26 @@ mod tests {
     }
 
     #[test]
-    fn comm_name_truncates_to_fifteen_bytes_display_name_does_not() {
-        // 20-byte basename; comm_name must be at most 15 bytes.
+    fn comm_name_truncates_to_sixteen_bytes_display_name_does_not() {
+        // 20-byte basename; comm_name must be at most 16 bytes — the width the
+        // kernel itself keeps (MAXCOMLEN, NUL not included), so the reaper's
+        // exact-match prefilter still matches this shell's orphans.
         let long_name = "abcdefghijklmnopqrst";
         assert_eq!(long_name.len(), 20);
         let profile = FallbackProfile::new(format!("/opt/weird/{long_name}"));
-        assert_eq!(profile.comm_name(), &long_name[..15]);
-        assert_eq!(profile.comm_name().len(), 15);
+        assert_eq!(profile.comm_name(), &long_name[..16]);
+        assert_eq!(profile.comm_name().len(), 16);
         assert_eq!(profile.display_name(), long_name);
+    }
+
+    /// A 16-byte basename is passed through whole: it is exactly what the kernel
+    /// reports for such a process, so truncating it would break the reaper.
+    #[test]
+    fn comm_name_keeps_a_sixteen_byte_basename_whole() {
+        let name = "abcdefghijklmnop";
+        assert_eq!(name.len(), 16);
+        let profile = FallbackProfile::new(format!("/opt/weird/{name}"));
+        assert_eq!(profile.comm_name(), name);
     }
 
     #[test]

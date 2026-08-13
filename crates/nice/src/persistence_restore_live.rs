@@ -38,7 +38,7 @@
 //! store), `NICE_CLAUDE_PROJECTS_ROOT` (the heal bucket), a sandbox `HOME`, a
 //! `ZDOTDIR` fixture, and `NICE_CLAUDE_OVERRIDE` at a stub — the real `claude` and
 //! the real `~/Library/Application Support` / `~/.claude` are NEVER touched. The
-//! store Global + the scenario `ShellInjectConfig` + every env var are cleared at
+//! store Global + the scenario `ShellRuntime` + every env var are cleared at
 //! teardown so the later `multiwindow` scenario runs clean. **Registers the
 //! `WindowRegistry` WITHOUT `install`** (its `build_window_root` only `register`s;
 //! quit-when-empty would kill the suite), registered BEFORE `multiwindow` (the

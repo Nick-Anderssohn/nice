@@ -361,7 +361,10 @@ Exactly the design §5 table. Key spellings:
   the filesystem.
 - `inject_env`: `vec![]`. `compose_support`: `None`. `prefill`: `Off`.
 - `probe_argv`: `[path, "-i", "-l", "-c", cmd]`.
-- `comm_name`: basename of `path` truncated to **15 bytes** (MAXCOMLEN is 16 incl. NUL). Store
+- `comm_name`: basename of `path` truncated to **16 bytes** (MAXCOMLEN is 16 and excludes the
+  NUL — XNU's `p_comm` is `char[MAXCOMLEN + 1]` and `pbi_comm` is `[c_char; 16]`, so a kernel
+  comm can be 16 visible bytes; truncating to 15 would make the reaper's exact-match prefilter
+  miss orphans of any shell whose basename is ≥ 16 bytes). Store
   the truncated basename on the profile at construction and borrow it — the trait method is
   `fn comm_name(&self) -> &str`, not `&'static str` (design §2 amended per `review-fable.md`
   I3; `display_name` likewise). Every profile satisfies it and no caller cares (the reaper

@@ -4041,7 +4041,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // sandbox theme/pointer files (never the real claude / ~/.claude / ~/.nice).
         // Registered BEFORE `multiwindow`: its build_window_root only `register`s (no
         // WindowRegistry close observer), so its window never trips the quit-when-
-        // empty terminus; teardown resets the scenario ShellInjectConfig.
+        // empty terminus; teardown resets the scenario ShellRuntime.
         Scenario {
             name: "claude-e2e",
             open: crate::claude_e2e_live::open_claude_e2e_window,
