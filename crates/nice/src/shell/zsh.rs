@@ -835,18 +835,45 @@ mod tests {
         let zdotdir = make_isolated();
         let capture = home.0.join("pty.bin");
         let driver = home.0.join("driver.zsh");
+        // Both waits are READINESS-driven, not sleep-driven: this suite's pty
+        // tests run in parallel with every other test in the crate, and a fixed
+        // "the shell is surely up by now" sleep becomes a flake the moment the
+        // box is loaded (a full-parallelism `cargo test --workspace` reproduced
+        // it as a hard failure).
+        //
+        //   * ready to type — the startup OSC 7 has landed. The injected zshrc
+        //     fires it after the `claude()` shadow is defined, so seeing it
+        //     means the wrapper this test drives exists.
+        //   * done — either the follow-up marker echoed back as OUTPUT (the
+        //     wrapper returned and we are at a prompt again) or the child is
+        //     gone (the wrapper exec'd). The marker is typed with quotes inside
+        //     the word so ZLE's paint of the line can never be mistaken for the
+        //     line's output.
         std::fs::write(
             &driver,
-            "emulate -L zsh\n\
-             zmodload zsh/zpty || exit 2\n\
-             out=$2\n\
-             : > $out\n\
-             drain() { local c; while zpty -rt n c 2>/dev/null; do print -rn -- \"$c\" >> $out; done }\n\
-             zpty n /bin/zsh -i\n\
-             sleep 1.5; drain\n\
-             zpty -w n \"$1\"\n\
-             repeat 25; do sleep 0.1; drain; done\n\
-             zpty -d n 2>/dev/null\n",
+            r#"emulate -L zsh
+zmodload zsh/zpty || exit 2
+cmd=$1; out=$2
+: > $out
+drain() { local c; while zpty -rt n c 2>/dev/null; do print -rn -- "$c" >> $out; done }
+zpty n /bin/zsh -i
+integer i
+for (( i = 0; i < 400; i++ )); do
+    drain
+    grep -q $'\e]7;' $out && break
+    sleep 0.05
+done
+zpty -w n "$cmd"
+zpty -w n 'print -r -- NICE-E2E-"DONE"' 2>/dev/null
+for (( i = 0; i < 400; i++ )); do
+    drain
+    grep -q 'NICE-E2E-DONE' $out && break
+    zpty -t n 2>/dev/null || break
+    sleep 0.05
+done
+drain
+zpty -d n 2>/dev/null
+"#,
         )
         .unwrap();
 
@@ -1424,6 +1451,11 @@ mod tests {
         let zdotdir = make_isolated();
         let capture = home.0.join("raw.bin");
         let driver = home.0.join("driver.zsh");
+        // Readiness-driven, not sleep-driven, for the same reason as the shadow
+        // driver above: fixed waits flake under a loaded box. Ready to type is
+        // the startup OSC 7; done is the composed command landing in the painted
+        // line. The request and the trigger go into the same input stream, so
+        // ZLE processes them in order with no wait needed between them.
         std::fs::write(
             &driver,
             format!(
@@ -1433,11 +1465,21 @@ out=$1
 : > $out
 drain() {{ local c; while zpty -rt n c 2>/dev/null; do print -rn -- "$c" >> $out; done }}
 zpty n /bin/zsh -i
-sleep 1; drain
+integer i
+for (( i = 0; i < 400; i++ )); do
+    drain
+    grep -q $'\e]7;' $out && break
+    sleep 0.05
+done
 zpty -w -n n "list all files with details"
-sleep 0.3; drain
 zpty -w -n n $'{trigger}'
-repeat 25; do sleep 0.1; drain; done
+for (( i = 0; i < 400; i++ )); do
+    drain
+    grep -q -- 'ls -la' $out && break
+    zpty -t n 2>/dev/null || break
+    sleep 0.05
+done
+drain
 zpty -d n 2>/dev/null
 "#,
                 trigger = COMPOSE_TRIGGER_BINDKEY

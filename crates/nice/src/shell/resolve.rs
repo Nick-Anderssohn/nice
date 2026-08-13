@@ -112,6 +112,11 @@ fn pwuid_shell_live() -> Option<String> {
 /// homebrew `/opt/homebrew/bin/bash` gets the bash profile *at that path*, not
 /// `/bin/bash`, so its own rc/probe/spawn argv all name the binary the user
 /// actually runs.
+///
+/// The bash arm is the one that touches the filesystem: [`BashProfile::probed`]
+/// forks the resolved binary once for its `--norc --noprofile` version probe,
+/// because resolve time is the single moment a pane's compose capability is
+/// decided (design §6.3).
 fn profile_for_path(path: String) -> Box<dyn ShellProfile> {
     let basename = Path::new(&path)
         .file_name()
@@ -119,7 +124,7 @@ fn profile_for_path(path: String) -> Box<dyn ShellProfile> {
         .unwrap_or(path.as_str());
     match basename {
         "zsh" => Box::new(ZshProfile::new(path)),
-        "bash" => Box::new(BashProfile::new(path)),
+        "bash" => Box::new(BashProfile::probed(path)),
         _ => Box::new(FallbackProfile::new(path)),
     }
 }
@@ -339,6 +344,36 @@ mod tests {
             assert_eq!(profile.program(), path);
             assert_eq!(profile.comm_name(), "bash", "{path}");
         }
+    }
+
+    /// The bash arm must *probe* the binary it resolved. This one line is the
+    /// entire production wiring of bash compose: a regression from
+    /// [`BashProfile::probed`] back to `BashProfile::new` would silently give
+    /// every pane `ComposeSupport::None` while the rest of the suite stayed
+    /// green (bash.rs tests call `probed`/`with_version` directly, and both
+    /// compose e2e paths write the trigger bytes themselves). Pinned
+    /// hermetically with stub executables named `bash`, so basename mapping and
+    /// the probe are both exercised without depending on the machine's shells.
+    #[test]
+    fn basename_mapping_bash_probes_resolved_binary_for_compose_support() {
+        use crate::shell::bash::hermetic::ScratchHome;
+        use crate::shell::ComposeSupport;
+
+        let modern = ScratchHome::new("nice-resolve-bash-modern");
+        let modern_bash = modern.install_executable("bash", "#!/bin/sh\nprintf %s 5.3\n");
+        assert_eq!(
+            profile_for_path(modern_bash.display().to_string()).compose_support(),
+            ComposeSupport::Trigger,
+            "a resolved bash >= 4.3 must come back compose-capable"
+        );
+
+        let stock = ScratchHome::new("nice-resolve-bash-stock");
+        let stock_bash = stock.install_executable("bash", "#!/bin/sh\nprintf %s 3.2\n");
+        assert_eq!(
+            profile_for_path(stock_bash.display().to_string()).compose_support(),
+            ComposeSupport::None,
+            "a resolved bash below the gate must come back without compose"
+        );
     }
 
     #[test]

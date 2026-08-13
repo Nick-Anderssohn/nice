@@ -545,8 +545,14 @@ untouched through step 2; step 3's plan adds the bash helper.
 - The existing zsh e2e/zpty suites run unchanged throughout (they are the frozen-contract
   regression net for step 1's extraction).
 
-**Live scenarios:** `compose_live` and the `term-render`-family scenarios stay zsh-pinned via
-`NICE_SHELL=/bin/zsh` (deterministic), with one added bash smoke scenario in step 5.
+**Live scenarios:** `compose_live` and the `term-render`-family scenarios stay zsh-pinned, with one
+added bash scenario in step 5. The pinning is done **in-code, not via `NICE_SHELL`**: self-tests run
+under `run_selftest`, which never bootstraps a `ShellRuntime`, so the live resolution chain in
+`shell::resolve` — the only reader of `NICE_SHELL` — never runs, and setting that variable would
+have no effect on a scenario. Each scenario names its shell directly instead: the zsh ones write
+zsh stubs and take `SpawnSpec`'s zsh-defaulting argv; the bash one writes `nice.bashrc` through
+`BashProfile` and hands over that profile's own `spawn_argv` (see `compose_live.rs`,
+`open_compose_live_bash_window`).
 
 ---
 

@@ -1318,13 +1318,21 @@ The GPUI application. Structure (grows over later cycles):
       claude`, `${sid:0:8}` not `${sid[1,8]}`, `printf … >&2` not `print -u2`)
       and the OSC 7 emitter, which rides a `$PWD`-deduped `PROMPT_COMMAND`
       wrapper because bash has no `chpwd` hook. Dialect baseline is **bash 3.2**
-      (macOS `/bin/bash` 3.2.57) — no ≥ 4 features — so compose is
-      `ComposeSupport::None` here and prefill is `PrefillStrategy::AppTyped`
-      (no `print -z`: Nice types the deferred-resume line into the pty itself on
-      the pane's first OSC 7, which is the rc file's final statement). Not
-      byte-pinned yet (design §10 freezes it once compose lands); until then
-      structural positive/negative sets plus real-`/bin/bash` e2e tests are the
-      net. Documented limitations, kept: under `--rcfile` the pane is not a login
+      (macOS `/bin/bash` 3.2.57) — no ≥ 4 features — so Command Compose is
+      version-gated, not assumed: `BashProfile::probed` runs the resolved binary
+      once at resolve time (`probe_version`, `--norc --noprofile`) and
+      `compose_support` reports `ComposeSupport::Trigger` only for a bash ≥ 4.3
+      (the lowest that fires a `bind -x` binding on the 8-byte trigger). Stock
+      3.2 — and any probe that fails to spawn, exits non-zero, or prints
+      something unparseable — stays `ComposeSupport::None`. Prefill is
+      `PrefillStrategy::AppTyped` (no `print -z`: Nice types the deferred-resume
+      line into the pty itself on the pane's first OSC 7, which is the rc file's
+      final statement). The script is **byte-pinned** now that compose landed
+      (design §10): a digest over the body plus a `write_rc_files` round-trip
+      makes any edit a deliberate digest bump, with the structural
+      positive/negative sets and the real-bash e2e tests as the readable half of
+      the contract. Documented limitations, kept: under `--rcfile` the pane is
+      not a login
       shell (`shopt -q login_shell` false), and `exec bash` drops the injection.
     - `shell::fallback` — `FallbackProfile`, the unknown-shell degrade (fish,
       tcsh, …): no rc injection, no shadow, no compose, no prefill, and separate

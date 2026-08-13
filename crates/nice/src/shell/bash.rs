@@ -37,9 +37,13 @@
 //! **Dialect baseline: bash 3.2** (macOS ships `/bin/bash` 3.2.57 forever).
 //! Nothing in the script may use ≥ 4 features. Command Compose needs bash ≥ 4.3
 //! (`bind -x` on a multi-character sequence), so [`ShellProfile::compose_support`]
-//! is unconditionally [`ComposeSupport::None`] here and the script carries no
-//! compose section — a bash pane's [`PaneShell`](super::PaneShell) snapshot keeps
-//! the trigger bytes away from a prompt that could not consume them.
+//! is gated on a **version probe**: [`BashProfile::probed`] runs the resolved
+//! binary once at resolve time ([`probe_version`], `--norc --noprofile`, ~ms) and
+//! only a bash ≥ 4.3 reports [`ComposeSupport::Trigger`]. Stock 3.2 — and any
+//! probe that fails to spawn, exits non-zero, or prints something unparseable —
+//! reports [`ComposeSupport::None`], so a bash pane's
+//! [`PaneShell`](super::PaneShell) snapshot keeps the trigger bytes away from a
+//! prompt that could not consume them (inventory finding F6).
 //!
 //! Prefill is [`PrefillStrategy::AppTyped`]: bash has no `print -z`, so Nice
 //! types the deferred-resume line into the pty itself once the pane's first OSC 7
@@ -48,12 +52,16 @@
 //!
 //! Like the zsh stubs, the script body is a static file pulled in with
 //! `include_str!` (design §8): no templating, ever — every dynamic value reaches
-//! the shell through an env var. Unlike them it is not yet byte-pinned; the
-//! contract freezes once compose lands (design §10), so until then the
-//! structural positive/negative sets below are the net.
+//! the shell through an env var. And like them it is now **byte-pinned**: the
+//! contract froze when Command Compose landed (design §10), so a digest over
+//! this body plus a `write_rc_files` round-trip turn any edit into a deliberate,
+//! reviewed digest bump. The structural positive/negative sets below stay the
+//! readable half of the contract — they say what the script must do; the digest
+//! only says nothing changed silently.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use super::{
     ComposeSupport, InjectPaths, PrefillStrategy, ShellKind, ShellProfile, SpawnCtx, UserShellEnv,
@@ -67,16 +75,133 @@ pub const NICE_BASHRC_BODY: &str = include_str!("scripts/bash/nice.bashrc");
 /// The rc file's name inside the profile's rc directory.
 const RC_FILE_NAME: &str = "nice.bashrc";
 
+/// The lowest bash that can honor the Command Compose trigger. `READLINE_LINE`
+/// became writable from a `bind -x` handler in 4.0, but a `bind -x` binding
+/// whose key sequence is longer than two characters silently never fires before
+/// **4.3** — and the trigger is the 8-byte `\e[5099~`. Gating at 4.0 would
+/// recreate finding F6 on 4.0–4.2: Nice would write bytes a dead binding could
+/// not consume, and `[5099~` would land in the user's line. The rc script's own
+/// `BASH_VERSINFO` guard checks this same pair, so the two sides cannot disagree
+/// in the dangerous direction. (Correction to design §6.3's "≥ 4.0"; there is no
+/// real macOS population on 4.0–4.2 — stock is 3.2.57, homebrew is 5.x.)
+const COMPOSE_MIN_VERSION: (u32, u32) = (4, 3);
+
+/// The version probe's shell command: `major.minor` on stdout and nothing else.
+/// Run under `--norc --noprofile` so no user config can slow it down or pollute
+/// stdout — the whole probe is a sub-millisecond fork of a shell that reads no
+/// files.
+const VERSION_PROBE_CMD: &str = r#"printf %s.%s "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}""#;
+
+/// Parse the probe's `major.minor` output. Strict on purpose — exactly two
+/// dot-separated non-negative integers — because every rejection falls to
+/// [`ComposeSupport::None`], the safe direction: a bash whose version Nice
+/// cannot read is treated as one that cannot honor the trigger.
+fn parse_version(out: &str) -> Option<(u32, u32)> {
+    let (major, minor) = out.trim().split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Run `<path> --norc --noprofile -c 'printf …'` and read back `(major, minor)`.
+///
+/// Fails toward `None` at every step — the binary is missing or not executable,
+/// it is not a bash (an `sh` chokes on `BASH_VERSINFO` and exits non-zero), it
+/// exits non-zero for any other reason, or its output does not parse. This is
+/// the seam the tests point at stub executables printing canned versions; it
+/// takes a plain path, so nothing about it is tied to a real bash.
+pub(crate) fn probe_version(path: &str) -> Option<(u32, u32)> {
+    let out = Command::new(path)
+        .args(["--norc", "--noprofile", "-c", VERSION_PROBE_CMD])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Where a modern bash lands on macOS when it is not the stock one: the two
+/// homebrew prefixes (Apple silicon, then Intel), walked in that order.
+const HOMEBREW_BASH_PATHS: [&str; 2] = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"];
+
+/// The env override that points the compose harness at an arbitrary bash build
+/// — the first candidate [`find_compose_bash`] tries.
+const TEST_BASH_ENV: &str = "NICE_TEST_BASH";
+
+/// Find a bash that can actually honor the Command Compose trigger — one
+/// [`probe_version`] reports at ≥ [`COMPOSE_MIN_VERSION`]. Search order:
+/// `NICE_TEST_BASH` → `/opt/homebrew/bin/bash` → `/usr/local/bin/bash` → every
+/// `bash` on this process's `PATH`, first match wins. **Every** candidate goes
+/// through the same probe, the env override included, so a `NICE_TEST_BASH`
+/// aimed at stock 3.2 is rejected rather than trusted.
+///
+/// `None` means "this machine has no bash ≥ 4.3", which is the normal state of
+/// a stock macOS: both consumers — the compose real-pty e2e and the
+/// `compose-live-bash` self-test scenario — then self-skip with a printed
+/// notice (design §10's environment-gated-test policy).
+///
+/// Deliberately **not** `#[cfg(test)]`: `compose_live.rs` is compiled into the
+/// shipping binary, and one shared helper is what keeps the scenario and the
+/// e2e from drifting into two different notions of "a bash that can compose".
+/// Nothing on a production code path calls it — panes get their bash from
+/// `resolve()`, never from this search.
+pub(crate) fn find_compose_bash() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(over) = std::env::var_os(TEST_BASH_ENV) {
+        candidates.push(PathBuf::from(over));
+    }
+    candidates.extend(HOMEBREW_BASH_PATHS.iter().map(PathBuf::from));
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("bash")));
+    }
+    candidates.into_iter().find(|cand| {
+        probe_version(&cand.to_string_lossy()).is_some_and(|v| v >= COMPOSE_MIN_VERSION)
+    })
+}
+
 /// bash — the `--rcfile`-injected profile (design §6.2). `path` is the resolved
 /// binary, kept as resolved: a homebrew `/opt/homebrew/bin/bash` gets the bash
 /// profile *at that path*, never rewritten to `/bin/bash`.
 pub struct BashProfile {
     path: String,
+    /// `(major, minor)` of the binary at [`Self::path`], or `None` when unprobed
+    /// or unreadable. The only input to [`ShellProfile::compose_support`].
+    version: Option<(u32, u32)>,
 }
 
 impl BashProfile {
+    /// A profile that has NOT probed its binary — `compose_support` is
+    /// [`ComposeSupport::None`]. Every path-shaped question (`spawn_argv`,
+    /// `rc_dir_for`, `probe_argv`, `comm_name`) is answered from the path alone,
+    /// so callers that only ask those — the unit tests, in practice — get them
+    /// without forking a shell. Production resolution uses [`Self::probed`].
     pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            version: None,
+        }
+    }
+
+    /// Probe the binary's version once, here at construction (design §6.3 allows
+    /// the synchronous probe in bootstrap: `--norc --noprofile` reads no files).
+    /// The one production constructor — `resolve()` builds every live
+    /// `BashProfile` this way, so a pane's compose capability is decided before
+    /// the first spawn and never re-probed.
+    pub fn probed(path: impl Into<String>) -> Self {
+        let path = path.into();
+        let version = probe_version(&path);
+        Self { path, version }
+    }
+
+    /// Construct with an already-known version — the injectable seam for
+    /// [`ShellProfile::compose_support`]'s truth table, with no subprocess.
+    #[cfg(test)]
+    pub(crate) fn with_version(path: impl Into<String>, version: Option<(u32, u32)>) -> Self {
+        Self {
+            path: path.into(),
+            version,
+        }
     }
 }
 
@@ -157,11 +282,16 @@ impl ShellProfile for BashProfile {
         })
     }
 
-    /// Compose needs `bind -x` on a multi-character sequence — bash ≥ 4.3, which
-    /// the 3.2 baseline is not. Unconditionally off in this slice; the version
-    /// probe that lifts it for a homebrew bash 5 lands with the compose section.
+    /// [`ComposeSupport::Trigger`] iff the probed version is at least
+    /// [`COMPOSE_MIN_VERSION`] — a homebrew bash 5 gets compose, stock
+    /// `/bin/bash` 3.2 does not, and an unprobed or unreadable version
+    /// (`None`) does not either. `None` is the safe direction: it is the pane
+    /// snapshot that keeps trigger bytes off a prompt with no binding for them.
     fn compose_support(&self) -> ComposeSupport {
-        ComposeSupport::None
+        match self.version {
+            Some(v) if v >= COMPOSE_MIN_VERSION => ComposeSupport::Trigger,
+            _ => ComposeSupport::None,
+        }
     }
 
     /// bash has no editor-buffer push (`print -z`), so Nice types the line
@@ -353,8 +483,7 @@ pub(crate) mod hermetic {
 mod tests {
     use super::hermetic::{quiet_argv, scratch, unique, Scratch, ScratchHome, SYSTEM_BASH};
     use super::*;
-    use std::path::PathBuf;
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
 
     fn profile() -> BashProfile {
         BashProfile::new(SYSTEM_BASH)
@@ -395,10 +524,115 @@ mod tests {
         assert_eq!(p.program(), "/bin/bash");
         assert_eq!(p.comm_name(), "bash");
         assert_eq!(p.display_name(), "bash");
-        // Compose is off until the >= 4.3 probe lands; prefill is app-typed
-        // because bash has no `print -z`.
+        // Compose is off for an UNPROBED profile (this fixture) exactly as it is
+        // for a probed stock /bin/bash 3.2 — the version gate owns that answer,
+        // and the tests below pin both halves. Prefill is app-typed because bash
+        // has no `print -z`.
         assert_eq!(p.compose_support(), ComposeSupport::None);
         assert_eq!(p.prefill(), PrefillStrategy::AppTyped);
+    }
+
+    // ---- the >= 4.3 compose version gate (work items 1 + 6) ----------------
+
+    /// The parser is deliberately strict: anything that is not exactly two
+    /// dot-separated integers is `None`, which routes to `ComposeSupport::None`
+    /// — the direction that cannot put `[5099~` in a user's line.
+    #[test]
+    fn bash_version_parse_reads_major_minor_and_fails_toward_none() {
+        assert_eq!(parse_version("3.2"), Some((3, 2)));
+        assert_eq!(parse_version("4.2"), Some((4, 2)));
+        assert_eq!(parse_version("4.3"), Some((4, 3)));
+        assert_eq!(parse_version("5.3"), Some((5, 3)));
+        // The probe prints no trailing newline, but a stub (or a future spelling)
+        // may; surrounding whitespace is trimmed, not rejected.
+        assert_eq!(parse_version("  5.2\n"), Some((5, 2)));
+        for bad in [
+            "",           // probe produced nothing
+            "\n",         //
+            "5",          // no minor
+            "5.",         //
+            ".3",         //
+            "5.x",        // non-numeric minor
+            "x.3",        // non-numeric major
+            "-1.2",       // negative major
+            "5.3.1",      // a full version string is NOT the probe's contract
+            "GNU bash 5", // someone else's --version banner
+        ] {
+            assert_eq!(parse_version(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// The probe against real executables, through the same seam production
+    /// uses: it takes a path, so a stub script printing a canned version stands
+    /// in for any bash Nice might resolve.
+    #[test]
+    fn bash_version_probe_reads_stub_executables_and_fails_toward_none() {
+        let home = ScratchHome::new("nice-bash-probe");
+        let stub = |name: &str, body: &str| {
+            home.install_executable(name, body).display().to_string()
+        };
+
+        let modern = stub("bash-5", "#!/bin/sh\nprintf %s 5.3\n");
+        assert_eq!(probe_version(&modern), Some((5, 3)), "canned modern bash");
+
+        let gate = stub("bash-43", "#!/bin/sh\nprintf %s 4.3\n");
+        assert_eq!(probe_version(&gate), Some((4, 3)));
+
+        let silent = stub("bash-silent", "#!/bin/sh\nexit 0\n");
+        assert_eq!(probe_version(&silent), None, "no output");
+
+        let garbage = stub("bash-garbage", "#!/bin/sh\nprintf %s 'not a version'\n");
+        assert_eq!(probe_version(&garbage), None, "unparseable output");
+
+        let failing = stub("bash-fails", "#!/bin/sh\nprintf %s 5.2\nexit 1\n");
+        assert_eq!(
+            probe_version(&failing),
+            None,
+            "a non-zero exit is not trusted even when stdout parses"
+        );
+
+        assert_eq!(
+            probe_version(&home.bin().join("nope").display().to_string()),
+            None,
+            "a binary that cannot be spawned probes as None"
+        );
+    }
+
+    /// The real macOS baseline: `/bin/bash` is 3.2.57 forever, so a probed stock
+    /// bash reports its version and still gets no compose. Unconditional —
+    /// `/bin/bash` is present on every machine.
+    #[test]
+    fn bash_version_probe_reports_stock_bin_bash_as_3_2() {
+        assert_eq!(
+            probe_version(SYSTEM_BASH),
+            Some((3, 2)),
+            "macOS ships /bin/bash 3.2.57"
+        );
+        assert_eq!(
+            BashProfile::probed(SYSTEM_BASH).compose_support(),
+            ComposeSupport::None,
+            "stock bash cannot bind a multi-character `bind -x` sequence"
+        );
+    }
+
+    /// The gate itself: `Trigger` iff the probed version is >= 4.3.
+    #[test]
+    fn bash_compose_support_needs_bash_4_3() {
+        let support = |version| BashProfile::with_version("/bin/bash", version).compose_support();
+        for off in [None, Some((3, 2)), Some((4, 0)), Some((4, 2))] {
+            assert_eq!(
+                support(off),
+                ComposeSupport::None,
+                "{off:?}: below the gate (or unprobed) — no trigger bytes"
+            );
+        }
+        for on in [Some((4, 3)), Some((4, 10)), Some((5, 3)), Some((6, 0))] {
+            assert_eq!(
+                support(on),
+                ComposeSupport::Trigger,
+                "{on:?}: at or above the gate"
+            );
+        }
     }
 
     /// The full `SpawnCtx` grid. Unlike zsh — whose injection rides `ZDOTDIR`,
@@ -563,7 +797,11 @@ mod tests {
         );
     }
 
-    // ---- script structural tests (the pre-byte-pin net, design §10) --------
+    // ---- script structural tests (what the contract SAYS, design §10) ------
+    //
+    // The readable half of the frozen contract: the digest pin at the bottom of
+    // this module catches any silent change, these say which parts matter and
+    // why. Neither replaces the other.
 
     /// The real bash 3.2 syntax gate, run against the file the writer actually
     /// produces. `/bin/bash` 3.2 ships on every macOS, so this is unconditional —
@@ -795,10 +1033,14 @@ mod tests {
     }
 
     /// The dialect table as a pinned NEGATIVE set: zsh spellings that would be
-    /// wrong or inert in bash, plus the two features this slice deliberately
-    /// leaves out (prefill env var, compose).
+    /// wrong or inert in bash, plus the prefill env var bash deliberately has
+    /// no shell-side contract for.
+    ///
+    /// The compose negatives this set once carried (`bind -x`, `READLINE_LINE`,
+    /// `5099`) are gone on purpose: the compose section is now IN the script,
+    /// and the positive pins below own that surface.
     #[test]
-    fn nice_bashrc_carries_no_zsh_isms_prefill_or_compose() {
+    fn nice_bashrc_carries_no_zsh_isms_or_shell_side_prefill() {
         let code = code_only();
         for (needle, why) in [
             ("print -z", "bash has no editor-buffer push; prefill is app-typed"),
@@ -820,9 +1062,6 @@ mod tests {
                 "the user's profile sources it; doing it again double-sources",
             ),
             (".bashrc", "no spelling of the user's ~/.bashrc may be sourced here"),
-            ("bind -x", "compose is not in this slice"),
-            ("READLINE_LINE", "compose is not in this slice"),
-            ("5099", "no compose trigger may be bound by a bash pane"),
         ] {
             assert!(
                 !code.contains(needle),
@@ -835,6 +1074,170 @@ mod tests {
             !NICE_BASHRC_BODY.contains("NICE_PREFILL_COMMAND"),
             "not even a comment may reference NICE_PREFILL_COMMAND"
         );
+    }
+
+    // ---- Command Compose: static pins (work item 3) ------------------------
+    //
+    // The bash half of the zsh static-text suite in `shell/zsh.rs`
+    // (`zshrc_compose_defines_widget_and_binds_trigger_in_all_keymaps` and
+    // friends), minus the precmd pin — the synchronous handler has nothing in
+    // flight across prompts to abandon — plus two pins with no zsh analogue:
+    // the `BASH_VERSINFO` guard the `bind` calls must sit inside, and the
+    // dialect word in the instruction.
+
+    /// The handler is bound to the trigger in ALL THREE keymaps that can hold
+    /// an idle prompt, with the shell-side trigger text derived from the Rust
+    /// constant so the two sides can never drift — and every `bind` sits INSIDE
+    /// the `BASH_VERSINFO` ≥ 4.3 guard, since a `bind -x` on an 8-byte sequence
+    /// silently never fires before 4.3.
+    #[test]
+    fn nice_bashrc_compose_binds_the_trigger_in_all_keymaps_under_the_version_guard() {
+        use crate::shell::{COMPOSE_TRIGGER_BINDKEY, COMPOSE_TRIGGER_SEQ};
+
+        assert!(NICE_BASHRC_BODY.contains("_nice_command_compose() {"));
+
+        // The guard is spelled against BASH_VERSINFO's major AND minor: a
+        // majors-only check would open compose on 4.0–4.2, where the binding
+        // is dead and the trigger bytes would land as `[5099~` in the line.
+        let guard =
+            "if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then";
+        let guard_at = at(guard);
+        // The guard's own `fi` — the first one after it.
+        let fi_at = guard_at
+            + NICE_BASHRC_BODY[guard_at..]
+                .find("\nfi\n")
+                .expect("the version guard must be closed by a top-level `fi`");
+
+        for bind in [
+            format!(r#"bind -x '"{COMPOSE_TRIGGER_BINDKEY}": _nice_command_compose'"#),
+            format!(r#"bind -m vi-insert -x '"{COMPOSE_TRIGGER_BINDKEY}": _nice_command_compose'"#),
+            format!(r#"bind -m vi-command -x '"{COMPOSE_TRIGGER_BINDKEY}": _nice_command_compose'"#),
+        ] {
+            let bind_at = at(&bind);
+            assert!(
+                bind_at > guard_at && bind_at < fi_at,
+                "`{bind}` must sit inside the BASH_VERSINFO >= 4.3 guard"
+            );
+        }
+        // No `bind` may escape the guard: 3.2 must source this file silently.
+        // Counted over the CODE — the comments discuss `bind -x` at length.
+        assert_eq!(
+            code_only().matches("bind ").count(),
+            3,
+            "the only `bind` calls in the script are the three guarded ones"
+        );
+
+        // Byte agreement: `\e` + the rest of the bind text == the pty bytes.
+        let mut expected = vec![0x1b_u8];
+        expected.extend_from_slice(
+            COMPOSE_TRIGGER_BINDKEY
+                .strip_prefix(r"\e")
+                .expect("the bindkey spelling starts with \\e")
+                .as_bytes(),
+        );
+        assert_eq!(COMPOSE_TRIGGER_SEQ, expected.as_slice());
+    }
+
+    /// The dialect line (inventory finding F5): the instruction asks for a
+    /// *bash* command line, and no code in the script mentions zsh. The
+    /// instruction is otherwise byte-identical to the zsh widget's — the single
+    /// word is the whole delta.
+    #[test]
+    fn nice_bashrc_compose_instruction_asks_for_bash_not_zsh() {
+        let code = code_only();
+        assert!(
+            code.contains(
+                "_nice_compose_instruction='Convert this plain-English request into a \
+                 single bash command line for macOS."
+            ),
+            "the instruction must ask for `a single bash command line`"
+        );
+        assert!(
+            !code.contains("zsh"),
+            "no code in nice.bashrc may mention zsh — least of all the instruction"
+        );
+        // The dialect word is the ONLY delta from the zsh instruction.
+        let bash_instruction = instruction_of(&code_only());
+        let zsh_instruction = instruction_of(crate::shell::zsh::ZSHRC_BODY);
+        assert_eq!(
+            bash_instruction.replacen("single bash command", "single zsh command", 1),
+            zsh_instruction,
+            "the two instructions differ in the dialect word and nothing else"
+        );
+    }
+
+    /// The `_nice_compose_instruction='…'` value of a script body.
+    fn instruction_of(body: &str) -> String {
+        let start = body
+            .find("_nice_compose_instruction='")
+            .expect("script defines _nice_compose_instruction");
+        let rest = &body[start + "_nice_compose_instruction='".len()..];
+        rest[..rest.find('\'').expect("instruction is single-quoted")].to_string()
+    }
+
+    /// The never-auto-execute invariant as a pinned NEGATIVE: no code path may
+    /// accept the line. readline's spelling of "run it" is the `accept-line`
+    /// function; the handler's only writes are to `READLINE_LINE` /
+    /// `READLINE_POINT`, which is editing state, not execution.
+    #[test]
+    fn nice_bashrc_compose_never_accepts_the_line() {
+        let code = code_only();
+        assert!(
+            !code.contains("accept-line"),
+            "the injected rc must never bind or invoke readline's accept-line"
+        );
+        let writes: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("READLINE_"))
+            .collect();
+        assert_eq!(
+            writes,
+            vec![r#"READLINE_LINE="$out""#, "READLINE_POINT=${#out}"],
+            "the handler's only mutations are the composed line and the cursor"
+        );
+    }
+
+    /// The user's text reaches claude on STDIN (a herestring off a
+    /// `$READLINE_LINE` copy), never argv — so no quoting of user text can ever
+    /// be wrong — and the flags ride `command claude -p`, which cannot re-enter
+    /// the `claude()` shadow defined above.
+    #[test]
+    fn nice_bashrc_compose_pipes_the_line_via_stdin() {
+        let code = code_only();
+        assert!(code.contains(r#"local request="$READLINE_LINE" sgr out rc"#));
+        assert!(code.contains(r#"_nice_compose_translate <<< "$request""#));
+        assert!(code.contains(r#"command claude -p "$_nice_compose_instruction""#));
+        for forbidden in [
+            r#"claude -p "$request""#,
+            r#"claude -p "$READLINE_LINE""#,
+            r#"claude "$request""#,
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "user text must never reach claude's argv (`{forbidden}`)"
+            );
+        }
+    }
+
+    /// An empty line is a no-op — no subprocess, no status line.
+    #[test]
+    fn nice_bashrc_compose_empty_line_is_a_noop() {
+        assert!(code_only().contains(r#"[[ -z "$READLINE_LINE" ]] && return 0"#));
+    }
+
+    /// The handler reads its runtime knobs from `$NICE_COMPOSE_CONF` — accent
+    /// for the status line's color, model/effort for the claude flags.
+    #[test]
+    fn nice_bashrc_compose_reads_the_conf_for_accent_model_and_effort() {
+        let code = code_only();
+        assert!(code.contains("NICE_COMPOSE_CONF"));
+        for key in ["accent", "model", "effort"] {
+            assert!(
+                code.contains(&format!("_nice_compose_conf_get {key}")),
+                "the conf key `{key}` must be read"
+            );
+        }
     }
 
     // ======================================================================
@@ -1555,5 +1958,525 @@ zpty -d n 2>/dev/null
             "startup + the cd, both ours. Got: {payloads:?}"
         );
         assert!(payloads[1].ends_with("/w2"), "Got: {payloads:?}");
+    }
+
+    // ---- Command Compose: real-bash 3.2 end-to-end (work item 4) -----------
+    //
+    // The bash port of `shell/zsh.rs`'s `compose_*_e2e` quartet. Unconditional
+    // and CI-safe: the compose helpers are defined OUTSIDE the ≥ 4.3 `bind`
+    // guard precisely so stock `/bin/bash` 3.2 — on every macOS — can run
+    // them. Only the `bind` calls need a modern bash, and those are the pty
+    // tier's business.
+
+    /// Install a fake `claude` into the scratch home's `bin/` recording its
+    /// argv (one per line) and stdin under `rec`, then printing `reply` — or,
+    /// with `fail`, exiting 1 with no output at all.
+    ///
+    /// The caller must also have written a PATH-restoring profile
+    /// ([`ScratchHome::write_path_restoring_bash_profile`]): the rc's login
+    /// emulation sources `/etc/profile`, whose `path_helper` would otherwise
+    /// demote the fixture `bin/` behind `/usr/bin`.
+    fn write_fake_claude(home: &ScratchHome, rec: &Path, reply: &str, fail: bool) {
+        std::fs::create_dir_all(rec).expect("create claude record dir");
+        let body = if fail {
+            "#!/bin/bash\nexit 1\n".to_string()
+        } else {
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}/argv\ncat > {rec}/stdin\nprintf '%s' {reply:?}\n",
+                rec = rec.display(),
+            )
+        };
+        home.install_executable("claude", &body);
+    }
+
+    /// Source the real `nice.bashrc` in `/bin/bash --rcfile … -i -c` under the
+    /// scratch home and run `script`, returning its stdout with the rc's
+    /// startup OSC 7 stripped (everything through the last BEL) — the bash
+    /// flavor of zsh's `run_zsh_compose`.
+    fn run_bash_compose(home: &ScratchHome, extra_env: &[(&str, &str)], script: &str) -> String {
+        let rc = nice_bashrc_in(home);
+        let out = run_bash(home, &unwrapped_argv(&rc, script), extra_env);
+        let text = stdout_of(&out);
+        match text.rfind('\u{07}') {
+            Some(i) => text[i + 1..].to_string(),
+            None => text,
+        }
+    }
+
+    /// `_nice_compose_translate` pipes the request through the fake claude's
+    /// STDIN, passes `-p` + the instruction, appends the conf file's
+    /// `--model`/`--effort`, and prints the reply verbatim.
+    #[test]
+    fn bash_compose_translate_pipes_stdin_and_conf_flags_e2e() {
+        let home = ScratchHome::new("nice-bash-compose-conf");
+        home.write_path_restoring_bash_profile("");
+        let rec = scratch("nice-bash-compose-conf-rec");
+        write_fake_claude(&home, &rec.0, "ls -la", false);
+        let conf = home.write_file(
+            "compose.json",
+            r##"{"accent":"#7a94db","model":"opus","effort":"high"}"##,
+        );
+
+        let out = run_bash_compose(
+            &home,
+            &[("NICE_COMPOSE_CONF", conf.to_str().unwrap())],
+            r#"_nice_compose_translate <<< "list files with details""#,
+        );
+
+        assert_eq!(out, "ls -la", "translate prints the model reply verbatim");
+        let argv = std::fs::read_to_string(rec.0.join("argv")).expect("fake claude ran");
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec![
+                "-p",
+                instruction_of(&code_only()).as_str(),
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+            ],
+            "argv is `-p <instruction>` plus the conf-driven flags"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rec.0.join("stdin")).unwrap(),
+            "list files with details\n",
+            "the user text reaches claude on stdin, never argv"
+        );
+        assert!(
+            !argv.contains("list files"),
+            "the user text must NOT appear on the command line. Got: <{argv}>"
+        );
+    }
+
+    /// Without a conf file, translate still runs — bare `claude -p`, no flags
+    /// (and no `set -u` trip on the empty array); a failing claude yields empty
+    /// output, which is what makes the handler print its failure line and keep
+    /// the typed English.
+    #[test]
+    fn bash_compose_translate_no_conf_and_failure_e2e() {
+        let home = ScratchHome::new("nice-bash-compose-noconf");
+        home.write_path_restoring_bash_profile("");
+        let rec = scratch("nice-bash-compose-noconf-rec");
+        write_fake_claude(&home, &rec.0, "echo hi", false);
+
+        let out = run_bash_compose(&home, &[], r#"_nice_compose_translate <<< "say hi""#);
+        assert_eq!(out, "echo hi");
+        let argv = std::fs::read_to_string(rec.0.join("argv")).unwrap();
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["-p", instruction_of(&code_only()).as_str()],
+            "no conf ⇒ no --model/--effort. Got: <{argv}>"
+        );
+
+        let failing = ScratchHome::new("nice-bash-compose-fail");
+        failing.write_path_restoring_bash_profile("");
+        write_fake_claude(&failing, &scratch("nice-bash-compose-fail-rec").0, "", true);
+        let out = run_bash_compose(&failing, &[], r#"_nice_compose_translate <<< "x""#);
+        assert_eq!(out, "", "a failing claude yields empty translate output");
+    }
+
+    /// `_nice_compose_strip` trims and unwraps fences/backticks — driven
+    /// through real bash 3.2, because the 3.2-safe parameter-expansion arcana
+    /// (`${out#"${out%%[![:space:]]*}"}`, not zsh's extendedglob) is the thing
+    /// under test.
+    #[test]
+    fn bash_compose_strip_unwraps_fences_e2e() {
+        let home = ScratchHome::new("nice-bash-compose-strip");
+        home.write_path_restoring_bash_profile("");
+
+        let script = concat!(
+            "printf '%s|' \"$(_nice_compose_strip $'```bash\\nls -la\\n```')\"\n",
+            "printf '%s|' \"$(_nice_compose_strip $'  \\tfind . -name \"*.rs\"\\n')\"\n",
+            "printf '%s|' \"$(_nice_compose_strip '`echo hi`')\"\n",
+            // A multi-line command inside a fence survives with its newlines.
+            "printf '%s|' \"$(_nice_compose_strip $'```\\nfor f in *; do\\n  echo $f\\ndone\\n```')\"\n",
+        );
+        let out = run_bash_compose(&home, &[], script);
+        let parts: Vec<&str> = out.split('|').collect();
+        assert_eq!(parts[0], "ls -la", "fence unwrapped");
+        assert_eq!(parts[1], r#"find . -name "*.rs""#, "whitespace trimmed");
+        assert_eq!(parts[2], "echo hi", "wrapping backticks stripped");
+        assert_eq!(
+            parts[3],
+            "for f in *; do\n  echo $f\ndone",
+            "multi-line composition survives the fence strip"
+        );
+    }
+
+    /// The bash conf reader and the Rust writer's parser agree key-for-key on a
+    /// production-shaped blob — the app↔shell interchange pin, ported from zsh.
+    #[test]
+    fn bash_compose_conf_get_matches_rust_parser_e2e() {
+        let home = ScratchHome::new("nice-bash-compose-confget");
+        home.write_path_restoring_bash_profile("");
+        let blob = r##"{"accent":"#c96442","model":"sonnet","effort":"medium"}"##;
+        let conf = home.write_file("compose.json", blob);
+
+        let out = run_bash_compose(
+            &home,
+            &[("NICE_COMPOSE_CONF", conf.to_str().unwrap())],
+            r#"printf '%s|%s|%s' "$(_nice_compose_conf_get accent)" "$(_nice_compose_conf_get model)" "$(_nice_compose_conf_get effort)""#,
+        );
+        let bash_values: Vec<&str> = out.split('|').collect();
+        for (i, key) in ["accent", "model", "effort"].iter().enumerate() {
+            assert_eq!(
+                Some(bash_values[i].to_string()),
+                crate::compose_conf::parse_value(blob, key),
+                "bash and Rust parsers agree on {key}"
+            );
+        }
+    }
+
+    /// The guard-closed half of acceptance 3, on the bash every macOS actually
+    /// ships: stock 3.2 sources the whole rc — compose section included —
+    /// cleanly. The helpers are defined (they live outside the guard, which is
+    /// what makes the e2e quartet above unconditional), the three `bind` calls
+    /// are skipped, and NOTHING about `bind` reaches the user's terminal. A
+    /// `bind -x` warning leaking into every stock-bash pane's first screen is
+    /// exactly the visible-breakage class the version gate exists to prevent.
+    #[test]
+    fn nice_bashrc_sources_cleanly_on_stock_bash_3_2_with_the_guard_closed() {
+        let home = ScratchHome::new("nice-bash-compose-guard");
+        home.write_path_restoring_bash_profile("");
+        let rc = nice_bashrc_in(&home);
+
+        let script = "type -t _nice_command_compose _nice_compose_translate \
+                      _nice_compose_strip _nice_compose_sgr _nice_compose_conf_get; \
+                      bind -p 2>/dev/null | grep -c 5099";
+        let out = run_bash(&home, &unwrapped_argv(&rc, script), &[]);
+
+        let stdout = stdout_of(&out);
+        let tail = match stdout.rfind('\u{07}') {
+            Some(i) => stdout[i + 1..].to_string(),
+            None => stdout.clone(),
+        };
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["function", "function", "function", "function", "function", "0"],
+            "3.2 must define every compose helper and bind the trigger in NONE of its \
+             keymaps. Got: <{tail}>"
+        );
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("bind"),
+            "sourcing the rc on stock 3.2 must emit no `bind` warning. Stderr: <{stderr}>"
+        );
+        assert!(
+            !stderr.contains("5099"),
+            "no trigger spelling may reach the terminal on 3.2. Stderr: <{stderr}>"
+        );
+    }
+
+    // ---- Command Compose: real-pty e2e on a modern bash (work item 5) ------
+    //
+    // The one tier that needs a bash >= 4.3: `bind -x` on an 8-byte sequence is
+    // the whole point, and readline only paints under a real pty. Found via
+    // [`find_compose_bash`] (`NICE_TEST_BASH` -> homebrew -> PATH); a machine
+    // with only stock 3.2 gets a printed skip, which is a PASS — the guard-closed
+    // leg above is what covers that machine's actual behavior.
+
+    /// Whatever the discovery returns really is a bash that can compose — the
+    /// helper's contract, asserted without mutating the process environment (a
+    /// racy thing to do under a threaded test runner).
+    #[test]
+    fn find_compose_bash_only_yields_a_bash_that_can_compose() {
+        let Some(found) = find_compose_bash() else {
+            return;
+        };
+        assert!(
+            found.is_file(),
+            "discovery returned a path that is not a file: {found:?}"
+        );
+        assert!(
+            probe_version(&found.to_string_lossy()).expect("a discovered bash probes")
+                >= COMPOSE_MIN_VERSION,
+            "discovery must reject anything below {COMPOSE_MIN_VERSION:?}"
+        );
+    }
+
+    /// Drain everything currently readable from a non-blocking pty master into
+    /// `sink`. Returns `false` once the child's side is gone (EOF or `EIO`,
+    /// which is how macOS reports the last slave fd closing).
+    fn drain_pty(fd: std::os::unix::io::RawFd, sink: &mut Vec<u8>) -> bool {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n > 0 {
+                sink.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                return false;
+            }
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::EAGAIN) => true,
+                Some(libc::EINTR) => continue,
+                _ => false,
+            };
+        }
+    }
+
+    /// Poll the accumulated pty output until `pred` holds or `budget_ms`
+    /// elapses. Time-based rather than a fixed sleep so a slow machine does not
+    /// turn a passing compose into a flake.
+    fn poll_pty(
+        pty: &nice_term_core::PtyProcess,
+        sink: &mut Vec<u8>,
+        budget_ms: u64,
+        pred: impl Fn(&str) -> bool,
+    ) -> bool {
+        let mut waited = 0;
+        loop {
+            drain_pty(pty.master_fd(), sink);
+            if pred(&String::from_utf8_lossy(sink)) {
+                return true;
+            }
+            if waited >= budget_ms {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            waited += 50;
+        }
+    }
+
+    /// Full-visual e2e in a REAL pty on a REAL modern bash: type English, fire
+    /// the trigger bytes Nice writes, and read the wire.
+    ///
+    /// Pins the fragile half of the design — the redisplay choreography. A
+    /// `bind -x` handler that prints a status row and then clears its way back
+    /// up has no API telling it what readline will redraw; the contract is
+    /// "composed line rendered, no fragments of the status line or the old
+    /// English left behind", and only a real terminal can show it. The Enter leg
+    /// proves the redrawn text is genuine EDITING state (`READLINE_LINE`) rather
+    /// than paint on the screen.
+    ///
+    /// **Driven through [`nice_term_core::PtyProcess`], not zsh's `zpty`** (the
+    /// zsh spinner test's harness). `zpty` opens its pty with a 0×0 winsize —
+    /// zsh only copies a size when the driving shell has a real tty, which a
+    /// test runner does not — and readline paints NOTHING into a zero-width
+    /// screen: with `zpty`, typed text never echoes and the post-handler
+    /// redisplay emits no bytes, so the whole assertion set is vacuous. ZLE
+    /// falls back to `$COLUMNS` and never noticed. `PtyProcess` opens the pty
+    /// *with* the winsize, and is what production actually spawns panes
+    /// through — the argv under test is `BashProfile::spawn_argv`'s own.
+    #[test]
+    fn bash_compose_replaces_the_line_in_a_real_pty_e2e() {
+        use crate::shell::COMPOSE_TRIGGER_SEQ;
+        use nice_term_core::{PtyProcess, SpawnSpec};
+
+        let Some(bash) = find_compose_bash() else {
+            eprintln!(
+                "[skip] bash_compose_replaces_the_line_in_a_real_pty_e2e: no bash >= {}.{} \
+                 (looked at ${TEST_BASH_ENV}, {}, {}, then PATH). The stock-3.2 legs still ran.",
+                COMPOSE_MIN_VERSION.0,
+                COMPOSE_MIN_VERSION.1,
+                HOMEBREW_BASH_PATHS[0],
+                HOMEBREW_BASH_PATHS[1],
+            );
+            return;
+        };
+
+        const REQUEST: &str = "list all files with details";
+
+        let home = ScratchHome::new("nice-bash-compose-pty");
+        home.write_path_restoring_bash_profile("");
+        let rec = scratch("nice-bash-compose-pty-rec");
+        std::fs::create_dir_all(&rec.0).expect("create record dir");
+        // Thinks ~0.8s so the status line is captured mid-flight, then replies.
+        home.install_executable(
+            "claude",
+            &format!(
+                "#!/bin/bash\ncat > {rec}/stdin\nsleep 0.8\nprintf '%s' 'ls -la'\n",
+                rec = rec.0.display()
+            ),
+        );
+        let conf = home.write_file(
+            "compose.json",
+            r##"{"accent":"#c96442","model":"sonnet","effort":"medium"}"##,
+        );
+        let modern = BashProfile::new(bash.to_string_lossy().into_owned());
+        let paths = modern
+            .write_rc_files(&home.path().join("shellrc"))
+            .expect("write nice.bashrc");
+
+        let mut env = home.env();
+        env.push((
+            "NICE_COMPOSE_CONF".to_string(),
+            conf.to_string_lossy().into_owned(),
+        ));
+        let spec = SpawnSpec::shell(home.path().to_string_lossy().into_owned())
+            .with_argv(modern.spawn_argv(&SpawnCtx {
+                inject: Some(&paths),
+                command: None,
+            }))
+            .with_env(env)
+            .with_size(24, 80);
+        let pty = PtyProcess::spawn(&spec).expect("spawn the bash pane");
+        // Non-blocking master: the drain loop polls rather than parking on a
+        // shell that has nothing more to say.
+        unsafe { libc::fcntl(pty.master_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+
+        let mut raw: Vec<u8> = Vec::new();
+        let dump = |t: &str| t.escape_debug().to_string();
+
+        assert!(
+            poll_pty(&pty, &mut raw, 8000, |t| t.contains('$')),
+            "the injected bash never printed a prompt. Captured: <{}>",
+            dump(&String::from_utf8_lossy(&raw))
+        );
+        pty.write_input(REQUEST.as_bytes()).expect("type the request");
+        assert!(
+            poll_pty(&pty, &mut raw, 4000, |t| t.contains(REQUEST)),
+            "readline never echoed the typed request. Captured: <{}>",
+            dump(&String::from_utf8_lossy(&raw))
+        );
+
+        // The exact bytes `dispatch_command_compose`'s `Trigger` route writes.
+        pty.write_input(COMPOSE_TRIGGER_SEQ).expect("fire the trigger");
+        let composed = poll_pty(&pty, &mut raw, 15000, |t| {
+            t.contains("Composing") && t.rfind("ls -la").is_some()
+        });
+        let split = raw.len();
+        let before = String::from_utf8_lossy(&raw[..split]).into_owned();
+        assert!(
+            composed,
+            "the compose never completed. Captured: <{}>",
+            dump(&before)
+        );
+
+        // Nothing ran: `ls -la` prints a `total` header, and it must not appear
+        // until the Enter leg — asserted BEFORE Enter is sent so the two halves
+        // of the capture can never be confused.
+        assert!(
+            !before.contains("total "),
+            "the composed command EXECUTED without the user's Enter. Captured: <{}>",
+            dump(&before)
+        );
+
+        pty.write_input(b"\r").expect("press Enter");
+        let ran = poll_pty(&pty, &mut raw, 8000, |t| t.contains("total "));
+        let after = String::from_utf8_lossy(&raw[split..]).into_owned();
+        pty.teardown();
+
+        assert!(
+            before.contains("Composing"),
+            "the status line never painted. Captured: <{}>",
+            dump(&before)
+        );
+        // #c96442 -> SGR 38;2;201;100;66, the same truecolor bytes the zsh
+        // spinner test asserts: one accent, one wire spelling, both shells.
+        assert!(
+            before.contains("38;2;201;100;66"),
+            "the status line must be painted in the conf accent as truecolor. Captured: <{}>",
+            dump(&before)
+        );
+        assert!(
+            before.contains("ls -la"),
+            "the composed command never landed in the redrawn line. Captured: <{}>",
+            dump(&before)
+        );
+        // The trigger was consumed by the binding, not echoed as text — the
+        // finding-F6 symptom, asserted on the wire.
+        assert!(
+            !before.contains("5099~"),
+            "trigger fragments leaked into the line. Captured: <{}>",
+            dump(&before)
+        );
+        // The redraw is CLEAN: everything after the handler's last erase is the
+        // prompt plus the composed command, with no surviving fragment of the
+        // status line or of the English that was typed.
+        let redrawn = before
+            .rsplit("\u{1b}[2K")
+            .next()
+            .expect("the cleanup erases before readline redraws");
+        assert!(
+            redrawn.contains("ls -la") && !redrawn.contains(REQUEST)
+                && !redrawn.contains("Composing"),
+            "the redrawn line must be the composed command alone. Redrawn: <{}> of <{}>",
+            dump(redrawn),
+            dump(&before)
+        );
+        assert_eq!(
+            std::fs::read_to_string(rec.0.join("stdin")).expect("fake claude ran"),
+            format!("{REQUEST}\n"),
+            "the request reached claude on stdin, so the reply arrived by compose"
+        );
+        assert!(
+            ran && after.contains("total "),
+            "the user's Enter did not run the composed command — the redrawn line was \
+             paint, not READLINE_LINE. Captured: <{}>",
+            dump(&after)
+        );
+    }
+
+    // ---- the frozen script contract (work item 8) --------------------------
+
+    /// SHA-256 of `bytes` via the system `shasum`, so a reviewer's hand-run
+    /// `shasum -a 256 nice.bashrc` cannot disagree with this test. Mirrors the
+    /// zsh suite's helper of the same name deliberately — each script module
+    /// owns its own freeze.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn shasum");
+        child
+            .stdin
+            .take()
+            .expect("shasum stdin")
+            .write_all(bytes)
+            .expect("write body to shasum");
+        let out = child.wait_with_output().expect("shasum output");
+        assert!(out.status.success(), "shasum exited {:?}", out.status);
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .expect("shasum digest field")
+            .to_string()
+    }
+
+    /// The script's contract froze when compose landed (design §10): from here
+    /// on `nice.bashrc` is a compatibility surface against rc files already
+    /// written to users' disks, so no byte of it may change by accident.
+    ///
+    /// A failure here means one of two things: the script text changed (if that
+    /// was deliberate and reviewed, re-pin the digest in the SAME commit), or
+    /// `include_str!` points at the wrong file. The structural tests above stay
+    /// the readable "what the contract says" layer — this is only the "nothing
+    /// changed silently" layer, and neither replaces the other.
+    #[test]
+    fn nice_bashrc_body_sha256_frozen() {
+        assert_eq!(
+            sha256_hex(NICE_BASHRC_BODY.as_bytes()),
+            "823a1b33b10fa511a055c0d4accc9de31acad92c6078efa857cf99726ce9c935",
+            "nice.bashrc bytes changed"
+        );
+    }
+
+    /// What [`ShellProfile::write_rc_files`] puts on disk is the frozen body,
+    /// byte for byte — the writer half of the freeze. A writer that mangled the
+    /// script (a stray newline, a truncated atomic write) would break panes
+    /// while the digest test above stayed green.
+    #[test]
+    fn nice_bashrc_writer_round_trips_the_frozen_bytes() {
+        let dir = scratch("nice-bashrc-roundtrip");
+        let rcfile = profile()
+            .write_rc_files(&dir.0)
+            .expect("write nice.bashrc")
+            .rcfile
+            .expect("bash always reports an rcfile");
+        assert_eq!(
+            std::fs::read_to_string(&rcfile).expect("read the written rc"),
+            NICE_BASHRC_BODY,
+            "the rc on disk must equal the frozen const"
+        );
     }
 }

@@ -193,10 +193,154 @@ case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
         ;;
 esac
 
+# --- Command Compose (the commandCompose shortcut, cmd-enter) ----------------
+# Nice writes the private trigger ESC[5099~ to this pty only when this pane's
+# spawn-time snapshot says compose is supported — which the app grants only for
+# bash >= 4.3 (`bind -x` needs 4.3 for key sequences longer than two
+# characters; writable READLINE_LINE needs 4.0). The guard at the bottom of
+# this section mirrors that same gate, so the two sides can never disagree in
+# the dangerous direction (a dead binding plus trigger bytes would drop
+# `[5099~` into the user's line — inventory finding F6).
+#
+# Degraded vs the zsh widget, deliberately: readline has no async fd handlers
+# and no POSTDISPLAY ghost text, so this handler runs `claude -p`
+# SYNCHRONOUSLY — a static accent-colored status line below the prompt instead
+# of the pulsing star, and the prompt is BLOCKED until the reply lands
+# (keystrokes buffer; ctrl-c is the only escape, killing the claude child and
+# keeping the typed line). Cancellation is coarser than the zsh widget's
+# precmd generation bump for the same reason. The composed command REPLACES
+# the line for review; nothing here ever accepts it — running it is always the
+# user's own Enter.
+#
+# Known cosmetic edges, accepted: a prompt sitting on the terminal's last row
+# scrolls one line while the status prints; a wrapped multi-row input line or
+# a multi-line PS1 can leave stale rows above the redrawn prompt; ctrl-c can
+# abort before the cleanup printf and leave the status line in scrollback.
+# Single-row prompt + single-row line — the overwhelmingly common case —
+# renders clean.
+#
+# Everything except the `bind` calls is defined UNCONDITIONALLY: bash 3.2 must
+# PARSE this whole file (it does — nothing below is a >= 4 feature), and
+# defining the helpers everywhere lets them be tested against stock /bin/bash.
+
+_nice_compose_instruction='Convert this plain-English request into a single bash command line for macOS. Reply with ONLY the command itself - no code fences, no backticks, no explanation, no surrounding quotes. If the request is already a valid shell command, return it unchanged.'
+
+_nice_compose_conf_get() {
+    # $1: key in the flat Nice-written JSON at $NICE_COMPOSE_CONF,
+    # e.g. {"accent":"#7A94DB","model":"sonnet","effort":"medium"}.
+    # Keys and values are Nice-controlled (no escapes), so parameter surgery
+    # beats requiring a JSON tool on PATH. Same shape as the zsh stub.
+    [[ -n "$NICE_COMPOSE_CONF" && -r "$NICE_COMPOSE_CONF" ]] || return 1
+    local blob rest
+    blob=$(<"$NICE_COMPOSE_CONF")
+    rest="${blob#*\"$1\":\"}"
+    [[ "$rest" == "$blob" ]] && return 1
+    printf '%s' "${rest%%\"*}"
+}
+
+_nice_compose_translate() {
+    # stdin: the plain-English request; stdout: the composed command. Split
+    # from the handler so it is testable without a tty. The request rides
+    # stdin — user text is never placed on a command line, so no quoting of it
+    # can ever be wrong.
+    local -a flags
+    flags=()
+    local v
+    v="$(_nice_compose_conf_get model)" && [[ -n "$v" ]] && flags+=(--model "$v")
+    v="$(_nice_compose_conf_get effort)" && [[ -n "$v" ]] && flags+=(--effort "$v")
+    # Guard the expansion: "${flags[@]}" on an empty array trips `set -u` on
+    # bash < 4.4 (same rationale as the zsh guard).
+    if (( ${#flags[@]} )); then
+        command claude -p "$_nice_compose_instruction" "${flags[@]}" 2>/dev/null
+    else
+        command claude -p "$_nice_compose_instruction" 2>/dev/null
+    fi
+}
+
+_nice_compose_strip() {
+    # $1: raw model output. Trim whitespace, then defensively unwrap a ```
+    # fence or a wrapping backtick pair. bash 3.2-safe trims — the zsh
+    # version's extendedglob patterns do not carry over.
+    local out=$1
+    out="${out#"${out%%[![:space:]]*}"}"
+    out="${out%"${out##*[![:space:]]}"}"
+    if [[ "$out" == '```'* && "$out" == *$'\n'* ]]; then
+        out="${out#*$'\n'}"
+        out="${out%$'\n'*}"
+        out="${out#"${out%%[![:space:]]*}"}"
+        out="${out%"${out##*[![:space:]]}"}"
+    fi
+    if [[ "$out" == \`*\` ]]; then
+        out="${out#\`}"
+        out="${out%\`}"
+    fi
+    printf '%s' "$out"
+}
+
+_nice_compose_sgr() {
+    # $1: "#rrggbb" accent from the conf -> truecolor SGR prefix.
+    # Missing/malformed -> the dim fallback (matches the zsh widget's fg=8).
+    local h="${1#\#}"
+    if [[ "$h" == [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F] ]]; then
+        printf '\033[38;2;%d;%d;%dm' "$((16#${h:0:2}))" "$((16#${h:2:2}))" "$((16#${h:4:2}))"
+    else
+        printf '\033[38;5;8m'
+    fi
+}
+
+# Idempotence guard for the queued-double-trigger case below. It is never
+# reset, deliberately: a later freshly-typed line that happens to equal an
+# older composed result no-ops instead of recomposing, which costs nothing
+# real (the instruction returns an already-valid command unchanged, so that
+# compose would be an expensive no-op anyway). The failure path never sets it,
+# so a failed compose stays retryable without editing the line.
+_nice_compose_last=
+
+_nice_command_compose() {
+    [[ -z "$READLINE_LINE" ]] && return 0
+    # A second cmd-enter pressed while composing replays after this handler
+    # returns (readline buffers the bytes); skip recomposing what we just
+    # composed.
+    [[ -n "$_nice_compose_last" && "$READLINE_LINE" == "$_nice_compose_last" ]] && return 0
+    local request="$READLINE_LINE" sgr out rc
+    sgr="$(_nice_compose_sgr "$(_nice_compose_conf_get accent)")"
+    # Status line one row below the prompt. bash forces a full readline
+    # redisplay after a `bind -x` handler returns (the same behavior that makes
+    # the folk `bind -x '"\C-l": clear'` binding work), so the cleanup only has
+    # to put the cursor back on a cleared prompt row: clear the status row,
+    # step back up, clear the old prompt row.
+    printf '\n\033[2K%s\342\234\273 Composing\342\200\246 (ctrl-c cancels)\033[0m' "$sgr" >&2
+    out="$(_nice_compose_translate <<< "$request")"
+    rc=$?
+    printf '\r\033[2K\033[1A\r\033[2K' >&2
+    if (( rc >= 128 )); then
+        # Interrupted (ctrl-c killed the claude child): keep the typed line.
+        return 0
+    fi
+    out="$(_nice_compose_strip "$out")"
+    if [[ -z "$out" ]]; then
+        printf '%s\n' "nice: compose failed (is claude on PATH?)" >&2
+        return 1
+    fi
+    _nice_compose_last="$out"
+    READLINE_LINE="$out"
+    READLINE_POINT=${#out}
+}
+
+# `bind -x` on a multi-byte sequence needs bash >= 4.3, and BashProfile gates
+# ComposeSupport on the same pair — when this guard is closed the trigger bytes
+# are never sent. Bound in all three keymaps that can hold an idle prompt:
+# parity with the zsh widget's emacs/viins/vicmd triple.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+    bind -x '"\e[5099~": _nice_command_compose'
+    bind -m vi-insert -x '"\e[5099~": _nice_command_compose'
+    bind -m vi-command -x '"\e[5099~": _nice_command_compose'
+fi
+
 # Fire once at startup so the initial cwd is reported even if the user never
 # cd's. This is also the readiness signal Nice's app-typed prefill waits for
-# — it MUST stay the final statement of this file (a later compose section is
-# inserted above it). Note the signal is "first OSC 7 of the pane", not
+# — it MUST stay the final statement of this file (the compose section sits
+# above it, deliberately). Note the signal is "first OSC 7 of the pane", not
 # "this line": a user profile sourced by the login emulation above may carry
 # its own terminal-integration OSC 7 emitter and report first, which only
 # means Nice types the prefill a moment earlier, into the tty input queue.

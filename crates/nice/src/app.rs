@@ -3861,6 +3861,17 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            // The bash twin of `compose-live` (design §10's one added bash smoke
+            // scenario). Self-skips — reporting a pass — on a machine with no
+            // bash >= 4.3, which is every stock macOS.
+            name: "compose-live-bash",
+            open: crate::compose_live::open_compose_live_bash_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(40),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "niceties-zoom",
             open: crate::niceties_zoom::open_niceties_zoom_window,
             gate: Gate::SelfReported {

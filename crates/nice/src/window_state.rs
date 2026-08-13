@@ -6009,12 +6009,31 @@ mod tests {
     /// and no row anywhere routes `Trigger`.
     #[test]
     fn compose_route_never_triggers_a_shell_without_the_binding() {
+        use crate::shell::{PaneShell, ShellKind};
         use ComposeRoute::*;
         let unbound = ComposeSupport::None;
         assert_eq!(
             WindowState::compose_route(TermWindowKind::Terminal, true, false, false, unbound),
             Noop,
             "an idle fallback-shell prompt gets NO bytes (never the trigger)"
+        );
+        // The stock-macOS bash row, spelled as the snapshot a pane actually
+        // carries: `BashProfile`'s >= 4.3 version gate reports `None` for
+        // /bin/bash 3.2, whose readline cannot bind the 8-byte trigger at all.
+        let bash_3_2 = PaneShell {
+            kind: ShellKind::Bash,
+            compose: ComposeSupport::None,
+        };
+        assert_eq!(
+            WindowState::compose_route(
+                TermWindowKind::Terminal,
+                true,
+                false,
+                false,
+                bash_3_2.compose
+            ),
+            Noop,
+            "an idle stock-bash 3.2 prompt gets NO bytes — `[5099~` must never reach it"
         );
         assert_eq!(
             WindowState::compose_route(TermWindowKind::Terminal, true, false, true, unbound),

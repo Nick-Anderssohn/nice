@@ -249,6 +249,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const HIDDEN_ALL: bool = true;
 
@@ -258,15 +259,24 @@ mod tests {
 
     impl TempTree {
         fn new() -> Self {
+            // The counter is load-bearing, not belt-and-braces: macOS's clock
+            // has MICROsecond granularity, so `as_nanos()` alone hands two of
+            // these tests starting in the same microsecond the same directory.
+            // They then see each other's files (wrong-order assertions) and the
+            // first `Drop` deletes the tree the other is still writing into.
+            static SEQ: AtomicU64 = AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "nice-listing-test-{}-{:?}",
+                "nice-listing-test-{}-{:?}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir_all(&root).unwrap();
+            // Not `create_dir_all`: a name that somehow still repeats must fail
+            // loudly here rather than silently share a tree with its twin.
+            fs::create_dir(&root).unwrap();
             TempTree { root }
         }
 
