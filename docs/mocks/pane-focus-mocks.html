@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pane focus affordance mocks</title>
+<style>
+  :root {
+    --page-bg: #f2f0ed; --page-fg: #1c1e21; --page-muted: #6b7078;
+    --card-border: #ddd8d2;
+    /* Nice light theme, sampled from the screenshot */
+    --win-bg: #fdfdfc; --term-fg: #3b3b3b; --term-dim: #9a9a94;
+    --accent: #c9683f;            /* terracotta */
+    --accent-soft: rgba(201,104,63,.55);
+    --link: #4a7db5; --ok: #7fae7a;
+    --chrome: #f4f2ef; --divider: #e6e2dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --page-bg: #17181b; --page-fg: #e8eaed; --page-muted: #9aa0aa; --card-border: #34363b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page-bg); color: var(--page-fg);
+         font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 2.2rem 1.2rem 4rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .3rem; }
+  .intro { color: var(--page-muted); max-width: 78ch; margin-bottom: 1.6rem; }
+  .intro b { color: var(--page-fg); }
+  section { margin: 2.4rem 0; }
+  section h2 { font-size: 1.05rem; margin: 0 0 .2rem; }
+  section h2 .tag { font-size: .72rem; font-weight: 700; letter-spacing: .06em;
+    padding: .15em .5em; border-radius: 99px; vertical-align: 2px; margin-left: .5em; }
+  .tag.rec { background: #2f7d46; color: #fff; }
+  .tag.cur { background: #8a8f98; color: #fff; }
+  .blurb { color: var(--page-muted); max-width: 80ch; margin: 0 0 .8rem; }
+  .blurb b { color: var(--page-fg); }
+  .procon { display: flex; gap: 2rem; font-size: .85rem; color: var(--page-muted);
+            margin: .5rem 0 0; flex-wrap: wrap; }
+  .procon span b { color: var(--page-fg); }
+
+  /* ---------- the mock mini-window ---------- */
+  .win { width: 100%; max-width: 900px; border-radius: 12px; overflow: hidden;
+         background: var(--win-bg); border: 1px solid var(--card-border);
+         box-shadow: 0 8px 28px rgba(0,0,0,.10); }
+  .titlebar { display: flex; align-items: center; gap: .45rem; padding: .5rem .8rem;
+              background: var(--chrome); border-bottom: 1px solid var(--divider); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .pill { font: .72rem/1.6 -apple-system, sans-serif; color: #666;
+          padding: 0 .6rem; border-radius: 6px; }
+  .pill.on { background: #fff; box-shadow: inset 0 -2px 0 var(--accent); color: #333; }
+  .split { display: flex; height: 340px; padding: 10px; gap: 0; background: var(--win-bg); }
+  .pane { position: relative; flex: 1; min-width: 0; display: flex; }
+  .pane .content { flex: 1; padding: 10px 12px; overflow: hidden;
+      font: 12.5px/1.65 ui-monospace, "SF Mono", Menlo, monospace;
+      color: var(--term-fg); white-space: pre; }
+  .content .p { color: var(--accent); }
+  .content .l { color: var(--link); }
+  .content .d { color: var(--term-dim); }
+  .content .g { background: var(--ok); color: #fff; padding: 0 .4em; }
+  .caret { display: inline-block; width: 7px; height: 14px; background: var(--accent);
+           vertical-align: -2px; }
+  .vdiv { width: 6px; flex: none; }
+
+  /* variant styles */
+  .flush .split { padding: 10px; }
+  .flush .pane .content { padding: 0; }                      /* current: no inner air */
+  .flush .pane.focused { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+  .ring .pane { border: 1px solid transparent; border-radius: 7px; }
+  .ring .pane.focused { border-color: var(--accent-soft); }
+
+  .dim .pane .content { transition: opacity .1s; }
+  .dim .pane:not(.focused) .content { opacity: .55; }
+  .dim .pane:not(.focused)::after { content: ""; position: absolute; inset: 0;
+      background: rgba(60,55,50,.04); pointer-events: none; }
+
+  .divider-accent .vdiv { position: relative; }
+  .divider-accent .vdiv::after { content: ""; position: absolute; top: 0; bottom: 0;
+      left: 2px; width: 2px; border-radius: 2px; background: var(--accent-soft); }
+
+  .topbar .pane::before { content: ""; position: absolute; top: 0; left: 8px; right: 8px;
+      height: 2px; border-radius: 2px; background: transparent; }
+  .topbar .pane.focused::before { background: var(--accent); }
+  .topbar .pane .content { padding-top: 12px; }
+
+  .combo .pane:not(.focused) .content { opacity: .62; }
+  .combo .pane::before { content: ""; position: absolute; top: 0; left: 8px; right: 8px;
+      height: 2px; border-radius: 2px; background: transparent; }
+  .combo .pane.focused::before { background: var(--accent); }
+  .combo .pane .content { padding-top: 12px; }
+
+  .note { font-size: .85rem; color: var(--page-muted); margin-top: 2.6rem;
+          border-top: 1px solid var(--card-border); padding-top: .9rem; max-width: 80ch; }
+
+  /* stacked-split variants (the ambiguity case: bottom pane focused) */
+  .split.stack { flex-direction: column; height: 300px; }
+  .hdiv { height: 6px; flex: none; }
+  .duo { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+  .duo > div { flex: 1 1 380px; min-width: 320px; }
+  .duo .cap { font-size: .8rem; color: var(--page-muted); margin: .4rem 0 .35rem; }
+
+  /* layout-gallery scaffolding (nested flex, ticks variant) */
+  .gal { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+         gap: 1.2rem; }
+  .gal .cap { font-size: .8rem; color: var(--page-muted); margin: .4rem 0 .35rem; }
+  .lay { display: flex; padding: 10px; height: 250px; background: var(--win-bg); }
+  .lay .col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .lay .row { display: flex; min-width: 0; min-height: 0; }
+  .lay .pane { min-height: 0; }
+  .lay .content { font-size: 11.5px; line-height: 1.55; }
+
+  .ticks .pane .c { position: absolute; width: 11px; height: 11px; display: none; }
+  .ticks .pane.focused .c { display: block; }
+  .ticks .c.tl { top: 0; left: 0; border-top: 2px solid var(--accent); border-left: 2px solid var(--accent); border-top-left-radius: 4px; }
+  .ticks .c.tr { top: 0; right: 0; border-top: 2px solid var(--accent); border-right: 2px solid var(--accent); border-top-right-radius: 4px; }
+  .ticks .c.bl { bottom: 0; left: 0; border-bottom: 2px solid var(--accent); border-left: 2px solid var(--accent); border-bottom-left-radius: 4px; }
+  .ticks .c.br { bottom: 0; right: 0; border-bottom: 2px solid var(--accent); border-right: 2px solid var(--accent); border-bottom-right-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Focused-pane affordance — options</h1>
+  <p class="intro">Every option below assumes the <b>padding fix as baseline</b>: in a split,
+  each pane gets its own inner inset (~10–12px) so terminal content never touches a pane edge,
+  divider, or indicator — mirroring the breathing room a single-pane pill already has.
+  Left pane is the focused one in every mock. Zoom shows a single pane, so no affordance
+  applies there.</p>
+
+  <!-- ===================================================== current -->
+  <section>
+    <h2>0 — What ships today <span class="tag cur">CURRENT</span></h2>
+    <p class="blurb">1px accent ring hugging the pane, content flush against it — the thing
+    that grated. Shown for comparison.</p>
+    <div class="win flush">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Problem:</b> zero air between ring and glyphs; the full rectangle is heavy for a 1-bit signal.</span></p>
+  </section>
+
+  <!-- ===================================================== A -->
+  <section>
+    <h2>A — Padded, softened ring</h2>
+    <p class="blurb">Keep the ring, fix its two problems: inner padding, rounded corners,
+    and the accent at ~55% opacity so it reads as a halo rather than a box.</p>
+    <div class="win ring">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Pro:</b> smallest change; unambiguous in any layout.</span>
+    <span><b>Con:</b> still draws a box around the thing you're already looking at — chrome spent on the wrong pane's benefit.</span></p>
+  </section>
+
+  <!-- ===================================================== B -->
+  <section>
+    <h2>B — Dim the unfocused panes <span class="tag rec">RECOMMENDED</span></h2>
+    <p class="blurb">No ring at all. The focused pane renders at full contrast; every other
+    pane drops to ~55–65% ink with a barely-there warm scrim. The signal sits on the panes
+    you're <b>not</b> using, so the focused one stays exactly as pristine as a single-pane
+    pill — nothing added, nothing outlined. (iTerm2's model.)</p>
+    <div class="win dim">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Pro:</b> focused pane is untouched; obvious even in peripheral vision; scales to any tree depth.</span>
+    <span><b>Con:</b> unfocused panes' colors shift slightly (a build log you're glancing at is a touch muted); needs care with already-dim theme text.</span></p>
+  </section>
+
+  <!-- ===================================================== C -->
+  <section>
+    <h2>C — Accent on the divider edge</h2>
+    <p class="blurb">The divider is the only new chrome splits introduce, so let it carry the
+    signal: the divider edge touching the focused pane gets a 2px accent line (tmux's
+    pane-active-border, but only on the focused side).</p>
+    <div class="win divider-accent">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Pro:</b> zero pixels inside any pane; dividers get easier to find for dragging.</span>
+    <span><b>Con:</b> ambiguous — with one divider, "accent near the left side" is a subtle read; a corner pane in a 4-way split touches dividers on two sides and the mapping gets puzzly.</span></p>
+  </section>
+
+  <!-- ===================================================== D -->
+  <section>
+    <h2>D — Top accent bar</h2>
+    <p class="blurb">A 2px accent strip along the focused pane's top edge, inset from the
+    corners — the browser-tab underline, flipped. One unambiguous mark per pane, no box.</p>
+    <div class="win topbar">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Pro:</b> unambiguous per pane; tiny footprint; echoes the pill strip's active underline, so it reuses an existing visual word.</span>
+    <span><b>Con:</b> in a tall stacked pane your eyes live at the bottom, far from the mark; adds permanent 2px reserve at every pane top.</span></p>
+  </section>
+
+  <!-- ===================================================== E -->
+  <section>
+    <h2>E — Dim + top bar (B + D, both at half strength)</h2>
+    <p class="blurb">Gentler dim (~62% ink) plus the top bar. The dim carries the peripheral
+    signal, the bar gives a crisp point to confirm at a glance — each can be subtler than it
+    would need to be alone.</p>
+    <div class="win combo">
+      <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+        <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+      <div class="split">
+        <div class="pane focused"><div class="content"><span class="p">❯</span> hello again
+
+<span class="p">●</span> Hello again! What's on your mind — want
+  to dig into the <span class="l">notes</span> project?
+
+<span class="d">✳ Baked for 2s</span>
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+        <div class="vdiv"></div>
+        <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Pro:</b> most legible overall at the least per-element weight.</span>
+    <span><b>Con:</b> two mechanisms to tune and keep consistent; the most implementation surface.</span></p>
+  </section>
+
+  <!-- ===================================================== F: the stacked test -->
+  <section>
+    <h2>F — The stacked test: enclosure disambiguates <span class="tag rec">DECIDING CASE</span></h2>
+    <p class="blurb">The scenario that kills edge marks: two panes stacked, <b>bottom</b> one
+    focused. A bar at the boundary could belong to either pane; an enclosure cannot be
+    misread. Two weights of enclosure, same layout:</p>
+    <div class="duo">
+      <div>
+        <p class="cap">A (stacked) — soft ring: full enclosure, quietest corners</p>
+        <div class="win ring">
+          <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+            <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+          <div class="split stack">
+            <div class="pane"><div class="content"><span class="p">●</span> Hello again! What's on your mind —
+  want to dig into <span class="l">notes</span>?
+
+<span class="d">✳ Baked for 2s</span></div></div>
+            <div class="hdiv"></div>
+            <div class="pane focused"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span> <span class="caret"></span></div></div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <p class="cap">F — corner ticks: enclosure implied by four brackets, less chrome than a ring</p>
+        <div class="win ticks">
+          <div class="titlebar"><span class="dot" style="background:#f57b6c"></span><span class="dot" style="background:#f5bf4f"></span><span class="dot" style="background:#61c554"></span>
+            <span class="pill on">nick@Nicks-MacBoo…</span><span class="pill">exit</span></div>
+          <div class="split stack">
+            <div class="pane"><div class="content"><span class="p">●</span> Hello again! What's on your mind —
+  want to dig into <span class="l">notes</span>?
+
+<span class="d">✳ Baked for 2s</span></div></div>
+            <div class="hdiv"></div>
+            <div class="pane focused"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main *1 ?6</span>
+<span class="g">INSERT</span> <span class="p">❯</span> <span class="caret"></span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="procon"><span><b>Ring:</b> the closed shape reads instantly; softened + padded it is far lighter than the shipped version.</span>
+    <span><b>Ticks:</b> ~90% less drawn border for the same "this region" read; slightly more novel visually.</span></p>
+  </section>
+
+  <!-- ===================================================== G: ticks across layouts -->
+  <section>
+    <h2>G — Corner ticks across layouts</h2>
+    <p class="blurb">The ticks variant in every layout shape splits can produce, with focus
+    placed in the awkward spots on purpose. The four brackets always outline exactly one
+    region — there is no position where they could be read as belonging to a neighbor.</p>
+    <div class="gal ticks">
+
+      <div>
+        <p class="cap">Side by side — RIGHT focused (the shell-next-to-Claude case)</p>
+        <div class="win"><div class="lay">
+          <div class="pane"><div class="content"><span class="p">●</span> Hello again! Want to dig
+  into <span class="l">notes</span>?
+
+<span class="d">✳ Baked for 2s</span></div></div>
+          <div class="vdiv"></div>
+          <div class="pane focused"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main</span>
+<span class="g">INSERT</span> <span class="p">❯</span> <span class="caret"></span></div></div>
+        </div></div>
+      </div>
+
+      <div>
+        <p class="cap">Side by side — LEFT focused</p>
+        <div class="win"><div class="lay">
+          <div class="pane focused"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="p">❯</span> hi again lol
+
+<span class="p">●</span> Hi! I'm here whenever
+  you're ready.
+
+<span class="p">❯</span> <span class="caret"></span></div></div>
+          <div class="vdiv"></div>
+          <div class="pane"><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+        </div></div>
+      </div>
+
+      <div>
+        <p class="cap">Three panes, mixed orientation — the SMALL bottom-right focused</p>
+        <div class="win"><div class="lay">
+          <div class="pane" style="flex:1.2"><div class="content"><span class="p">●</span> Streaming a long answer
+  about the <span class="l">notes</span> repo…
+
+<span class="d">✳ Brewed for 2s</span></div></div>
+          <div class="vdiv"></div>
+          <div class="col" style="flex:1">
+            <div class="pane" style="flex:1.4"><div class="content"><span class="d">$ cargo build</span>
+<span class="d">   Compiling nice…</span></div></div>
+            <div class="hdiv"></div>
+            <div class="pane focused" style="flex:1"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="p">❯</span> git status <span class="caret"></span></div></div>
+          </div>
+        </div></div>
+      </div>
+
+      <div>
+        <p class="cap">Four-pane grid — INNER pane focused (touches dividers on two sides)</p>
+        <div class="win"><div class="lay">
+          <div class="col" style="flex:1">
+            <div class="pane" style="flex:1"><div class="content"><span class="p">●</span> Claude…</div></div>
+            <div class="hdiv"></div>
+            <div class="pane" style="flex:1"><div class="content"><span class="d">$ tail -f app.log</span></div></div>
+          </div>
+          <div class="vdiv"></div>
+          <div class="col" style="flex:1">
+            <div class="pane focused" style="flex:1"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="p">❯</span> vim notes.md <span class="caret"></span></div></div>
+            <div class="hdiv"></div>
+            <div class="pane" style="flex:1"><div class="content"><span class="g">INSERT</span> <span class="p">❯</span></div></div>
+          </div>
+        </div></div>
+      </div>
+
+      <div>
+        <p class="cap">Deep nest — a MINIMUM-SIZE pane (~120×80) focused: ticks at the smallest they get</p>
+        <div class="win"><div class="lay">
+          <div class="col" style="flex:1.4">
+            <div class="pane" style="flex:2"><div class="content"><span class="p">●</span> The big Claude pane.
+
+<span class="d">✳ Crunched for 3s</span></div></div>
+            <div class="hdiv"></div>
+            <div class="row" style="flex:1">
+              <div class="pane" style="flex:1"><div class="content"><span class="d">htop</span></div></div>
+              <div class="vdiv"></div>
+              <div class="pane focused" style="flex:1"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="p">❯</span> <span class="caret"></span></div></div>
+            </div>
+          </div>
+          <div class="vdiv"></div>
+          <div class="pane" style="flex:1"><div class="content"><span class="l">~/Projects/notes</span>
+<span class="g">INSERT</span> <span class="p">❯</span></div></div>
+        </div></div>
+      </div>
+
+      <div>
+        <p class="cap">Stacked — BOTTOM focused (the case that killed the top bar)</p>
+        <div class="win"><div class="lay">
+          <div class="col" style="flex:1">
+            <div class="pane" style="flex:1"><div class="content"><span class="p">●</span> Hello again! What's on
+  your mind?</div></div>
+            <div class="hdiv"></div>
+            <div class="pane focused" style="flex:1"><i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i><div class="content"><span class="l">~/Projects/notes</span> <span class="d">main</span>
+<span class="g">INSERT</span> <span class="p">❯</span> <span class="caret"></span></div></div>
+          </div>
+        </div></div>
+      </div>
+
+    </div>
+    <p class="procon"><span><b>Note on the grid case:</b> the inner pane's ticks sit right against two dividers, and still read as one enclosed region — the corner geometry does the work the bar couldn't.</span></p>
+  </section>
+
+  <p class="note">Mocks approximate the light theme from the screenshot; the real
+  implementation derives everything from the live theme + accent, so each option has an
+  obvious dark-theme reading (the dim scrim inverts to a darkening wash, the bars/rings use
+  the same accent). File lives at <code>docs/mocks/pane-focus-mocks.html</code> on the
+  <code>tmux-phase-2</code> working tree.</p>
+</main>
+</body>
+</html>

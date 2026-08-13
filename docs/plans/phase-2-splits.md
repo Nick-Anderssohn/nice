@@ -685,7 +685,13 @@ across leaves.
   they get tuned if they grate.
 - **The focused-pane affordance is an accent border.** The plan offered
   "1px accent-tinted inner border (or divider-side highlight — pick at
-  implementation)". The border won.
+  implementation)". The border won — then the 2026-08-13 feel-check
+  replaced it: the ring drew flush against the grid, and the mock round
+  (`docs/mocks/pane-focus-mocks.html`) settled on four accent CORNER TICKS
+  plus a per-pane content inset (`PANE_CONTENT_INSET_X/Y`). Dimming was
+  rejected (reading unfocused panes is the flagship use; composes badly
+  with themes/blur), and edge bars were rejected (ambiguous at a stacked
+  boundary — only an enclosure reads without convention).
 - **`Eq`/`Hash` came off `Project` too.** The plan predicted the derives
   would have to leave `TermWindow` and `Session` because `ratio: f32` is
   not `Eq`. `Project` contains `Session`, so it followed. As the plan

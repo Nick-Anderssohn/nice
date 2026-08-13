@@ -307,7 +307,11 @@ What shipped:
   nested flex rows/columns landing on exactly the rects `leaf_rects`
   computes. Dividers follow the sidebar resize-handle pattern (cursor flip
   per orientation, root-level drag tracking, min clamp, double-click reset
-  to half). The focused pane in a split pill carries an accent border.
+  to half). The focused pane in a split pill carries four accent corner
+  ticks (an enclosure — unambiguous in any layout, and it costs unfocused
+  panes' legibility nothing; revised from an accent border 2026-08-13,
+  mocks at `docs/mocks/pane-focus-mocks.html`), and every split pane gets
+  its own content inset so glyphs never touch a divider.
 - **Actions**: twelve new rebindable actions — `^⌘-` Split Down, `^⌘\`
   Split Right, `^⌘z` Zoom Pane, `^⌘b` Break Pane to Window, plus the
   `^⌥⌘hjkl` resize and `^⌥⌘⇧hjkl` swap rungs. The `^⌘⇧hjkl` focus handlers

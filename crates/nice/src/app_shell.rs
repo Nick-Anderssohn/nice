@@ -325,6 +325,20 @@ struct DividerDrag {
 /// it. Matches the sidebar resize handle's 6 pt zone.
 pub(crate) const PANE_DIVIDER_PX: f32 = 6.0;
 
+/// Inner content inset every pane gets in a SPLIT pill (px). A single-pane
+/// pill keeps the window-level `CONTENT_INSET_*` alone; in a split, each pane
+/// adds its own breathing room so glyphs never touch a divider or the corner
+/// ticks (the padding half of the 2026-08-13 styling revision — the shipped
+/// affordance drew its ring flush against the grid).
+pub(crate) const PANE_CONTENT_INSET_X: f32 = 12.0;
+/// The vertical twin of [`PANE_CONTENT_INSET_X`].
+pub(crate) const PANE_CONTENT_INSET_Y: f32 = 10.0;
+/// Corner-tick bracket size (px, square). The 2px stroke lives in the
+/// `border_*_2` builders at the draw site.
+pub(crate) const PANE_TICK_SIZE: f32 = 11.0;
+/// The tick's outer corner radius.
+const PANE_TICK_RADIUS: f32 = 4.0;
+
 /// P6 minimum pane extents. A split that would produce a pane under these is
 /// refused (Slice 4's action handlers), and divider drags / keyboard resizes
 /// clamp against them. The window-level `TERMINAL_MIN_WIDTH` is unrelated and
@@ -505,7 +519,7 @@ struct TreeCtx {
     /// Whether this pill paints more than one pane right now — the gate on the
     /// focused-pane affordance, so a never-split pill renders exactly as before.
     multi: bool,
-    /// The focused-pane border tint.
+    /// The corner-tick tint.
     accent: Srgba,
 }
 
@@ -588,23 +602,13 @@ impl WindowHostView {
             .size_full()
             .min_w_0()
             .min_h_0()
-            // The affordance is a border in BOTH states so focus moving cannot
-            // reflow the grid; only its color changes. A single-pane pill draws
-            // no border and no clip at all — pre-splits pills render
-            // pixel-identically.
+            // A single-pane pill draws no clip, no inset, and no affordance —
+            // pre-splits pills render pixel-identically.
             .when(ctx.multi, |el| {
                 // Clipped to its own rect, so nothing a grid paints at its edge
-                // can bleed across a divider into its neighbour.
-                el.overflow_hidden().border_1().border_color(if focused {
-                    focused_pane_border(ctx.accent)
-                } else {
-                    Rgba {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }
-                })
+                // can bleed across a divider into its neighbour; `relative`
+                // roots the corner ticks.
+                el.relative().overflow_hidden()
             })
             // Capture phase: the terminal's own mouse-down handling (selection,
             // app mouse reporting) stops propagation in some modes, so a bubble
@@ -614,7 +618,27 @@ impl WindowHostView {
                     this.focus_pane(&session_id, &term_window_id, &pane_id, window, cx);
                 },
             ))
-            .child(inner)
+            .child({
+                // In a split, every pane carries its own content inset — the
+                // breathing room a single-pane pill gets from the window-level
+                // insets. Inside the clip so the inset area still paints the
+                // terminal background.
+                let content = div().flex().size_full().min_w_0().min_h_0();
+                let content = if ctx.multi {
+                    content
+                        .px(px(PANE_CONTENT_INSET_X))
+                        .py(px(PANE_CONTENT_INSET_Y))
+                } else {
+                    content
+                };
+                content.child(inner)
+            })
+            // The focused-pane affordance: four accent corner ticks. An
+            // ENCLOSURE reads unambiguously in every layout — an edge bar at a
+            // stacked boundary could belong to either neighbour — and unlike
+            // dimming it costs the unfocused panes' legibility nothing.
+            // Decided over mocks 2026-08-13: `docs/mocks/pane-focus-mocks.html`.
+            .when(ctx.multi && focused, |el| el.children(corner_ticks(ctx.accent)))
             .into_any_element()
     }
 
@@ -866,15 +890,54 @@ impl WindowHostView {
     }
 }
 
-/// The focused pane's border tint in a split pill: the user's accent, dimmed so
-/// it reads as an affordance rather than a highlight.
-fn focused_pane_border(accent: Srgba) -> Rgba {
-    Rgba {
+/// The four corner-tick brackets of the focused pane in a split pill, in the
+/// user's accent at full strength — small enough that they never need dimming.
+/// Absolute children of the pane's clipped `relative` root, so they sit exactly
+/// on the pane's corners and can never collide with a divider or a neighbour.
+fn corner_ticks(accent: Srgba) -> Vec<AnyElement> {
+    let color = Rgba {
         r: accent.r,
         g: accent.g,
         b: accent.b,
-        a: 0.55,
-    }
+        a: 1.0,
+    };
+    let tick = move || {
+        div()
+            .absolute()
+            .w(px(PANE_TICK_SIZE))
+            .h(px(PANE_TICK_SIZE))
+            .border_color(color)
+    };
+    vec![
+        tick()
+            .top(px(0.0))
+            .left(px(0.0))
+            .border_t_2()
+            .border_l_2()
+            .rounded_tl(px(PANE_TICK_RADIUS))
+            .into_any_element(),
+        tick()
+            .top(px(0.0))
+            .right(px(0.0))
+            .border_t_2()
+            .border_r_2()
+            .rounded_tr(px(PANE_TICK_RADIUS))
+            .into_any_element(),
+        tick()
+            .bottom(px(0.0))
+            .left(px(0.0))
+            .border_b_2()
+            .border_l_2()
+            .rounded_bl(px(PANE_TICK_RADIUS))
+            .into_any_element(),
+        tick()
+            .bottom(px(0.0))
+            .right(px(0.0))
+            .border_b_2()
+            .border_r_2()
+            .rounded_br(px(PANE_TICK_RADIUS))
+            .into_any_element(),
+    ]
 }
 
 /// The window-host's fill when the active window has no live session yet (a
