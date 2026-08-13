@@ -141,11 +141,14 @@ The GPUI application. Structure (grows over later cycles):
   integration gap: this wiring previously lived ONLY in the `session-lifecycle`
   scenario, so shipped-window titles/exits dead-ended at the view adapter). It is
   subscribe-once (a per-window `subscribed_windows` set), so sweeping every render is
-  safe. The `RoutedExit` neighbor-refocus spawn is composed by this same activation
+  safe. The `RoutedEvent` neighbor-refocus spawn is composed by this same activation
   path (the routed removal shifts the active window, whose activation change re-runs
   `activate_term_window`); only the every-project-empty terminus — which needs a `&mut
   Window` a subscription callback lacks — is actuated through the `AnyWindowHandle`
-  stashed on `WindowState` at `build_window_root`. The pure host logic
+  stashed on `WindowState` at `build_window_root`. The same subscription is where
+  app-typed prefill lands: a `RoutedEvent.prefill` (the deferred-resume line a bash
+  pane's first OSC 7 handed back) is written into that pane's pty with
+  `write_input`, **without a trailing newline**. The pure host logic
   (`active_window_target` / `model_window_ids` / `stale_cache_ids`) is extracted +
   in-crate `#[test]`-covered; the render-level placeholder → `TerminalView` swap (a
   model-only Claude window shows the placeholder until its spawn/promotion caches a
@@ -767,8 +770,12 @@ The GPUI application. Structure (grows over later cycles):
     (`merge_env_spec_wins`: a key already on the caller-built spec, e.g. a blanked
     `ZDOTDIR`, survives), so the ~10 landed ZDOTDIR-blanked scenarios are untouched.
     `build_claude_extra_env` is the pure port of the Claude-window env matrix
-    (`TERM_PROGRAM` + ids + `NICE_SOCKET` always; `ZDOTDIR` + `NICE_USER_ZDOTDIR` +
-    the frozen `NICE_PREFILL_COMMAND` only for `ResumeDeferred`) — was
+    (`TERM_PROGRAM` + ids + `NICE_SOCKET` always; the active profile's inject pairs +
+    the frozen `NICE_PREFILL_COMMAND` only for `ResumeDeferred`, and the prefill var
+    only under `PrefillStrategy::ShellSide` — an `AppTyped` profile (bash) gets the
+    line through `pending_prefill_for` → `WindowPty::pending_prefill` instead, typed
+    into the pty by the shipped subscription on the pane's first OSC 7,
+    newline-free so it sits editable at the prompt) — was
     production-unused before R15; R15's `spawn_claude_window` now wires it, its
     `settings_path` arg threaded (the injectable theme-sync provider — **R17 fills it**
     from the process gate; changing no composer logic). Exported for later
@@ -1275,7 +1282,7 @@ The GPUI application. Structure (grows over later cycles):
     snapshot routing keys off, and the reaper's comm-name union
     (`all_known_comm_names` + `reaper_comm_names`). rc files live under the
     per-variant `shellrc_root` (`<app support>/<CFBundleName>/shellrc`), one
-    `rc_dir_for` subdirectory per shell (`shellrc/zsh`, …), NOT `$TMPDIR`; the
+    `rc_dir_for` subdirectory per shell (`shellrc/zsh`, `shellrc/bash`), NOT `$TMPDIR`; the
     `NICE_APPLICATION_SUPPORT_ROOT` override seam redirects it for tests. Absent
     `ShellRuntime` (every `run_selftest` scenario) each reader returns the
     historical zsh answer, so scenarios spawn and route exactly as before.
@@ -1297,10 +1304,31 @@ The GPUI application. Structure (grows over later cycles):
       `default_location` (`…/<CFBundleName>/shellrc/zsh`; the pre-split
       `…/<CFBundleName>/zdotdir` is left on disk, never swept, so a still-running
       older build of the same variant keeps reading it).
+    - `shell::bash` — `BashProfile`, the `--rcfile`-injected profile. bash has no
+      `ZDOTDIR` analogue, so injection rides **argv** (`bash --rcfile
+      <nice.bashrc> -i`) and `inject_env` is empty — an empty pair list says
+      nothing about whether the pane is injected, only `SpawnCtx.inject` / the
+      argv does. `--rcfile` is ignored for login shells, so injected panes spawn
+      NON-login and the single generated `nice.bashrc` (`shell/scripts/bash/`,
+      `include_str!`) opens by emulating bash's login sequence (`/etc/profile`,
+      then the first existing of `~/.bash_profile` / `~/.bash_login` /
+      `~/.profile`; never `~/.bashrc` on top — the user's profile sources that
+      itself) before layering Nice's hooks: the `claude()` shadow (same wire
+      protocol as zsh's, POSIX-bash dialect — `exec claude` not `exec command
+      claude`, `${sid:0:8}` not `${sid[1,8]}`, `printf … >&2` not `print -u2`)
+      and the OSC 7 emitter, which rides a `$PWD`-deduped `PROMPT_COMMAND`
+      wrapper because bash has no `chpwd` hook. Dialect baseline is **bash 3.2**
+      (macOS `/bin/bash` 3.2.57) — no ≥ 4 features — so compose is
+      `ComposeSupport::None` here and prefill is `PrefillStrategy::AppTyped`
+      (no `print -z`: Nice types the deferred-resume line into the pty itself on
+      the pane's first OSC 7, which is the rc file's final statement). Not
+      byte-pinned yet (design §10 freezes it once compose lands); until then
+      structural positive/negative sets plus real-`/bin/bash` e2e tests are the
+      net. Documented limitations, kept: under `--rcfile` the pane is not a login
+      shell (`shopt -q login_shell` false), and `exec bash` drops the injection.
     - `shell::fallback` — `FallbackProfile`, the unknown-shell degrade (fish,
-      tcsh, and bash until the `BashProfile` step): no rc injection, no shadow, no
-      compose, no prefill, and separate short flags (`-i` `-l` `-c`, never
-      clustered `-ilc`).
+      tcsh, …): no rc injection, no shadow, no compose, no prefill, and separate
+      short flags (`-i` `-l` `-c`, never clustered `-ilc`).
   - `claude_hook_installer` — the R16 Claude `SessionStart` hook installer (port of
     Swift `ClaudeHookInstaller`). `HOOK_SCRIPT` is the **FROZEN** socket-client
     script (a `set -u` `sed -nE` extractor — no jq — that posts

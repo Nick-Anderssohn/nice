@@ -1784,7 +1784,7 @@ fn build_window_root(
     });
     // R15 subscription lift: stash this window's handle so the window-event
     // subscription (wired lazily by `WindowHostView`'s render sweep) can actuate a
-    // RoutedExit's every-project-empty terminus (close/quit) — a `&mut Window` a
+    // RoutedEvent's every-project-empty terminus (close/quit) — a `&mut Window` a
     // subscription callback otherwise lacks.
     state.update(cx, |ws, _cx| ws.set_window_handle(window.window_handle()));
     // BUGHUNT1-D: wire the model's did-mutate observer to the debounced session

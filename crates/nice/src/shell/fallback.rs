@@ -1,7 +1,7 @@
 //! [`FallbackProfile`] — the unknown-shell degrade (design §5).
 //!
 //! For any resolved shell Nice has no dedicated profile for (fish, tcsh, dash,
-//! and — until migration step 3 — bash): degrade to a working plain terminal.
+//! …): degrade to a working plain terminal.
 //! Never block, never garble. No rc injection, no `claude()` shadow, no
 //! Command Compose, no prefill — the pane runs the user's actual shell with
 //! their actual config and PATH, minus Nice's integration features.
@@ -289,7 +289,8 @@ mod tests {
     /// close the pane when it exits. `/bin/bash` is on every macOS, so this runs
     /// unconditionally — it is the cheapest available proof that
     /// `-i -l -c "exec …"` is a real spawn shape and not just a table entry.
-    /// (Bash's own integration lands in migration step 3; this only pins argv.)
+    /// (Bash's own integration lives in [`super::bash`] and never routes here —
+    /// this borrows the binary purely to pin the fallback's argv.)
     #[test]
     fn separate_flag_argv_runs_a_command_under_real_bash() {
         use nice_term_core::{PtyProcess, SpawnSpec};

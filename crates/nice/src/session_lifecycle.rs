@@ -210,9 +210,15 @@ fn spawn_and_subscribe(
             .detach();
         }
         // The live `cx.subscribe` that feeds `route_terminal_event` from the window's
-        // session entity (the slice-3 subscription seam). The RoutedExit's
+        // session entity (the slice-3 subscription seam). The `RoutedEvent`'s
         // GPUI-only side effects are composed by the live window root (see the
-        // module docs); here the routed model mutation is the whole observable.
+        // module docs); here the routed model mutation is the whole observable,
+        // so the value is DISCARDED on purpose.
+        //
+        // This scenario is NOT where a routed side effect gets wired — the
+        // shipped one is `WindowState::subscribe_spawned_windows`. Actuating
+        // something here (app-typed prefill, say) would pass this scenario while
+        // the real app never did it.
         if let Some(handle) = s.ptys.term_window_handle(&session_id, &term_window_id) {
             let (t, p) = (session_id.clone(), term_window_id.clone());
             cx.subscribe(&handle, move |s2, _handle, event: &TerminalEvent, cx2| {

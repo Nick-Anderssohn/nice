@@ -175,15 +175,28 @@ pub(crate) struct WindowExitResolution {
     pub(crate) terminus: DissolveTerminus,
 }
 
-/// The routing outcome of a single [`TerminalEvent`] — empty for the title / cwd
-/// / reset / first-output events (fully handled inline), carrying the window-exit
+/// The routing outcome of a single [`TerminalEvent`] — empty for the title /
+/// reset / first-output events (fully handled inline), carrying the window-exit
 /// resolution for an `Exited { held: false }` event so the live subscription
 /// applies the same step-4 spawn + terminus the direct [`window_exited`] caller
-/// does.
+/// does, and the app-typed prefill line for the `CwdChanged` that took it.
+///
+/// Named for the whole routing outcome (it was `RoutedExit` while the exit
+/// resolution was the only thing routing handed back): the two things it now
+/// carries are both "gpui side effects [`route_terminal_event`] cannot run
+/// itself" — it takes `&mut WorkspaceModel`, not a `cx`, so anything needing the
+/// entity or the app context travels back to the subscription this way.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RoutedExit {
+pub(crate) struct RoutedEvent {
     pub(crate) refocus_session: Option<String>,
     pub(crate) terminus: DissolveTerminus,
+    /// The deferred-resume line to TYPE into this pane's pty, handed out by the
+    /// pane's **first** `CwdChanged` (design §6.4's app-typed prefill; bash has
+    /// no `print -z`). `Some` at most once per spawn — the slot is `take`n — and
+    /// only for a pane spawned under a [`PrefillStrategy::AppTyped`] profile.
+    /// The subscription that owns the entity writes it **without a trailing
+    /// newline**, so the line sits editable at the prompt.
+    pub(crate) prefill: Option<String>,
 }
 
 /// One live window session: the core→gpui adapter entity for this window. Dropping
@@ -205,6 +218,25 @@ struct WindowPty {
     /// and never the live profile: a mid-run shell change must not make Nice talk
     /// to a running pane in a dialect it does not speak.
     shell: PaneShell,
+    /// The deferred-resume line Nice must TYPE into this pane once it signals
+    /// readiness — set at spawn for a [`PrefillStrategy::AppTyped`] pane (bash,
+    /// which has no `print -z`), `None` for every other pane. The pane's first
+    /// `CwdChanged` (its rc file's unconditional startup OSC 7) `take`s it, so
+    /// it is delivered at most once; a pane that exits before that OSC 7 takes
+    /// the slot to the grave with its entry, and a respawn records a fresh one.
+    ///
+    /// The slot has no expiry, so **missing** that first OSC 7 is not a harmless
+    /// no-op: the line would be typed on whatever OSC 7 came next — the user's
+    /// first `cd` — splicing it into what they are typing at that moment. The one
+    /// way to miss it is for the pane to emit before a subscriber exists (gpui
+    /// drops a subscriber-less `cx.emit` rather than queueing it), so every arming
+    /// path subscribes the fresh window in the same synchronous update as the
+    /// spawn. That rule, and the sites that keep it, live on
+    /// [`WindowState::subscribe_spawned_windows`](crate::window_state::WindowState::subscribe_spawned_windows).
+    ///
+    /// Runtime-only, exactly like [`shell`](Self::shell): never persisted, so a
+    /// restored pane is re-armed by whatever profile spawns it next.
+    pending_prefill: Option<String>,
 }
 
 /// The per-window pty/session manager. Session-keyed: each session maps to its live window
@@ -233,8 +265,16 @@ pub(crate) struct WindowShellEnv {
     /// The active shell profile's rc-injection pairs, built once at window
     /// construction (`crate::shell::ShellProfile::inject_env`) and spliced into
     /// every pty this window spawns. Shell-shaped and opaque here: zsh sends
-    /// `ZDOTDIR` + `NICE_USER_ZDOTDIR`, a shell that injects via argv sends
-    /// nothing. Empty ⇒ no rc injection (the pane sources the user's own rc).
+    /// `ZDOTDIR` + `NICE_USER_ZDOTDIR`; bash injects through **argv**
+    /// (`--rcfile <nice.bashrc>`) and sends nothing.
+    ///
+    /// **Empty does NOT mean "not injected"** — a bash pane's pairs are empty
+    /// while its rc file absolutely runs. Whether a pane is injected is decided
+    /// by `SpawnCtx.inject` (i.e. the argv `crate::shell::spawn_argv` builds),
+    /// never by this list's length. The genuine no-injection case is
+    /// `ShellRuntime.inject == None` (the rc write failed), which routes every
+    /// spawn to `ctx.inject: None` and gives the pane a plain login shell
+    /// sourcing the user's own rc.
     pub(crate) inject_pairs: Vec<(String, String)>,
     /// `NICE_COMPOSE_CONF` — the Command Compose conf-file path the injected
     /// ZLE widget reads per compose (accent + `claude -p` flags). `None` ⇒ the
@@ -524,10 +564,11 @@ impl PtyManager {
     /// subscription (slice 3) invokes per event; splitting it out keeps the
     /// routing unit-testable without a live pty or a gpui context.
     ///
-    /// Returns a [`RoutedExit`]: empty for title / cwd / reset / first-output
-    /// (fully handled here), carrying the window-exit resolution for a clean
+    /// Returns a [`RoutedEvent`]: empty for title / reset / first-output (fully
+    /// handled here), carrying the window-exit resolution for a clean
     /// `Exited { held: false }` so the live subscription runs the same step-4
-    /// spawn + terminus a direct [`window_exited`](Self::window_exited) caller does.
+    /// spawn + terminus a direct [`window_exited`](Self::window_exited) caller does,
+    /// and this pane's app-typed prefill line on the `CwdChanged` that takes it.
     pub(crate) fn route_terminal_event(
         &mut self,
         model: &mut WorkspaceModel,
@@ -535,51 +576,64 @@ impl PtyManager {
         session_id: &str,
         term_window_id: &str,
         event: &TerminalEvent,
-    ) -> RoutedExit {
+    ) -> RoutedEvent {
         match event {
             TerminalEvent::TitleChanged(title) => {
                 let _ = self.window_title_changed(model, session_id, term_window_id, title);
-                RoutedExit::default()
+                RoutedEvent::default()
             }
             TerminalEvent::CwdChanged(path) => {
                 // OSC 7 → `TermWindow.cwd` (plain path across the boundary; the app owns
                 // the model type). The `to_string_lossy` is safe for the on-disk
                 // absolute paths OSC 7 reports.
                 let _ = self.window_cwd_changed(model, session_id, term_window_id, &path.to_string_lossy());
-                RoutedExit::default()
+                // …and, for an app-typed deferred-resume pane, this is also the
+                // readiness signal: the FIRST OSC 7 of such a pane is its rc
+                // file's unconditional startup fire, which is that file's last
+                // statement — so the hooks are installed and a prompt is coming.
+                // `take` makes it once-only by construction; every later OSC 7 is
+                // a plain cwd update. Edge worth knowing (design §6.4): a user
+                // profile that emits its OWN OSC 7 can make this fire mid-rc, in
+                // which case the bytes simply queue in the tty until readline
+                // starts — they still land on the prompt line, never executed.
+                RoutedEvent {
+                    prefill: self.take_pending_prefill(session_id, term_window_id),
+                    ..RoutedEvent::default()
+                }
             }
             TerminalEvent::TitleReset => {
                 // The terminal title-policy (`SessionsModel.swift:391-414`) only
                 // accepts a non-empty OSC *set*; a reset to the terminal default
                 // carries no new label, so it is a no-op for the window pill here.
-                RoutedExit::default()
+                RoutedEvent::default()
             }
             TerminalEvent::OutputStarted => {
                 // First pty byte — dismiss the "Launching…" overlay (Swift's
                 // `NiceTerminalView.onFirstData` → `clearPaneLaunch`).
                 self.clear_window_launch(term_window_id);
-                RoutedExit::default()
+                RoutedEvent::default()
             }
             TerminalEvent::Exited { held: true, .. } => {
                 // `TabPtySession` decided to keep the view mounted (non-clean /
                 // pre-first-byte exit) — flip the model to dead-but-on-screen and
                 // clear the overlay. No removal, no dissolve.
                 self.window_held(model, session_id, term_window_id);
-                RoutedExit::default()
+                RoutedEvent::default()
             }
             TerminalEvent::Exited { held: false, .. } => {
                 // Clean exit — the full 5-step `paneExited` cascade. The
                 // resolution tells the live caller to run step-4 spawn on a
                 // surviving session and to actuate the terminus.
                 let r = self.window_exited(model, selection, session_id, term_window_id);
-                RoutedExit {
+                RoutedEvent {
                     refocus_session: r.refocus_session,
                     terminus: r.terminus,
+                    prefill: None,
                 }
             }
             // `TerminalEvent` is `#[non_exhaustive]`; a still-later lifecycle
             // variant reaches here until this manager learns to route it.
-            _ => RoutedExit::default(),
+            _ => RoutedEvent::default(),
         }
     }
 
@@ -1269,6 +1323,50 @@ impl PtyManager {
             .map(|session| session.shell)
     }
 
+    /// Arm `(session_id, term_window_id)` with the deferred-resume line Nice must
+    /// type into it on its first OSC 7 — the app-typed half of design §6.4, set
+    /// by [`spawn_claude_window`](Self::spawn_claude_window) right after a
+    /// successful `ResumeDeferred` spawn under an
+    /// [`AppTyped`](PrefillStrategy::AppTyped) profile. No-op for a window with no
+    /// live pty (the spawn failed — there is nothing to type into).
+    pub(crate) fn record_pending_prefill(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        line: String,
+    ) {
+        if let Some(window) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|windows| windows.get_mut(term_window_id))
+        {
+            window.pending_prefill = Some(line);
+        }
+    }
+
+    /// Take `(session_id, term_window_id)`'s pending prefill line, leaving the slot
+    /// empty — the once-only guarantee behind
+    /// [`RoutedEvent::prefill`](RoutedEvent). `None` for a pane that was never
+    /// armed, whose line was already delivered, or that has no live pty.
+    fn take_pending_prefill(&mut self, session_id: &str, term_window_id: &str) -> Option<String> {
+        self.sessions
+            .get_mut(session_id)?
+            .get_mut(term_window_id)?
+            .pending_prefill
+            .take()
+    }
+
+    /// Test-only read of the pending-prefill slot (production only ever `take`s
+    /// it, through [`route_terminal_event`](Self::route_terminal_event)).
+    #[cfg(test)]
+    pub(crate) fn pending_prefill(&self, session_id: &str, term_window_id: &str) -> Option<&str> {
+        self.sessions
+            .get(session_id)?
+            .get(term_window_id)?
+            .pending_prefill
+            .as_deref()
+    }
+
     /// Every `(session_id, term_window_id)` with a live window session right now — the
     /// enumeration the shipped window's subscribe-once sweep
     /// ([`crate::window_state::WindowState::subscribe_spawned_windows`]) walks to
@@ -1388,10 +1486,16 @@ impl PtyManager {
         // The pane's shell snapshot, taken at spawn from the active profile (the
         // one whose argv this spec carries) and never revisited.
         let shell = crate::shell::pane_shell(cx);
-        self.sessions
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(term_window_id.to_string(), WindowPty { handle, shell });
+        self.sessions.entry(session_id.to_string()).or_default().insert(
+            term_window_id.to_string(),
+            WindowPty {
+                handle,
+                shell,
+                // Armed (only) by `spawn_claude_window`'s deferred-resume arm,
+                // after this spawn returns.
+                pending_prefill: None,
+            },
+        );
         Ok(())
     }
 
@@ -1600,9 +1704,13 @@ impl PtyManager {
     /// mode-driven:
     ///
     /// * [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) → a plain login shell
-    ///   (`zsh -il`) carrying `NICE_PREFILL_COMMAND` (the injected zshrc pre-types
-    ///   `claude --resume <id>`); the launch overlay is suppressed (a quiescent
-    ///   prefilled shell isn't "launching").
+    ///   whose prompt carries `claude --resume <id>` pre-typed. HOW it gets there is
+    ///   the active profile's [`PrefillStrategy`]: zsh takes `NICE_PREFILL_COMMAND`
+    ///   in the env and pre-types it from its rc tail's `print -z`; bash has no such
+    ///   builtin, so the line is recorded as this pane's
+    ///   [`pending_prefill`](WindowPty::pending_prefill) and Nice types it into the
+    ///   pty on the pane's first OSC 7 (see [`pending_prefill_for`]). Either way the
+    ///   launch overlay is suppressed (a quiescent prefilled shell isn't "launching").
     /// * Probe resolved a `claude` binary → `zsh -ilc "exec <claude> …"` via
     ///   [`build_claude_exec_command`], env from [`build_claude_extra_env`].
     /// * Probe unresolved → a plain `zsh -il` with **no** Nice env (Swift's
@@ -1684,6 +1792,15 @@ impl PtyManager {
 
         self.spawn_session_raw(session_id, term_window_id, spec, cx)?;
 
+        // App-typed prefill (design §6.4): a shell with no `print -z` got no
+        // `NICE_PREFILL_COMMAND` in its env, so the line waits here instead and
+        // the pane's first OSC 7 (routed through `route_terminal_event`) hands it
+        // to the subscription that owns the pty. Recorded AFTER the spawn — an
+        // errored spawn returns above and leaves no entry to arm.
+        if let Some(line) = pending_prefill_for(mode, prefill, settings_path) {
+            self.record_pending_prefill(session_id, term_window_id, line);
+        }
+
         // Launch-overlay policy: register the user-facing command string; a
         // deferred-resume window suppresses it (Swift `installLaunchOverlayHooks`'s
         // early return for `.resumeDeferred`). The live window root clears it on
@@ -1703,9 +1820,11 @@ impl PtyManager {
     ///   resolved cwd (last OSC 7, else the session/project fallback) — unchanged;
     /// * a **claude-kind** active window lazy-spawns **only in resume-deferred
     ///   form** (L3): iff the session carries a `claude_session_id`, the window is not
-    ///   yet spawned, and no Claude is running, it spawns a plain login shell
-    ///   carrying `claude --resume <sid>` as `NICE_PREFILL_COMMAND` (nothing runs
-    ///   until the user opens the session and presses Enter). This **supersedes** R15's
+    ///   yet spawned, and no Claude is running, it spawns a plain login shell with
+    ///   `claude --resume <sid>` pre-typed at the prompt — shell-side via
+    ///   `NICE_PREFILL_COMMAND` under zsh, app-typed on the pane's first OSC 7 under
+    ///   bash (see [`ClaudeSessionMode::ResumeDeferred`]). Nothing runs
+    ///   until the user opens the session and presses Enter. This **supersedes** R15's
     ///   "claude never lazy-spawns" note: a *restored* Claude window returns modelled
     ///   but unspawned and must lazy-spawn its deferred-resume shell on first
     ///   activation. A *running* Claude window (already spawned, or one promoted in
@@ -1944,10 +2063,20 @@ pub(crate) enum ClaudeSessionMode {
     /// 2.1.223 — it starts a brand-new conversation). So this mode emits no
     /// `--settings` pointer and no `extra_claude_args`.
     Attach(String),
-    /// Restore path: don't run claude — spawn a plain `zsh -il` with
-    /// `claude --resume <uuid>` pre-typed at the prompt via the stub's
-    /// `print -z "$NICE_PREFILL_COMMAND"` tail. This is the only mode that needs
-    /// `ZDOTDIR` + `NICE_PREFILL_COMMAND` in the window env.
+    /// Restore path: don't run claude — spawn a plain interactive login shell with
+    /// `claude --resume <uuid>` pre-typed at the prompt. HOW it gets pre-typed is
+    /// the active profile's [`PrefillStrategy`], not this mode's business:
+    ///
+    /// * [`ShellSide`](PrefillStrategy::ShellSide) (zsh, `zsh -il`): the shell types
+    ///   it, from `NICE_PREFILL_COMMAND` in the window env via the `.zshrc` stub's
+    ///   `print -z "$NICE_PREFILL_COMMAND"` tail.
+    /// * [`AppTyped`](PrefillStrategy::AppTyped) (bash, `bash --rcfile … -i`): Nice
+    ///   types it, from the pane's [`pending_prefill`](WindowPty::pending_prefill)
+    ///   slot on the pane's first OSC 7 — no prefill env var is set at all.
+    ///
+    /// Either way this is the only mode that carries the profile's rc-injection
+    /// pairs (zsh's `ZDOTDIR`/`NICE_USER_ZDOTDIR`; bash injects none) or arms a
+    /// prefill — see [`build_claude_extra_env`] and [`pending_prefill_for`].
     ResumeDeferred(String),
 }
 
@@ -2007,13 +2136,10 @@ pub(crate) fn build_claude_extra_env(
                 "NICE_PREFILL_COMMAND".to_string(),
                 build_claude_prefill_command(settings_path.as_deref(), claude_session_id),
             )),
-            // step 4: record the prefill string as this pane's `pending_prefill`
-            // and type it into the pty master when the pane's FIRST OSC 7 arrives
-            // (the rc file's unconditional startup fire). Nothing to set here —
-            // an app-typed profile has no rc tail reading an env var. Worth
-            // knowing when that lands: a user profile that emits its own OSC 7
-            // can deliver that first report mid-rc, in which case the bytes queue
-            // in the tty until readline starts — still landing on the prompt line.
+            // Nothing to set here — an app-typed profile has no rc tail reading
+            // an env var. The line is recorded as the pane's `pending_prefill`
+            // instead (see [`pending_prefill_for`]) and typed into the pty when
+            // its FIRST OSC 7 arrives.
             PrefillStrategy::AppTyped => {}
             // No prefill mechanism at all: the pane opens at a bare prompt
             // (design §5). Strictly better than pre-typing a line into a shell
@@ -2022,6 +2148,32 @@ pub(crate) fn build_claude_extra_env(
         }
     }
     env
+}
+
+/// The prefill line a freshly-spawned pane must hold **pending** — the app-typed
+/// twin of the `NICE_PREFILL_COMMAND` row in [`build_claude_extra_env`], and the
+/// exact complement of it: at most one of the two ever produces a line for the
+/// same spawn.
+///
+/// `Some` only for a [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) spawn
+/// under an [`AppTyped`](PrefillStrategy::AppTyped) profile (bash). A
+/// [`ShellSide`](PrefillStrategy::ShellSide) profile already got the line through
+/// its env (typing it too would double it at the prompt); an
+/// [`Off`](PrefillStrategy::Off) profile gets no prefill at all; and no other
+/// mode prefills anything — those `exec` claude directly.
+///
+/// Pure, so the whole mode × strategy grid is unit-tested without a pty.
+pub(crate) fn pending_prefill_for(
+    mode: &ClaudeSessionMode,
+    prefill: PrefillStrategy,
+    settings_path: Option<&str>,
+) -> Option<String> {
+    match (mode, prefill) {
+        (ClaudeSessionMode::ResumeDeferred(sid), PrefillStrategy::AppTyped) => {
+            Some(build_claude_prefill_command(settings_path, sid))
+        }
+        _ => None,
+    }
 }
 
 /// Build the deferred-resume prefill command the injected zshrc's `print -z`

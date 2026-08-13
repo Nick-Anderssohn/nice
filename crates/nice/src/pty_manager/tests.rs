@@ -20,7 +20,8 @@ use super::{
     claude_launch_display_command, claude_session_title_from_args, claude_worktree_cwd, clip_title,
     compose_claude_reply, default_mint_id, dispatch_extra_args, dispatch_prompt, dispatch_title,
     handoff_extra_args, handoff_prompt, handoff_title,
-    merge_env_spec_wins, mint_session_uuid, parse_claude_title, ClaudeReplyDecision,
+    merge_env_spec_wins, mint_session_uuid, parse_claude_title, pending_prefill_for,
+    ClaudeReplyDecision,
     ClaudeSessionMode, DissolveTerminus, WindowLaunchStatus, PtyManager, WindowShellEnv,
     WINDOW_TITLE_MAX,
 };
@@ -2221,6 +2222,196 @@ fn prefill_command_settings_path_with_space_single_quoted() {
         build_claude_prefill_command(Some("/Users/dev user/s.json"), "SID"),
         "claude --settings '/Users/dev user/s.json' --resume SID"
     );
+}
+
+// =====================================================================
+// App-typed prefill plumbing (design §6.4) — the delivery half of the same
+// FROZEN line for a shell with no `print -z`. `build_claude_extra_env` (above)
+// covers the env half: `ShellSide` gets `NICE_PREFILL_COMMAND`, `AppTyped` and
+// `Off` do not. Here: who gets a PENDING line, and that the pane's first OSC 7
+// hands it out exactly once.
+// =====================================================================
+
+/// `pending_prefill_for` is the exact complement of the `NICE_PREFILL_COMMAND`
+/// env row: only a `ResumeDeferred` spawn under an app-typed profile holds a
+/// line, and the line is the frozen composer's, verbatim.
+#[test]
+fn pending_prefill_only_for_resume_deferred_under_an_app_typed_profile() {
+    use crate::shell::PrefillStrategy;
+
+    let deferred = ClaudeSessionMode::ResumeDeferred("SID".into());
+
+    assert_eq!(
+        pending_prefill_for(&deferred, PrefillStrategy::AppTyped, None).as_deref(),
+        Some("claude --resume SID"),
+        "bash's pane holds the frozen line pending its first OSC 7"
+    );
+    assert_eq!(
+        pending_prefill_for(&deferred, PrefillStrategy::AppTyped, Some("/s.json")).as_deref(),
+        Some("claude --settings '/s.json' --resume SID"),
+        "the settings path splices through the same frozen composer"
+    );
+    assert_eq!(
+        pending_prefill_for(&deferred, PrefillStrategy::ShellSide, None),
+        None,
+        "zsh already got the line via NICE_PREFILL_COMMAND — typing it too would double it"
+    );
+    assert_eq!(
+        pending_prefill_for(&deferred, PrefillStrategy::Off, None),
+        None,
+        "a shell with no prefill mechanism opens at a bare prompt"
+    );
+
+    // No other mode prefills anything — they exec claude directly.
+    for mode in [
+        ClaudeSessionMode::None,
+        ClaudeSessionMode::New("SID".into()),
+        ClaudeSessionMode::Resume("SID".into()),
+    ] {
+        assert_eq!(
+            pending_prefill_for(&mode, PrefillStrategy::AppTyped, Some("/s.json")),
+            None,
+            "{mode:?} runs claude itself; there is nothing to pre-type"
+        );
+    }
+}
+
+/// The spawn side arms the pane and the routing side disarms it: a deferred-resume
+/// spawn under a bash profile records the line, the pane's FIRST `CwdChanged`
+/// takes it, and every later one is a plain cwd update. The zsh profile records
+/// nothing at all (its rc tail does the pre-typing).
+///
+/// Every cwd here is a path that does not exist, so each forked child `_exit`s at
+/// its `chdir` and no shell is ever really sourced — the assertions are the
+/// manager's own bookkeeping. The real-bash end of this lives in
+/// `window_state`'s `prefill_is_typed_into_a_real_bash_pane_...` test.
+#[gpui::test]
+fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::shell::ShellProfile;
+    const NO_SPAWN_CWD: &str = "/nice-unit-test-no-such-dir";
+
+    let rc = crate::shell::bash::hermetic::scratch("nice-prefill-rc");
+    cx.update(|cx| {
+        cx.set_global(crate::pty_manager::ResolvedClaudePath(None));
+
+        // A real BashProfile runtime: `prefill()` is `AppTyped` and `spawn_argv`
+        // needs genuine `InjectPaths` (its `--rcfile` comes from them).
+        let profile = crate::shell::bash::BashProfile::new("/bin/bash");
+        let inject = profile.write_rc_files(&rc.0).expect("write nice.bashrc");
+        cx.set_global(crate::shell::ShellRuntime {
+            profile: Box::new(profile),
+            inject: Some(inject),
+            user_env: crate::shell::UserShellEnv::default(),
+        });
+
+        let mut model = WorkspaceModel::new("/home/u");
+        let (claude_window, _) = seed_claude_session_in(&mut model, "p", "t1", false);
+        let mut mgr = PtyManager::new();
+        mgr.set_event_wakes_enabled_for_test(false);
+
+        mgr.spawn_claude_window(
+            "t1",
+            &claude_window,
+            NO_SPAWN_CWD,
+            &ClaudeSessionMode::ResumeDeferred("SID".into()),
+            &[],
+            Some("/s.json"),
+            cx,
+        )
+        .expect("the deferred-resume spawn returns Ok even when the child dies at chdir");
+
+        assert_eq!(
+            mgr.pending_prefill("t1", &claude_window),
+            Some("claude --settings '/s.json' --resume SID"),
+            "an app-typed pane is armed at spawn"
+        );
+
+        // First OSC 7: the line comes back to the subscription, AND the cwd
+        // routing that has always run still runs.
+        let mut selection = selection();
+        let routed = mgr.route_terminal_event(
+            &mut model,
+            &mut selection,
+            "t1",
+            &claude_window,
+            &TerminalEvent::CwdChanged("/tmp/first".into()),
+        );
+        let line = routed.prefill.expect("the first OSC 7 hands the line out");
+        assert_eq!(line, "claude --settings '/s.json' --resume SID");
+        assert!(
+            !line.ends_with('\n') && !line.ends_with('\r'),
+            "the line must sit EDITABLE at the prompt — a trailing newline would run it: <{line}>"
+        );
+        assert_eq!(
+            window_cwd(&model, "t1", &claude_window),
+            Some("/tmp/first".to_string()),
+            "taking the prefill must not displace the OSC 7's cwd update"
+        );
+
+        // Second OSC 7: a plain cwd update. `take` makes this once-only by
+        // construction, which is what keeps the line from being typed twice.
+        let routed = mgr.route_terminal_event(
+            &mut model,
+            &mut selection,
+            "t1",
+            &claude_window,
+            &TerminalEvent::CwdChanged("/tmp/second".into()),
+        );
+        assert_eq!(routed.prefill, None, "the slot is emptied by the first take");
+        assert_eq!(
+            mgr.pending_prefill("t1", &claude_window),
+            None,
+            "and stays empty"
+        );
+        assert_eq!(
+            window_cwd(&model, "t1", &claude_window),
+            Some("/tmp/second".to_string()),
+            "later OSC 7s are plain cwd updates"
+        );
+
+        // A zsh runtime over the same spawn: nothing pending, because the rc
+        // tail's `print -z` reads NICE_PREFILL_COMMAND out of the env instead.
+        crate::app::set_scenario_shell_inject_config(cx, None, None);
+        let (zsh_window, _) = seed_claude_session_in(&mut model, "p", "t2", false);
+        mgr.spawn_claude_window(
+            "t2",
+            &zsh_window,
+            NO_SPAWN_CWD,
+            &ClaudeSessionMode::ResumeDeferred("SID".into()),
+            &[],
+            Some("/s.json"),
+            cx,
+        )
+        .expect("spawn");
+        assert_eq!(
+            mgr.pending_prefill("t2", &zsh_window),
+            None,
+            "a shell-side profile is never armed"
+        );
+        let routed = mgr.route_terminal_event(
+            &mut model,
+            &mut selection,
+            "t2",
+            &zsh_window,
+            &TerminalEvent::CwdChanged("/tmp/zsh".into()),
+        );
+        assert_eq!(routed.prefill, None);
+
+        mgr.teardown();
+    });
+}
+
+/// A window's routed cwd, as `window_cwd_changed` stored it.
+fn window_cwd(model: &WorkspaceModel, session_id: &str, term_window_id: &str) -> Option<String> {
+    model
+        .session_for(session_id)?
+        .windows
+        .iter()
+        .find(|w| w.id == term_window_id)?
+        .cwd
+        .clone()
 }
 
 // =====================================================================

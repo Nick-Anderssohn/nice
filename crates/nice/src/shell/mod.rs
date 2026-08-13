@@ -19,10 +19,13 @@
 //! gates Command Compose, the orphan reaper prefilters on the comm-name union
 //! ([`reaper_comm_names`]), rc files live under `shellrc/<shell>/`, and the
 //! deferred-resume prefill var is gated on the profile's
-//! [`PrefillStrategy`].
+//! [`PrefillStrategy`]. **Step 3 is complete too**: [`bash::BashProfile`] brings
+//! the `--rcfile` spawn shapes, a generated `nice.bashrc`, and `"bash"` in
+//! [`all_known_comm_names`].
 //!
-//! Next (design §9 step 3): `BashProfile` — `--rcfile` spawn shapes and a
-//! `nice.bashrc`, which also adds `"bash"` to [`all_known_comm_names`].
+//! Next (design §9 step 5): Command Compose for bash — the ≥ 4.3 version probe
+//! and the `bind -x` handler, which is what lets `BashProfile` report anything
+//! other than [`ComposeSupport::None`].
 
 // Carried over from the `shell_inject` module this replaces, for the same
 // reason and one more. The trait surface is a CONTRACT (design §2) implemented
@@ -33,6 +36,7 @@
 // dead-code warnings during exactly the migration where they are noise.
 #![allow(dead_code)]
 
+pub mod bash;
 pub mod fallback;
 pub mod resolve;
 pub mod zsh;
@@ -370,17 +374,17 @@ pub fn prefill_strategy(cx: &gpui::App) -> PrefillStrategy {
 /// own comm name) so it still recognizes shells orphaned by a PRIOR run under a
 /// different setting.
 ///
-/// `"bash"` joins the list with `BashProfile` (migration step 3) — until then a
-/// bash user runs under the fallback profile, and the active-profile arm of the
-/// union already covers them.
+/// Both entries earn their place through the CROSS-RUN case: a run that resolved
+/// zsh still reaps bash orphans left by a prior bash-configured run, and vice
+/// versa. The active-profile arm alone could not see those.
 pub fn all_known_comm_names() -> &'static [&'static str] {
-    &["zsh"]
+    &["zsh", "bash"]
 }
 
 /// The kernel comm names the orphan reaper's prefilter admits: the registry
 /// ([`all_known_comm_names`]) plus `active` — the currently-resolved profile's
-/// own comm, which covers a fallback shell (`"fish"`, and `"bash"` until step 3)
-/// that is in no registry. Deduped, registry first.
+/// own comm, which covers a fallback shell (`"fish"`, `"tcsh"`, …) that is in no
+/// registry. Deduped, registry first.
 ///
 /// The union is what makes the reaper see shells orphaned by a PRIOR run under a
 /// DIFFERENT setting (design §7) — the decisive PPID==1 / uid / `NICE_TAB_ID=`
@@ -489,6 +493,12 @@ mod tests {
             zsh::default_location(),
             "the bootstrap must write zsh's stubs exactly where the zsh module reads them"
         );
+        // bash's `nice.bashrc` lands beside — never among — zsh's stubs.
+        assert_eq!(
+            rc_dir_for(&bash::BashProfile::new("/opt/homebrew/bin/bash")),
+            root.join("bash"),
+            "a homebrew bash still writes into the `bash` subdirectory"
+        );
         assert_eq!(
             rc_dir_for(&fallback::FallbackProfile::new("/usr/local/bin/fish")),
             root.join("fish")
@@ -500,24 +510,46 @@ mod tests {
     /// matched whether they predate or follow a shell-setting change.
     #[test]
     fn reaper_comm_names_union_covers_registry_and_active_profile() {
-        // A zsh run: the registry already carries it, so no duplicate appears.
-        assert_eq!(reaper_comm_names("zsh"), vec!["zsh".to_string()]);
-        // A fallback run: the registry entries still ride along, so zsh orphans
-        // from a PRIOR zsh-configured run are reaped by a fish-configured launch.
+        // The registry is every shell Nice ships a profile for.
+        assert_eq!(all_known_comm_names(), &["zsh", "bash"]);
+
+        // A zsh run: the registry already carries zsh, so no duplicate appears —
+        // and `bash` rides along even though nothing bash is active. THIS is the
+        // cross-run orphan case the union exists for: a prior bash-configured run
+        // that crashed left bash orphans, and this zsh-configured launch still
+        // reaps them.
         assert_eq!(
-            reaper_comm_names("fish"),
-            vec!["zsh".to_string(), "fish".to_string()]
+            reaper_comm_names("zsh"),
+            vec!["zsh".to_string(), "bash".to_string()]
         );
-        // Until step 3's BashProfile joins the registry, a bash user's own comm
-        // reaches the prefilter through the active-profile arm.
+        // The mirror: a bash run still sees a prior zsh run's orphans, with no
+        // duplicate for the active profile's own registered comm.
         assert_eq!(
             reaper_comm_names("bash"),
             vec!["zsh".to_string(), "bash".to_string()]
+        );
+        // A fallback run: the registry entries ride along AND the unregistered
+        // active shell is appended.
+        assert_eq!(
+            reaper_comm_names("fish"),
+            vec!["zsh".to_string(), "bash".to_string(), "fish".to_string()]
         );
         // Every registry entry is always present, whatever is active.
         for name in all_known_comm_names() {
             assert!(reaper_comm_names("tcsh").iter().any(|n| n == name));
         }
+    }
+
+    /// The registry and the profiles must agree: every name the reaper
+    /// prefilters on is some shipped profile's own `comm_name()`, and every
+    /// shipped profile's comm is in the registry. A profile added without its
+    /// registry row would go unreaped across runs (the bug design §7 names).
+    #[test]
+    fn registry_agrees_with_the_shipped_profiles_comm_names() {
+        let zsh = ZshProfile::new("/bin/zsh");
+        let bash = bash::BashProfile::new("/bin/bash");
+        let shipped: Vec<&str> = vec![zsh.comm_name(), bash.comm_name()];
+        assert_eq!(all_known_comm_names().to_vec(), shipped);
     }
 
     /// The degraded arm is zsh's alone. A non-zsh profile whose rc write failed

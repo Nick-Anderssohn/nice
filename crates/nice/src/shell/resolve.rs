@@ -11,6 +11,7 @@
 use std::ffi::CStr;
 use std::path::Path;
 
+use super::bash::BashProfile;
 use super::fallback::FallbackProfile;
 use super::zsh::ZshProfile;
 use super::ShellProfile;
@@ -106,9 +107,11 @@ fn pwuid_shell_live() -> Option<String> {
 }
 
 /// Map the winning path to a profile by executable basename (design §4): `zsh`
-/// ⇒ [`ZshProfile`] at the resolved path (kept as-resolved — a homebrew
-/// `/opt/homebrew/bin/zsh` gets the zsh profile at that path, not `/bin/zsh`);
-/// anything else, including `bash`, ⇒ [`FallbackProfile`] in this slice.
+/// ⇒ [`ZshProfile`], `bash` ⇒ [`BashProfile`], anything else ⇒
+/// [`FallbackProfile`]. The resolved path is kept as-resolved in every arm — a
+/// homebrew `/opt/homebrew/bin/bash` gets the bash profile *at that path*, not
+/// `/bin/bash`, so its own rc/probe/spawn argv all name the binary the user
+/// actually runs.
 fn profile_for_path(path: String) -> Box<dyn ShellProfile> {
     let basename = Path::new(&path)
         .file_name()
@@ -116,7 +119,7 @@ fn profile_for_path(path: String) -> Box<dyn ShellProfile> {
         .unwrap_or(path.as_str());
     match basename {
         "zsh" => Box::new(ZshProfile::new(path)),
-        // step 3: BashProfile
+        "bash" => Box::new(BashProfile::new(path)),
         _ => Box::new(FallbackProfile::new(path)),
     }
 }
@@ -325,11 +328,17 @@ mod tests {
         assert_eq!(profile.program(), "/opt/homebrew/bin/zsh");
     }
 
+    /// Basename `bash` now resolves to the real bash profile — at `/bin/bash`
+    /// and at a homebrew path alike, each keeping its own binary — rather than
+    /// falling through to the fallback.
     #[test]
-    fn basename_mapping_bash_is_fallback_in_this_slice() {
-        let profile = profile_for_path("/bin/bash".to_string());
-        assert_eq!(profile.kind(), ShellKind::Other);
-        assert_eq!(profile.program(), "/bin/bash");
+    fn basename_mapping_bash_keeps_resolved_path() {
+        for path in ["/bin/bash", "/opt/homebrew/bin/bash"] {
+            let profile = profile_for_path(path.to_string());
+            assert_eq!(profile.kind(), ShellKind::Bash, "{path}");
+            assert_eq!(profile.program(), path);
+            assert_eq!(profile.comm_name(), "bash", "{path}");
+        }
     }
 
     #[test]

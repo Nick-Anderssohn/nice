@@ -425,7 +425,7 @@ pub(crate) struct WindowState {
     /// R15 subscription lift: this window's handle, stashed at
     /// [`crate::app::build_window_root`]. The window-event subscription callback
     /// ([`subscribe_spawned_windows`](WindowState::subscribe_spawned_windows)) needs a
-    /// `&mut Window` to actuate a [`RoutedExit`](crate::pty_manager)'s
+    /// `&mut Window` to actuate a [`RoutedEvent`](crate::pty_manager)'s
     /// every-project-empty terminus (close this window / quit), which an
     /// entity-subscription callback lacks — it re-enters through this handle. `None`
     /// on a `WindowState` never mounted by the shipped builder (unit tests /
@@ -700,14 +700,37 @@ impl WindowState {
     /// idempotent via [`subscribed_windows`](Self::subscribed_windows) (subscribe-once
     /// dedupe), so running it every render is safe and cheap.
     ///
-    /// The [`RoutedExit`](crate::pty_manager) neighbor-refocus spawn is
+    /// The [`RoutedEvent`](crate::pty_manager) neighbor-refocus spawn is
     /// **composed by `WindowHostView`'s activation path**, not re-actuated here: the
     /// `cx.notify()` below re-renders the host, whose activation change re-runs
     /// the activation path (`activate_term_window`'s deferred-companion spawn, then the
-    /// host's own key-focus move) per the landed M2 focus-routing. Only the
-    /// every-project-empty terminus — which needs a
-    /// `&mut Window` a subscription callback lacks — is actuated here, via the
-    /// stashed [`window_handle`](Self::window_handle).
+    /// host's own key-focus move) per the landed M2 focus-routing. Two routed
+    /// side effects ARE actuated here, both because a subscription callback
+    /// cannot run them itself: the every-project-empty terminus (it needs a
+    /// `&mut Window`, reached via the stashed
+    /// [`window_handle`](Self::window_handle)), and the app-typed prefill line
+    /// (it needs the session entity, which arrives as this callback's emitter).
+    ///
+    /// **Ordering rule for the app-typed prefill (design §6.4).** A gpui `cx.emit`
+    /// with no subscriber is dropped — it is not queued for a later subscriber. The
+    /// pre-existing routed events tolerate that (a lost title/cwd/exit is corrected
+    /// by the next one), but the prefill does not: its readiness signal is the pane's
+    /// **first** OSC 7, and if that one is missed the armed slot survives and the
+    /// line is typed on a LATER OSC 7 — the user's first `cd` — splicing
+    /// `claude --resume <sid>` into whatever they are typing then. The render sweep
+    /// alone does not rule that out: a bash pane with a thin profile chain can reach
+    /// its rc file's startup OSC 7 in a few ms, and the drain task that re-emits it
+    /// is a foreground task that runs before the next frame's render.
+    ///
+    /// So every code path that can ARM a prefill runs this sweep **synchronously in
+    /// the same `Context<WindowState>` update as the spawn**, before returning to the
+    /// run loop: the drain task cannot execute mid-update, so the subscription always
+    /// precedes the pane's first emit. Today those paths are
+    /// [`spawn_deferred_resume_window`](Self::spawn_deferred_resume_window) (the
+    /// `/branch` parent + background-`/fork` child) and `WindowHostView`'s activation
+    /// block, which wraps `activate_term_window` → `ensure_active_window_spawned`'s L3
+    /// restore arm. A new arming site must do the same; the sweep is idempotent, so
+    /// the extra call costs a `HashSet` lookup per live window.
     pub(crate) fn subscribe_spawned_windows(&mut self, cx: &mut gpui::Context<WindowState>) {
         for (session_id, term_window_id) in self.ptys.live_window_keys() {
             let key = format!("{session_id}:{term_window_id}");
@@ -719,7 +742,7 @@ impl WindowState {
             };
             self.subscribed_windows.insert(key);
             let (t, p) = (session_id.clone(), term_window_id.clone());
-            cx.subscribe(&handle, move |ws, _handle, event: &TerminalEvent, cx| {
+            cx.subscribe(&handle, move |ws, handle, event: &TerminalEvent, cx| {
                 // Quit freeze: once quit has begun the model is read-only.
                 // `quit_cascade` has already flushed every window's snapshot
                 // (step 2) when its teardown (step 3) kills the windows — and an
@@ -741,6 +764,20 @@ impl WindowState {
                 let routed = ws
                     .ptys
                     .route_terminal_event(workspace, selection, &t, &p, event);
+                // App-typed prefill (design §6.4): this pane's FIRST OSC 7 handed
+                // back its deferred-resume line, because its shell has no
+                // `print -z` to pre-type it from the rc file. Typing it needs the
+                // session entity, which `route_terminal_event` has no access to —
+                // it arrives here as the subscription's emitter.
+                //
+                // **No trailing newline, ever.** The line must sit editable at the
+                // prompt; only the user's Enter runs it. A profile whose rc file
+                // emits its own OSC 7 before the prompt paints simply queues these
+                // bytes in the tty until readline starts — they still land on the
+                // prompt line, still unexecuted.
+                if let Some(line) = routed.prefill.as_deref() {
+                    let _ = handle.read(cx).session().write_input(line.as_bytes());
+                }
                 // R19: a routed window-exit may have dissolved a session — drop its
                 // file-browser state (the window-exit dissolve path, not covered by
                 // the UI-close methods above).
@@ -1546,7 +1583,8 @@ impl WindowState {
     /// [`ensure_active_window_spawned`](crate::pty_manager::PtyManager::ensure_active_window_spawned)
     /// precondition holds, then spawn the parent's Claude window in
     /// [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) mode — a plain login
-    /// shell carrying `claude --resume <old id>` as `NICE_PREFILL_COMMAND` (nothing
+    /// shell with `claude --resume <old id>` pre-typed at the prompt — shell-side
+    /// under zsh, app-typed under bash (nothing
     /// resumes, and no tokens are spent, until the user opens the parent session and
     /// presses Enter). Fire-and-forget: a spawn failure degrades to a model-only
     /// recovery session (the tree mutation already landed), so it is logged-and-swallowed
@@ -1568,7 +1606,8 @@ impl WindowState {
     /// [`ensure_active_window_spawned`](crate::pty_manager::PtyManager::ensure_active_window_spawned)
     /// precondition holds, then spawn the window in
     /// [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) mode — a plain login
-    /// shell carrying `claude --resume <claude session id>` as `NICE_PREFILL_COMMAND`
+    /// shell with `claude --resume <claude session id>` pre-typed at the prompt,
+    /// shell-side under zsh and app-typed under bash
     /// (nothing resumes, and no tokens are spent, until the user opens the session
     /// and presses Enter). Fire-and-forget: a spawn failure degrades to a model-only
     /// recovery session (the tree mutation already landed), so it is
@@ -1579,6 +1618,11 @@ impl WindowState {
     /// ([`insert_background_fork_child`](Self::insert_background_fork_child)) — the
     /// two differ only in which session they hang off and which id they pin, never
     /// in how the deferred window is brought up.
+    ///
+    /// Under an [`AppTyped`](crate::shell::PrefillStrategy::AppTyped) profile (bash)
+    /// the spawn ARMS the pane's prefill slot, so this subscribes the fresh window
+    /// before returning — see the ordering rule on
+    /// [`subscribe_spawned_windows`](Self::subscribe_spawned_windows).
     fn spawn_deferred_resume_window(
         &mut self,
         session_id: &str,
@@ -1598,6 +1642,12 @@ impl WindowState {
             settings.as_deref(),
             cx,
         );
+        // Subscribe the just-spawned window HERE, not on the next render: an
+        // app-typed pane was armed by that spawn, and its readiness OSC 7 must not
+        // land before a subscriber exists (a subscriber-less `cx.emit` is dropped,
+        // and the surviving slot would then type the resume line into the user's
+        // first `cd`). Synchronous, so the pane's drain task cannot emit first.
+        self.subscribe_spawned_windows(cx);
     }
 
     /// **Fix B.** Materialize a daemon-hosted background `/fork`
@@ -6023,5 +6073,211 @@ mod tests {
         assert_eq!(split.idle_ids, vec!["a", "b"]);
         assert!(split.busy_ids.is_empty());
         assert!(split.busy_summaries.is_empty());
+    }
+
+    // ---- app-typed prefill delivery (design §6.4) ---------------------------
+
+    /// End to end over a **real `/bin/bash`**: an armed pane's first OSC 7 makes
+    /// the SHIPPED subscription ([`WindowState::subscribe_spawned_windows`]) type
+    /// the deferred-resume line into the pty, and the line sits at the prompt
+    /// unexecuted.
+    ///
+    /// Hermetic: a scratch `$HOME` whose `.bash_profile` sets a marker prompt and
+    /// re-prepends the fixture `bin/` (`/etc/profile`'s `path_helper` demotes it),
+    /// plus a fake `claude` there that touches a marker file if it ever runs. The
+    /// pane is spawned with the PRODUCTION injected argv
+    /// (`crate::shell::spawn_argv(cx, true, None)` → `bash --rcfile <nice.bashrc>
+    /// -i`) and armed through the same recorder `spawn_claude_window` uses — that
+    /// spawn-side arming is pinned separately, without a real shell, by
+    /// `pty_manager`'s `deferred_resume_arms_the_pending_prefill_...`.
+    ///
+    /// The `CwdChanged` is emitted on the session entity rather than waited for
+    /// off the wire: under the mocked `TestAppContext` the drain task's
+    /// cross-thread wake is disabled (gpui's determinism guard), so no real OSC 7
+    /// can become a gpui event here. That the rc file's startup fire IS a clean
+    /// OSC 7 is pinned by the real-bash tests in `shell::bash`. Everything from
+    /// the event onward — subscription dispatch, `write_input`, bash's own
+    /// readline — is the real thing.
+    #[gpui::test]
+    fn prefill_is_typed_into_a_real_bash_pane_on_its_first_osc7(cx: &mut gpui::TestAppContext) {
+        use crate::shell::bash::hermetic::{scratch, ScratchHome, SYSTEM_BASH};
+        use crate::shell::{bash::BashProfile, ShellProfile, ShellRuntime, UserShellEnv};
+        use nice_term_core::SpawnSpec;
+
+        const PROMPT: &str = "NICE_READY>";
+        const LINE: &str = "claude --settings '/s.json' --resume SID";
+
+        let home = ScratchHome::new("nice-prefill-home");
+        let ran_marker = home.path().join("claude-ran");
+        // A `claude` that leaves a trace if the typed line is ever EXECUTED.
+        home.install_executable(
+            "claude",
+            &format!("#!/bin/sh\n: > '{}'\n", ran_marker.display()),
+        );
+        // The login-chain fixture: PATH restored ahead of `path_helper`'s rebuild
+        // (so the fake `claude` would be findable) and a prompt we can poll for.
+        home.write_path_restoring_bash_profile(&format!("export PS1='{PROMPT} '\n"));
+
+        let rc = scratch("nice-prefill-rc");
+        let cwd = home.path().to_string_lossy().to_string();
+
+        let state = cx.new(|_cx| WindowState::new(&cwd));
+        cx.update(|cx| {
+            let profile = BashProfile::new(SYSTEM_BASH);
+            let inject = profile.write_rc_files(&rc.0).expect("write nice.bashrc");
+            cx.set_global(ShellRuntime {
+                profile: Box::new(profile),
+                inject: Some(inject),
+                user_env: UserShellEnv::default(),
+            });
+        });
+
+        // A session with one window, spawned over a real pty and armed exactly as
+        // a deferred-resume Claude spawn arms it.
+        let (session_id, window_id) = ("t-prefill".to_string(), "w-prefill".to_string());
+        state.update(cx, |ws, cx| {
+            let mut session = Session::new(&session_id, "prefill", &cwd);
+            session.windows = vec![TermWindow::new(&window_id, "Terminal 1", TermWindowKind::Terminal)];
+            session.active_window_id = Some(window_id.clone());
+            ws.workspace.ensure_project("p", "P", &cwd);
+            let pi = ws.workspace.projects.iter().position(|p| p.id == "p").unwrap();
+            ws.workspace.projects[pi].sessions.push(session);
+
+            ws.ptys.set_event_wakes_enabled_for_test(false);
+            let spec = SpawnSpec::shell(&cwd)
+                .with_env(home.env())
+                .with_argv(crate::shell::spawn_argv(cx, true, None));
+            ws.ptys
+                .spawn_window(&session_id, &window_id, spec, cx)
+                .expect("spawn a real bash pane");
+            ws.ptys
+                .record_pending_prefill(&session_id, &window_id, LINE.to_string());
+            ws.subscribe_spawned_windows(cx);
+        });
+
+        let handle = state
+            .update(cx, |ws, _| ws.ptys.term_window_handle(&session_id, &window_id))
+            .expect("the pane has a live session");
+        let grid = |cx: &mut gpui::TestAppContext| -> String {
+            handle.update(cx, |h, _| h.session().grid_lines().join("\n"))
+        };
+        // Real subprocess, real feeder thread: poll the shared grid on the wall
+        // clock. Nothing gpui-scheduled runs during the wait.
+        let poll = |cx: &mut gpui::TestAppContext, needle: &str| -> bool {
+            for _ in 0..200 {
+                if grid(cx).contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            false
+        };
+
+        assert!(
+            poll(cx, PROMPT),
+            "the injected nice.bashrc never reached a prompt. Grid:\n{}",
+            grid(cx)
+        );
+
+        // The pane's first OSC 7 — the readiness signal nice.bashrc fires as its
+        // final statement.
+        handle.update(cx, |_h, cx| {
+            cx.emit(TerminalEvent::CwdChanged(std::path::PathBuf::from(&cwd)))
+        });
+        cx.run_until_parked();
+
+        assert!(
+            poll(cx, LINE),
+            "the resume line was never typed into the pane. Grid:\n{}",
+            grid(cx)
+        );
+        state.update(cx, |ws, _| {
+            assert_eq!(
+                ws.ptys.pending_prefill(&session_id, &window_id),
+                None,
+                "the slot is emptied by the delivery"
+            );
+        });
+        assert!(
+            !ran_marker.exists(),
+            "the line must sit EDITABLE at the prompt — no trailing newline may have executed it"
+        );
+
+        state.update(cx, |ws, _| ws.ptys.teardown());
+    }
+
+    /// The arming path subscribes its pane **in the spawn's own update**, so a
+    /// readiness OSC 7 can never beat the subscription (a subscriber-less
+    /// `cx.emit` is dropped by gpui, and the surviving slot would then type the
+    /// resume line into the user's first `cd`).
+    ///
+    /// The render sweep is deliberately NOT run here: this emits straight after
+    /// [`WindowState::spawn_deferred_resume_window`], which is exactly the window
+    /// the sweep-on-next-render would have left open. Delivery is observed as the
+    /// slot being taken — the cwd is a path that does not exist, so the forked
+    /// child `_exit`s at its `chdir` and no shell is ever really sourced (the
+    /// bytes-at-the-prompt end is covered by
+    /// `prefill_is_typed_into_a_real_bash_pane_on_its_first_osc7`).
+    #[gpui::test]
+    fn a_deferred_resume_spawn_is_subscribed_before_its_first_osc7(cx: &mut gpui::TestAppContext) {
+        use crate::shell::{bash::BashProfile, ShellProfile, ShellRuntime, UserShellEnv};
+
+        const NO_SPAWN_CWD: &str = "/nice-unit-test-no-such-dir";
+
+        let rc = crate::shell::bash::hermetic::scratch("nice-prefill-order-rc");
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        cx.update(|cx| {
+            cx.set_global(crate::pty_manager::ResolvedClaudePath(None));
+            let profile = BashProfile::new("/bin/bash");
+            let inject = profile.write_rc_files(&rc.0).expect("write nice.bashrc");
+            cx.set_global(ShellRuntime {
+                profile: Box::new(profile),
+                inject: Some(inject),
+                user_env: UserShellEnv::default(),
+            });
+        });
+
+        let (session_id, window_id) = ("t-order".to_string(), "w-order".to_string());
+        state.update(cx, |ws, cx| {
+            let mut session = Session::new(&session_id, "order", NO_SPAWN_CWD);
+            session.claude_session_id = Some("SID".to_string());
+            session.windows = vec![TermWindow::new(&window_id, "Claude", TermWindowKind::Claude)];
+            session.active_window_id = Some(window_id.clone());
+            ws.workspace.ensure_project("p", "P", NO_SPAWN_CWD);
+            let pi = ws.workspace.projects.iter().position(|p| p.id == "p").unwrap();
+            ws.workspace.projects[pi].sessions.push(session);
+
+            ws.ptys.set_event_wakes_enabled_for_test(false);
+            ws.spawn_deferred_resume_window(
+                &session_id,
+                &window_id,
+                NO_SPAWN_CWD,
+                "SID".to_string(),
+                cx,
+            );
+            assert_eq!(
+                ws.ptys.pending_prefill(&session_id, &window_id),
+                Some("claude --resume SID"),
+                "the bash spawn armed the pane's app-typed prefill"
+            );
+        });
+
+        let handle = state
+            .update(cx, |ws, _| ws.ptys.term_window_handle(&session_id, &window_id))
+            .expect("the deferred-resume spawn left a session entity");
+        handle.update(cx, |_h, cx| {
+            cx.emit(TerminalEvent::CwdChanged(std::path::PathBuf::from("/tmp/first")))
+        });
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _| {
+            assert_eq!(
+                ws.ptys.pending_prefill(&session_id, &window_id),
+                None,
+                "the first OSC 7 reached a subscriber — without the spawn-time subscribe it \
+                 would have been dropped, leaving the line armed for the user's next `cd`"
+            );
+            ws.ptys.teardown();
+        });
     }
 }

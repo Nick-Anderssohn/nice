@@ -662,6 +662,14 @@ impl Render for WindowHostView {
                     let workspace = &mut ws.workspace;
                     let ptys = &mut ws.ptys;
                     ptys.activate_term_window(workspace, &session, &term_window, settings.as_deref(), wcx);
+                    // Subscribe whatever that just spawned NOW, in this same update:
+                    // the sweep above ran BEFORE the spawn, so deferring to the next
+                    // render would leave the fresh window unsubscribed for a frame.
+                    // The L3 restore arm reached through here arms an app-typed pane's
+                    // prefill, and a readiness OSC 7 that beats the subscription is
+                    // dropped outright — see `subscribe_spawned_windows`' ordering
+                    // rule. Idempotent: a `HashSet` lookup per live window.
+                    ws.subscribe_spawned_windows(wcx);
                 });
                 // Re-point the demand-present kick to the (now-active) window's
                 // handle so its damage kicks this window while occluded.
