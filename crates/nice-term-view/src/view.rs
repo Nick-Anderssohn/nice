@@ -75,6 +75,15 @@
 //!   ([`crate::input::scrollback_key_action`]); plain variants still encode,
 //!   and on the alternate screen even the Shift chords go to the app. Works on
 //!   a held pane too (the read-gesture carve-out beside held ⌘C).
+//! * **Copy mode** (Phase 3) — while the pane is in copy mode (alacritty's
+//!   `TermMode::VI`, read through the handle) the view stops being an input
+//!   edge at all: [`on_key_down`](TerminalView::on_key_down) consumes EVERY key
+//!   through [`crate::input::copy_mode_key_action`] ahead of the held/IME
+//!   gates, [`on_key_up`](TerminalView::on_key_up) drops the matching release
+//!   reports, the three IME callbacks drop their pty writes (still running
+//!   their state transitions so a composition can clear itself), and mouse
+//!   reporting is suspended exactly like the Shift override. The mode toggles
+//!   themselves are app-level actions, never key-listener business.
 //! * **DECSET-1004 focus in/out** — a change in the combined focus predicate
 //!   (`is_focused && window active`, the same value the caret uses) emits
 //!   `ESC[I` / `ESC[O` when the app enabled focus reporting.
@@ -87,6 +96,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use alacritty_terminal::grid::Dimensions;
+// gpui has a `Point` of its own (pixels), so the grid's is aliased.
+use alacritty_terminal::index::{Column, Line, Point as GridPoint};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::TermMode;
@@ -112,13 +123,14 @@ use crate::font::{snap_metrics_to_scale, FontSettings};
 use crate::hyperlink::{hover_changed, UrlOpener, UrlRegexCache};
 use crate::mouse::{link_click_verdict, LinkClickVerdict};
 use crate::input::{
-    build_key_input, build_modifier_input, encoder_config, kitty_forwards_super, named_key_for,
-    scrollback_key_action, KeyCodeProbe, ScrollbackAction,
+    build_key_input, build_modifier_input, copy_mode_key_action, encoder_config, ime_gate,
+    key_gate, kitty_forwards_super, mouse_reports_to_app, named_key_for, scrollback_key_action,
+    CopyModeAction, ImeCallback, KeyCodeProbe, KeyGate, ScrollbackAction,
 };
 use crate::mouse;
 use crate::overlay::{
-    held_exit_footer, HeldPane, LaunchDeadline, LaunchOverlay, DEFAULT_LAUNCH_OVERLAY_GRACE,
-    HELD_FOOTER_LABEL,
+    copy_mode_badge_label, held_exit_footer, HeldPane, LaunchDeadline, LaunchOverlay,
+    DEFAULT_LAUNCH_OVERLAY_GRACE, HELD_FOOTER_LABEL,
 };
 use crate::session_handle::{TerminalEvent, TerminalSessionHandle};
 use crate::theme::TerminalTheme;
@@ -773,9 +785,13 @@ impl TerminalView {
             // this entity, not the view. The view holds no title/cwd state, so it
             // ignores them (a hidden pane has no view at all, which is exactly why
             // these events live on the entity).
+            // `SearchRequested` is the same shape in reverse: the view *emits*
+            // it (in-mode `/`/`?`) for the app's search bar to consume. Seeing
+            // it come back round through this subscription means nothing here.
             TerminalEvent::TitleChanged(_)
             | TerminalEvent::TitleReset
-            | TerminalEvent::CwdChanged(_) => {}
+            | TerminalEvent::CwdChanged(_)
+            | TerminalEvent::SearchRequested { .. } => {}
             // `TerminalEvent` is `#[non_exhaustive]` for cross-crate consumers, but
             // it is defined in THIS crate, so this match is exhaustive here — a
             // future lifecycle variant will (rightly) force the view to handle it.
@@ -933,6 +949,14 @@ impl TerminalView {
             .unwrap_or(TermMode::NONE)
     }
 
+    /// Whether this pane is in copy mode (Phase 3, P1: copy mode IS
+    /// `TermMode::VI`). Read fresh from the handle at every gate — there is no
+    /// view-side mirror of it to drift out of sync, and the mode outlives this
+    /// view (it lives on the per-pane handle).
+    fn copy_mode_active(&self, cx: &App) -> bool {
+        self.handle.read(cx).copy_mode_active()
+    }
+
     /// Write raw bytes to the child. Best-effort: a not-yet-spawned session
     /// errors, which is dropped (there is nowhere to send the keystroke yet).
     fn write_pty(&self, bytes: &[u8], cx: &App) {
@@ -980,10 +1004,96 @@ impl TerminalView {
         });
     }
 
+    /// Perform one copy-mode key action (Phase 3) against the session handle.
+    ///
+    /// Every arm is an app gesture — none of them touches the pty, and none
+    /// snaps the viewport to the bottom (copy mode is *reading* scrollback; a
+    /// snap would throw away the thing being read). `Swallow`/`SwallowPaste`
+    /// deliberately do nothing at all: consuming the key IS the behaviour (P4).
+    fn perform_copy_mode(&mut self, action: CopyModeAction, cx: &mut Context<Self>) {
+        match action {
+            CopyModeAction::Motion(motion) => self.handle.update(cx, |handle, hcx| {
+                handle.vi_motion(motion);
+                hcx.notify();
+            }),
+            CopyModeAction::Top => self.handle.update(cx, |handle, hcx| {
+                handle.vi_top();
+                hcx.notify();
+            }),
+            CopyModeAction::Bottom => self.handle.update(cx, |handle, hcx| {
+                handle.vi_bottom();
+                hcx.notify();
+            }),
+            CopyModeAction::Page { toward_history, half } => {
+                self.handle.update(cx, |handle, hcx| {
+                    handle.vi_page(toward_history, half);
+                    hcx.notify();
+                })
+            }
+            CopyModeAction::ToggleSelection(ty) => self.handle.update(cx, |handle, hcx| {
+                handle.toggle_copy_selection(ty);
+                hcx.notify();
+            }),
+            // `y` / Enter: copy-and-cancel. With nothing selected there is
+            // nothing to copy, so the mode stays (P4) — `copy_selection` reports
+            // exactly that, and it is the same clipboard write ⌘C uses.
+            CopyModeAction::Yank => {
+                if self.copy_selection(cx) {
+                    self.handle.update(cx, |handle, hcx| {
+                        handle.exit_copy_mode();
+                        hcx.notify();
+                    });
+                }
+            }
+            // ⌘C: today's copy, unchanged — including staying in the mode.
+            CopyModeAction::YankStay => {
+                self.copy_selection(cx);
+            }
+            // The query field lives in the app crate (P2), so the view can only
+            // ask for it. `begin_search` is the app's call as it opens the bar.
+            CopyModeAction::OpenSearch { backward } => self.handle.update(cx, |_handle, hcx| {
+                hcx.emit(TerminalEvent::SearchRequested { backward });
+            }),
+            CopyModeAction::NextMatch => self.handle.update(cx, |handle, hcx| {
+                if handle.next_match() {
+                    hcx.notify();
+                }
+            }),
+            CopyModeAction::PrevMatch => self.handle.update(cx, |handle, hcx| {
+                if handle.prev_match() {
+                    hcx.notify();
+                }
+            }),
+            CopyModeAction::Exit => self.handle.update(cx, |handle, hcx| {
+                handle.exit_copy_mode();
+                hcx.notify();
+            }),
+            // Nothing to do: the key is consumed by the caller either way.
+            CopyModeAction::SwallowPaste | CopyModeAction::Swallow => {}
+        }
+    }
+
     /// gpui key-down: the terminal's typed-input entry point.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = keystroke.modifiers;
+
+        // Copy mode (Phase 3): the FIRST gate — ahead of the held gate (P10:
+        // keyboard-selecting a dead pane's output is that pane's whole remaining
+        // purpose) and ahead of the IME gates. EVERY key is consumed here, bound
+        // or not (the table's default arm is `Swallow`), so nothing reaches the
+        // ⌘V/⌘C handling or `dispatch_key` while VI is on — P4's no-leak
+        // guarantee. Nice's own ⌃⌘ chords never arrive: gpui matches actions
+        // before view key listeners, which is why the mode toggles are actions
+        // and the in-mode keys are intercepted here.
+        if matches!(
+            key_gate(self.copy_mode_active(cx), self.held.is_held()),
+            KeyGate::CopyMode
+        ) {
+            self.perform_copy_mode(copy_mode_key_action(&keystroke.key, m), cx);
+            cx.stop_propagation();
+            return;
+        }
 
         // Held pane (T10): the child is dead, so **pty-bound** input is inert — the
         // key is consumed (never reaching the encoder / a closed pty, and never
@@ -1110,6 +1220,15 @@ impl TerminalView {
     ///
     /// [`dispatch_key`]: Self::dispatch_key
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Copy mode (P4, gate 2): the press was swallowed, so its release must be
+        // too — otherwise an app that asked for `REPORT_EVENT_TYPES` would still
+        // see the release half of every in-mode keystroke. The one asymmetry this
+        // accepts is a press/release pair that straddles entry or exit (the Esc
+        // that leaves the mode releases with VI already off), which is the same
+        // class as today's intercepted Shift+PageUp.
+        if self.copy_mode_active(cx) {
+            return;
+        }
         if self.ime.is_composing() {
             return;
         }
@@ -1248,6 +1367,16 @@ impl TerminalView {
         // nothing to do for that side.
         if let Some(pos) = self.last_mouse_pos {
             self.update_hover(pos, event.modifiers, cx);
+        }
+
+        // Copy mode: P4's no-leak guarantee reaches this writer too. The plan
+        // enumerates the four gates around `on_key_down`; bare-modifier reports
+        // are the fifth pty writer a keystroke can reach, and Shift is held
+        // constantly inside the mode (`V`, `G`, `?`, `N`), so under
+        // report-all-keys every one of those would otherwise report to the app.
+        // The ⌘-hover edge above stays live — it writes nothing.
+        if self.copy_mode_active(cx) {
+            return;
         }
 
         let mode = self.current_mode(cx);
@@ -1419,8 +1548,10 @@ impl TerminalView {
             }
         }
 
-        // App mouse reporting, unless Shift forces a local selection.
-        if mouse::reporting_active(mode) && !m.shift {
+        // App mouse reporting, unless Shift — or copy mode (P10) — forces the
+        // local branch below.
+        let copy_mode = self.copy_mode_active(cx);
+        if mouse_reports_to_app(mode, m.shift, copy_mode) {
             if let (Some(button), Some(hit)) =
                 (mouse::vt_button(event.button), self.hit_cell(event.position, cx))
             {
@@ -1445,6 +1576,18 @@ impl TerminalView {
                     _ => SelectionType::Lines,
                 };
                 self.drag_selecting = true;
+                // In copy mode the click also MOVES the vi cursor there (P10).
+                // `scroll_display` recomputes a live selection's end to the vi
+                // cursor while VI is on, so without this a later wheel scroll
+                // would drag the mouse selection back to wherever the cursor was
+                // parked; pointing the cursor at the click makes that recompute
+                // target where the drag already is. The point is in view by
+                // construction, so `vi_goto` scrolls nothing.
+                if copy_mode {
+                    self.handle.update(cx, |handle, _| {
+                        handle.vi_goto(GridPoint::new(Line(hit.buffer_line), Column(hit.col)));
+                    });
+                }
                 // The Term owns the anchor from here (content-locked; see the
                 // `drag_selecting` field docs). A `Simple` selection starts
                 // empty, so a single click still collapses any prior highlight
@@ -1497,7 +1640,7 @@ impl TerminalView {
         // Hover is passive — motion reports are NOT suppressed while ⌘ is held,
         // so an app that tracks the pointer keeps tracking it under ⌘.
         let mode = self.current_mode(cx);
-        if !mouse::reporting_active(mode) || event.modifiers.shift {
+        if !mouse_reports_to_app(mode, event.modifiers.shift, self.copy_mode_active(cx)) {
             return;
         }
         if !mouse::reports_motion(mode, event.pressed_button.is_some()) {
@@ -1565,7 +1708,7 @@ impl TerminalView {
             return;
         }
         let mode = self.current_mode(cx);
-        if !mouse::reporting_active(mode) || event.modifiers.shift {
+        if !mouse_reports_to_app(mode, event.modifiers.shift, self.copy_mode_active(cx)) {
             return;
         }
         if let (Some(button), Some(hit)) =
@@ -1653,6 +1796,10 @@ impl TerminalView {
     }
 
     /// `setMarkedText:` — update the preedit (no pty write) and repaint.
+    ///
+    /// Copy mode declines the whole callback ([`ime_gate`]): the composition is
+    /// never learned, so `is_composing` never arms and no preedit paints over
+    /// the scrollback the user is reading.
     pub(crate) fn ime_set_marked(
         &mut self,
         range: Option<Range<usize>>,
@@ -1660,9 +1807,15 @@ impl TerminalView {
         sel: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        let gate = ime_gate(ImeCallback::SetMarked, self.copy_mode_active(cx));
+        if !gate.run_transition {
+            return;
+        }
         // Starting/updating a composition is typing: snap so the preedit
         // overlay (anchored at the grid cursor) is actually on screen.
-        self.snap_to_bottom_on_input(cx);
+        if gate.snap_to_bottom {
+            self.snap_to_bottom_on_input(cx);
+        }
         self.ime.set_marked_text(range, text, sel);
         cx.notify();
     }
@@ -1670,17 +1823,28 @@ impl TerminalView {
     /// `insertText:` — commit. Committed IME text is **data**: write it straight
     /// to the pty (never through the key encoder). If it ended a composition,
     /// schedule the end-of-cycle disarm so a later bare Enter still sends CR.
+    ///
+    /// In copy mode the write and the snap are dropped but the transition still
+    /// RUNS ([`ime_gate`]): a composition already in flight when `⌃⌘c` fired has
+    /// to be able to clear itself here, or marked state would stay `Some` and
+    /// gpui would keep routing every key into the input context — leaving the
+    /// pane keyboard-dead after the mode exits.
     pub(crate) fn ime_commit(
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        let gate = ime_gate(ImeCallback::Commit, self.copy_mode_active(cx));
         let outcome = self.ime.commit_text(range, text);
         // Plain printables arrive here (via `insertText:`), not `dispatch_key` —
         // this is the snap-to-bottom site for ordinary typing.
-        self.snap_to_bottom_on_input(cx);
-        self.write_pty(outcome.pty_text.as_bytes(), cx);
+        if gate.snap_to_bottom {
+            self.snap_to_bottom_on_input(cx);
+        }
+        if gate.write_pty {
+            self.write_pty(outcome.pty_text.as_bytes(), cx);
+        }
         if outcome.was_composing {
             // End-of-native-key-cycle disarm: runs after any synchronous
             // `doCommandBySelector` re-dispatch, before the next keypress, so a
@@ -1697,9 +1861,16 @@ impl TerminalView {
 
     /// `unmarkText` — accept the pending composition as typed (focus loss /
     /// input-source switch). Does not arm the Enter swallow.
+    ///
+    /// In copy mode the pending text is discarded instead of written, but the
+    /// transition still runs so the preedit clears (same reasoning as
+    /// [`ime_commit`](Self::ime_commit)).
     pub(crate) fn ime_unmark(&mut self, cx: &mut Context<Self>) {
+        let gate = ime_gate(ImeCallback::Unmark, self.copy_mode_active(cx));
         if let Some(pending) = self.ime.unmark() {
-            self.write_pty(pending.as_bytes(), cx);
+            if gate.write_pty {
+                self.write_pty(pending.as_bytes(), cx);
+            }
         }
         cx.notify();
     }
@@ -1846,6 +2017,12 @@ impl Render for TerminalView {
         let show_held = self.held.is_held();
         let held_affordance = show_held.then(|| self.render_held_affordance(cx));
 
+        // The copy-mode badge (P9): the mode has no other standing signal — the
+        // grid still looks live, the caret has just stopped following the shell
+        // — so a pane in copy mode says so, and names the search whose matches
+        // are tinting its cells.
+        let copy_badge = self.copy_mode_active(cx).then(|| self.render_copy_badge(cx));
+
         // Snapshot the preedit for this frame's inline overlay (byte range for the
         // shaped runs). The IME wiring (input-handler registration + preedit
         // paint) is threaded into the element so it shares the grid geometry.
@@ -1942,6 +2119,7 @@ impl Render for TerminalView {
             // over the grid when active (children paint after the element).
             .when_some(launch_overlay, |root, overlay| root.child(overlay))
             .when_some(held_affordance, |root, pill| root.child(pill))
+            .when_some(copy_badge, |root, badge| root.child(badge))
     }
 }
 
@@ -2071,6 +2249,44 @@ impl TerminalView {
             .child(pill)
             .child(div().h(px(24.0)))
     }
+
+    /// The copy-mode badge (P9): a small pill in the pane's top-right corner
+    /// reading `COPY`, plus the live search query when one is running (the
+    /// wording and its eliding are [`copy_mode_badge_label`], unit-tested).
+    ///
+    /// Top-RIGHT because the bottom of a pane is where the prompt and the app
+    /// crate's search bar live, and because copy mode is usually entered to read
+    /// something that scrolled off the top. Non-interactive (no listeners), so
+    /// clicks and drags pass straight through to the grid underneath — in copy
+    /// mode those move the vi cursor and select.
+    fn render_copy_badge(&self, cx: &App) -> impl IntoElement {
+        let slots = self.overlay_slots();
+        let label: SharedString =
+            copy_mode_badge_label(self.handle.read(cx).active_search_query()).into();
+
+        let pill = div()
+            .px(px(7.0))
+            .py(px(2.0))
+            .rounded(px(6.0))
+            .bg(slot_rgba(slots.panel))
+            .border_1()
+            .border_color(slot_rgba(slots.line))
+            .text_size(px(11.0))
+            .text_color(slot_rgba(slots.ink))
+            .font_family(self.font_family.clone())
+            .child(label);
+
+        // Inset from the pane's own edges, inside the Phase-2 content inset, so
+        // the badge never sits on a split divider. Fills via `inset: 0` (see
+        // [`overlay_fill`] — `.size_full()` is zero on an absolute element).
+        overlay_fill()
+            .flex()
+            .justify_end()
+            .items_start()
+            .pt(px(4.0))
+            .pr(px(6.0))
+            .child(pill)
+    }
 }
 
 /// A chrome slot as a gpui [`Rgba`] — this crate has no dependency on the app's
@@ -2126,7 +2342,7 @@ impl TerminalView {
         // **up** (button 64). Whole cells are reported; the remainder is kept so a
         // slow trackpad still eventually reports (like the scrollback accumulator).
         let mode = self.current_mode(cx);
-        if mouse::reporting_active(mode) && !event.modifiers.shift {
+        if mouse_reports_to_app(mode, event.modifiers.shift, self.copy_mode_active(cx)) {
             self.wheel_accum += lines;
             let steps = self.wheel_accum.trunc();
             self.wheel_accum -= steps;

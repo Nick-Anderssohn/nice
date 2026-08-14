@@ -119,6 +119,8 @@ gpui::actions!(
         SwapPaneDown,
         SwapPaneUp,
         SwapPaneRight,
+        CopyMode,
+        SearchScrollback,
     ]
 );
 
@@ -479,6 +481,9 @@ fn register_window_scoped_actions(cx: &mut App) {
     });
     cx.on_action(|_: &ScrollHalfPageUp, cx: &mut App| scroll_active_window_half_page(cx, true));
     cx.on_action(|_: &ScrollHalfPageDown, cx: &mut App| scroll_active_window_half_page(cx, false));
+    // -- Phase 3 (tmux port): copy mode + scrollback search -------------------
+    cx.on_action(|_: &CopyMode, cx: &mut App| toggle_copy_mode(cx));
+    cx.on_action(|_: &SearchScrollback, cx: &mut App| open_scrollback_search(cx));
     cx.on_action(|action: &SelectWindowIndex, cx: &mut App| {
         let index = action.index;
         with_active_state(cx, |s, _cx| {
@@ -935,6 +940,71 @@ fn scroll_active_window_half_page(cx: &mut App, toward_history: bool) {
     });
 }
 
+// ===========================================================================
+// Phase 3 (tmux port) — copy mode + scrollback search
+// ===========================================================================
+
+/// The focused pane of the active session's active window — the pane every
+/// Phase 3 verb operates on (copy mode and search are per-PANE). The resolution
+/// chain is [`scroll_active_window_half_page`]'s: model-resolved
+/// [`effective_pane_id`](nice_model::TermWindow::effective_pane_id), never the
+/// pty map's active-pane mirror, which goes stale the moment focus moves without
+/// re-activating the pill.
+fn focused_pane_key(state: &WindowState) -> Option<(String, String, String)> {
+    let (session_id, term_window_id) = active_session_window(state)?;
+    let pane_id = with_active_window(state, &session_id, &term_window_id, |w| {
+        w.effective_pane_id()
+    })?;
+    Some((session_id, term_window_id, pane_id))
+}
+
+/// `⌃⌘C` — toggle the focused pane's copy mode (D2). Entry seeds the vi cursor
+/// at the terminal cursor; exit clears the selection and the search and returns
+/// the viewport to the bottom (P6). Both halves are the handle's, so this is the
+/// resolution plus one call.
+///
+/// **No alt-screen gate**, unlike the half-page template it otherwise copies:
+/// P10 allows copy mode on the alternate screen, where motions and search work
+/// over the visible grid — selecting what vim or less is showing is a real use.
+///
+/// An open search bar closes with the mode: the mode going false is one of the
+/// three stale conditions the host checks on its next render
+/// ([`search_bar_is_stale`](crate::search_bar::search_bar_is_stale)), which is
+/// what makes this action safe to fire while the bar holds key focus.
+fn toggle_copy_mode(cx: &mut App) {
+    with_active_state(cx, |s, cx| {
+        let Some((session_id, term_window_id, pane_id)) = focused_pane_key(s) else {
+            return;
+        };
+        let Some(handle) = s.ptys.pane_handle(&session_id, &term_window_id, &pane_id) else {
+            return;
+        };
+        handle.update(cx, |h, hcx| {
+            h.toggle_copy_mode();
+            hcx.notify();
+        });
+    });
+}
+
+/// `⌃⌘/` — open the focused pane's scrollback search field, searching BACKWARD
+/// (P7: history-ward is the flagship "find the thing that scrolled past"
+/// direction; in-mode `/` and `?` keep vim's meanings and arrive as a routed
+/// [`SearchRequested`](nice_term_view::TerminalEvent) instead).
+///
+/// [`WindowState::open_search_bar`] does the work — enter copy mode, start a
+/// fresh search (or refocus the identical bar that a click into the pane left
+/// open), open the bar and defer its focus. The deferral is not optional here: a
+/// keymap handler is an App-level closure with no `&mut Window`, so focusing
+/// inline would silently not focus.
+fn open_scrollback_search(cx: &mut App) {
+    with_active_state(cx, |s, cx| {
+        let Some((session_id, term_window_id, pane_id)) = focused_pane_key(s) else {
+            return;
+        };
+        s.open_search_bar(&session_id, &term_window_id, &pane_id, true, cx);
+    });
+}
+
 /// After a sidebar-session cycle on a collapsed sidebar, float the peek overlay so
 /// the user can see which session they're cycling toward (dossier G6). Cleared on
 /// modifier release by [`on_window_modifiers_changed`].
@@ -1087,6 +1157,8 @@ fn shortcut_binding(
         ShortcutAction::SwapPaneDown => Box::new(SwapPaneDown),
         ShortcutAction::SwapPaneUp => Box::new(SwapPaneUp),
         ShortcutAction::SwapPaneRight => Box::new(SwapPaneRight),
+        ShortcutAction::CopyMode => Box::new(CopyMode),
+        ShortcutAction::SearchScrollback => Box::new(SearchScrollback),
         // Handled above — it is the one action that is not one binding.
         ShortcutAction::WindowByIndex => unreachable!("WindowByIndex expands via window_index_bindings"),
     };
@@ -1781,6 +1853,59 @@ mod tests {
             // set is what separates them.
             assert!(bound(&DecreaseFontSize, "cmd--"));
             assert!(bound(&ToggleSidebar, "cmd-b"));
+        });
+    }
+
+    /// Phase 3's two chords reach the live keymap: ⌃⌘C enters copy mode and
+    /// ⌃⌘/ opens the scrollback search — the two remaining directionless pane
+    /// verbs on the bare ⌃⌘ rung.
+    ///
+    /// Board only, same caveat as the Phase 2 test above: whether macOS delivers
+    /// them is the hand feel-check's gate. ⌃⌘C's neighbour risk is ⌘C, which is
+    /// why the plain-⌘ copy chord is asserted untouched here.
+    #[gpui::test]
+    fn phase_three_copy_mode_chords_are_live_in_the_keymap(cx: &mut gpui::TestAppContext) {
+        use gpui::Keystroke;
+
+        cx.update(|cx| {
+            cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("phase3")));
+            rebuild_keymap(cx);
+
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let bound = |action: &dyn Action, chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .bindings_for_action(action)
+                    .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
+            };
+
+            assert!(bound(&CopyMode, "cmd-ctrl-c"), "⌃⌘C enters copy mode");
+            assert!(
+                bound(&SearchScrollback, "cmd-ctrl-/"),
+                "⌃⌘/ opens the scrollback search"
+            );
+
+            // ⌃⌘/ was the reserved table's last `FuturePhase` entry; a chord may
+            // never be both reserved and a default, so it is gone from there.
+            assert_eq!(
+                nice_model::shortcuts::reserved_combo(
+                    &OwnedCombo::from_token("cmd-ctrl-/").expect("token parses")
+                ),
+                None,
+                "⌃⌘/ was promoted out of the reserved table"
+            );
+
+            // ⌘C (terminal copy) is a different modifier set and stays free of
+            // the keymap entirely — the slipped-Ctrl cost D2 accepts is entering
+            // copy mode, never losing a copy.
+            let plain_copy = Keystroke::parse("cmd-c").expect("test chord parses");
+            assert!(
+                keymap
+                    .all_bindings_for_input(std::slice::from_ref(&plain_copy))
+                    .is_empty(),
+                "⌘C stays the terminal's copy, unbound in the keymap"
+            );
         });
     }
 

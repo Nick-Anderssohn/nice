@@ -101,15 +101,21 @@ use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
 // `Dimensions` brings `Term::screen_lines()` into scope for the half-page delta.
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vi_mode::ViMotion;
+use alacritty_terminal::Term;
 use anyhow::Result;
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, Task};
 
 use crate::hyperlink::hyperlink_at_point;
+use crate::search::{
+    flip, run_search, step_origin, viewport_matches_in, SearchState, MAX_VIEWPORT_MATCHES,
+};
 
 use nice_term_core::{
     DamageCallback, DrainWake, ExitStatus, Session, SessionEvent, SharedTerm, SpawnSpec,
@@ -305,6 +311,17 @@ pub enum TerminalEvent {
     /// [`nice_term_core::SessionEvent::CwdChanged`]). Plain [`PathBuf`]; the app
     /// stashes it on its per-pane cwd.
     CwdChanged(PathBuf),
+    /// The pane asked for the scrollback search field (Phase 3, P2): in-mode
+    /// `/` (`backward: false`) or `?` (`backward: true`), pressed while copy
+    /// mode is on.
+    ///
+    /// The query UI lives in the **app** crate (this crate has no `nice-model`
+    /// dependency, and the text-field precedent is `inline_rename`), so the view
+    /// cannot open it directly — it emits this instead and the app routes it
+    /// pane-keyed like every other terminal event. **Not** a core
+    /// [`SessionEvent`] mirror: nothing in `nice-term-core` produces it, so
+    /// [`to_terminal_event`] never returns it.
+    SearchRequested { backward: bool },
 }
 
 /// Translate a core [`SessionEvent`] to its gpui [`TerminalEvent`]. Every
@@ -343,6 +360,20 @@ pub struct TerminalSessionHandle {
     /// line-stepped now; the float offset lets sub-line smooth scroll land later
     /// without a rewrite). See [`take_scroll_steps`].
     scroll_accum: f32,
+    /// The copy-mode selection anchor (Phase 3, P5): the point a `v`/`V`/`⌃v`
+    /// selection was started from, plus the kind it was started as.
+    ///
+    /// alacritty owns the `Selection` itself (and rotates it with the grid), but
+    /// does **not** expose its anchor — and P5's toggle needs it twice: pressing
+    /// the SAME kind again clears the selection, while a DIFFERENT kind rebuilds
+    /// it from the same anchor at the new granularity. `None` whenever no
+    /// copy-mode selection is live.
+    copy_anchor: Option<(Point, SelectionType)>,
+    /// The per-pane scrollback-search sub-state (Phase 3, P1): query, lazily
+    /// compiled matcher, confirmed direction, active match. It has no alacritty
+    /// equivalent (`Term::search_next` is a pure query), so it lives on this
+    /// entity — surviving view unmounts, dying with the pane, never persisted.
+    search: SearchState,
     /// The injected demand-present kick (see [`PresentKick`] + the module docs).
     /// `None` until the app wires a window via [`set_present_kick`]; the entity
     /// works view- and window-independent until then (Stage 2 keeps hidden
@@ -389,6 +420,8 @@ impl TerminalSessionHandle {
                 spec,
                 scrollback_lines,
                 scroll_accum: 0.0,
+                copy_anchor: None,
+                search: SearchState::default(),
                 present_kick: None,
                 drain_signal,
                 _drain: drain,
@@ -428,6 +461,11 @@ impl TerminalSessionHandle {
             .wake_enabled
             .store(self.drain_signal.wake_enabled.load(Ordering::Acquire), Ordering::Release);
         self.session = session;
+        // The old `Term` (and its scrollback) is gone, so any copy-mode state
+        // pointing into it is stale: a respawned pane starts out of copy mode
+        // with no anchor and no search.
+        self.copy_anchor = None;
+        self.search.clear();
         // Future dismissals of this pane respawn a shell too (the command spec is
         // gone once its held pane is dismissed).
         self.spec = shell_spec;
@@ -738,6 +776,301 @@ impl TerminalSessionHandle {
         self.display_offset() == 0
     }
 
+    // ---- Copy mode (Phase 3) --------------------------------------------------
+    //
+    // Copy mode IS `TermMode::VI` (P1) — there is no second Nice-side flag to
+    // drift out of sync, and every motion is alacritty's. This block is the API
+    // over the term lock; the key table that drives it is `input.rs`, the query
+    // UI is the app crate's search bar.
+    //
+    // **Lock discipline** (the `is_alt_screen` / scroll-block rule): alacritty's
+    // `FairMutex` is NOT reentrant, so a method either takes the lock once and
+    // inlines everything it needs, or calls siblings that each take their own —
+    // never a sibling call while holding the lock.
+
+    /// Whether this pane is in copy mode — i.e. the `Term` has `TermMode::VI`
+    /// set. `false` before the session spawns. The single source of truth: every
+    /// gate (key interception, mouse-report suspension, the badge) reads it.
+    pub fn copy_mode_active(&self) -> bool {
+        self.session
+            .term()
+            .map(|term_arc| term_arc.lock().mode().contains(TermMode::VI))
+            .unwrap_or(false)
+    }
+
+    /// Enter copy mode, seeding the vi cursor at the terminal cursor (or the
+    /// viewport's top-left when the terminal cursor is scrolled out of view) —
+    /// alacritty's `toggle_vi_mode` behaviour, P6's "entry seeds the cursor".
+    /// Already in copy mode ⇒ no-op (so a re-entry never re-seeds the cursor out
+    /// from under the user). Caller should `cx.notify()`.
+    pub fn enter_copy_mode(&mut self) {
+        if let Some(term_arc) = self.session.term() {
+            let mut term = term_arc.lock();
+            if !term.mode().contains(TermMode::VI) {
+                term.toggle_vi_mode();
+            }
+        }
+    }
+
+    /// Leave copy mode, returning the pane to live output (P6): clear the
+    /// selection → clear the search → scroll to the bottom → flip VI off. tmux's
+    /// exit-returns-you-to-live behaviour; the search state is dropped so a later
+    /// entry never inherits a stale query or a stale active match.
+    ///
+    /// Safe to call when not in copy mode (it still parks the viewport at the
+    /// bottom and clears any leftovers). Caller should `cx.notify()`.
+    pub fn exit_copy_mode(&mut self) {
+        // Search state is ours, not the Term's — clear it outside the lock.
+        self.search.clear();
+        self.scroll_accum = 0.0;
+        self.copy_anchor = None;
+        if let Some(term_arc) = self.session.term() {
+            exit_copy_mode_in(&mut term_arc.lock());
+        }
+    }
+
+    /// Toggle copy mode, returning whether it is active afterwards — the
+    /// `⌃⌘c` action's behaviour (D2), in one call instead of a read plus a write.
+    pub fn toggle_copy_mode(&mut self) -> bool {
+        if self.copy_mode_active() {
+            self.exit_copy_mode();
+            false
+        } else {
+            self.enter_copy_mode();
+            true
+        }
+    }
+
+    /// Move the vi cursor (D3's `hjkl` / `w b e` / `0 $ ^` / `H M L` / `%` /
+    /// `{ }` — every [`ViMotion`] the library models). No-op unless copy mode is
+    /// on (alacritty enforces that itself), and a live selection follows the
+    /// cursor for free: `vi_motion` calls the library's
+    /// `vi_mode_recompute_selection`, which is the same `update` + `include_all`
+    /// idiom the mouse drag path uses. Caller should `cx.notify()`.
+    pub fn vi_motion(&mut self, motion: ViMotion) {
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().vi_motion(motion);
+        }
+    }
+
+    /// Jump the vi cursor to a **buffer** point, scrolling it into view first
+    /// (the mouse-click-in-copy-mode path, P10). No-op unless copy mode is on.
+    pub fn vi_goto(&mut self, point: Point) {
+        if let Some(term_arc) = self.session.term() {
+            let mut term = term_arc.lock();
+            if term.mode().contains(TermMode::VI) {
+                term.vi_goto_point(point);
+            }
+        }
+    }
+
+    /// The vi cursor's current **buffer** point (negative line = scrollback), or
+    /// `None` if the session has not spawned. Meaningful only while copy mode is
+    /// on; the render path reads the cursor through alacritty's
+    /// `RenderableCursor` instead.
+    pub fn vi_cursor_point(&self) -> Option<Point> {
+        self.session
+            .term()
+            .map(|term_arc| term_arc.lock().vi_mode_cursor.point)
+    }
+
+    /// Page the viewport in copy mode, dragging the vi cursor along so it keeps
+    /// its row on screen — `⌃u`/`⌃d` (`half`) and `⌃f`/`⌃b` (full page), D3.
+    ///
+    /// BOTH halves are needed: `ViModeCursor::scroll` only *computes* the target
+    /// cursor point (it is `#[must_use]` and touches no viewport), and
+    /// `scroll_display` only moves the viewport (clamping the cursor into it).
+    /// Moving the cursor first and scrolling second means the clamp is a no-op
+    /// except at the buffer ends, where it is exactly the right correction.
+    /// No-op unless copy mode is on. Caller should `cx.notify()`.
+    pub fn vi_page(&mut self, toward_history: bool, half: bool) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            vi_page_in(&mut term_arc.lock(), toward_history, half);
+        }
+    }
+
+    /// `g` — jump the vi cursor to the top of the scrollback (the oldest line
+    /// still in history). No-op unless copy mode is on.
+    pub fn vi_top(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            let mut term = term_arc.lock();
+            if term.mode().contains(TermMode::VI) {
+                let point = Point::new(term.topmost_line(), Column(0));
+                term.vi_goto_point(point);
+            }
+        }
+    }
+
+    /// `G` — jump the vi cursor to the terminal cursor's line, i.e. the newest
+    /// output. No-op unless copy mode is on.
+    pub fn vi_bottom(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            let mut term = term_arc.lock();
+            if term.mode().contains(TermMode::VI) {
+                let line = term.grid().cursor.point.line;
+                term.vi_goto_point(Point::new(line, Column(0)));
+            }
+        }
+    }
+
+    /// `v` / `V` / `⌃v` — toggle a copy-mode selection of `ty` at the vi cursor
+    /// (P5, vim's rules):
+    ///
+    /// * no live selection ⇒ start one at the cursor (one cell / line / block),
+    /// * the SAME kind again ⇒ clear it,
+    /// * a DIFFERENT kind ⇒ rebuild from the **same anchor** at the new
+    ///   granularity.
+    ///
+    /// Extension is not this method's job: once a selection is live, every
+    /// [`vi_motion`](Self::vi_motion) extends it through alacritty's own
+    /// recompute. No-op unless copy mode is on. Caller should `cx.notify()`.
+    pub fn toggle_copy_selection(&mut self, ty: SelectionType) {
+        if let Some(term_arc) = self.session.term().cloned() {
+            toggle_copy_selection_in(&mut term_arc.lock(), &mut self.copy_anchor, ty);
+        }
+    }
+
+    /// `y` (and in-mode Enter / ⌘C) — the selected text, or `None` when nothing
+    /// is selected. The copy-mode name for
+    /// [`selection_text`](Self::selection_text); whether the caller then stays in
+    /// the mode (⌘C) or leaves it (`y`, Enter) is P4's call, not this method's.
+    pub fn yank(&self) -> Option<String> {
+        self.selection_text()
+    }
+
+    // ---- Scrollback search (Phase 3, P7/P8) -----------------------------------
+
+    /// Start a fresh search in `backward` (history-ward, `⌃⌘/` and in-mode `?`)
+    /// or forward (in-mode `/`) direction, dropping any previous query. The app's
+    /// search bar calls this as it opens.
+    pub fn begin_search(&mut self, backward: bool) {
+        self.search.restart(if backward {
+            Direction::Left
+        } else {
+            Direction::Right
+        });
+    }
+
+    /// Push the field's current text down as the live query (P8: highlights are
+    /// incremental, so this runs on every keystroke). The regex is compiled
+    /// lazily on first use and an invalid pattern simply matches nothing — a
+    /// half-typed `(foo` must never surface an error. Caller should `cx.notify()`.
+    pub fn set_search_query(&mut self, query: &str) {
+        self.search.set_query(query);
+    }
+
+    /// Enter in the search field: jump to the nearest match and focus it,
+    /// returning whether one was found (P7).
+    ///
+    /// The origin is the **raw** vi cursor — a match under the cursor counts,
+    /// which is what "confirm what you are already looking at" means. `n`/`N`
+    /// deliberately do the opposite (see [`next_match`](Self::next_match)).
+    /// Searching is whole-buffer, so it wraps at the ends.
+    pub fn confirm_search(&mut self) -> bool {
+        let Some(term_arc) = self.session.term().cloned() else {
+            return false;
+        };
+        let direction = self.search.direction();
+        let mut term = term_arc.lock();
+        let origin = term.vi_mode_cursor.point;
+        let found = self
+            .search
+            .with_regex(|regex| run_search(&mut term, regex, origin, direction))
+            .flatten();
+        drop(term);
+        match found {
+            Some(m) => {
+                self.search.set_active_match(m);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `n` — the next match in the confirmed direction. Returns whether one was
+    /// found. Caller should `cx.notify()`.
+    pub fn next_match(&mut self) -> bool {
+        self.search_step(self.search.direction())
+    }
+
+    /// `N` — the next match against the confirmed direction (P7: `N` reverses
+    /// the travel without changing the search's direction).
+    pub fn prev_match(&mut self) -> bool {
+        self.search_step(flip(self.search.direction()))
+    }
+
+    /// Shared `n`/`N` body. The origin is advanced one cell off the active match
+    /// (see [`step_origin`]) — `search_next` accepts a match *at* its origin, so
+    /// stepping from the cursor's own cell would return the active match forever.
+    fn search_step(&mut self, direction: Direction) -> bool {
+        let Some(term_arc) = self.session.term().cloned() else {
+            return false;
+        };
+        let mut term = term_arc.lock();
+        let origin = step_origin(
+            &*term,
+            self.search.active_match(),
+            term.vi_mode_cursor.point,
+            direction,
+        );
+        let found = self
+            .search
+            .with_regex(|regex| run_search(&mut term, regex, origin, direction))
+            .flatten();
+        drop(term);
+        match found {
+            Some(m) => {
+                self.search.set_active_match(m);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop the query, its matcher and the active match, leaving copy mode and
+    /// the cursor exactly where they are (the search-bar Esc path, P7).
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+    }
+
+    /// Whether a search is live — a non-empty query, whether or not it matches
+    /// anything. Drives the badge and the render path's highlight channel.
+    pub fn search_active(&self) -> bool {
+        self.search.is_active()
+    }
+
+    /// The live query for the badge, or `None` when no search is running.
+    pub fn active_search_query(&self) -> Option<&str> {
+        self.search.is_active().then(|| self.search.query())
+    }
+
+    /// The focused match (the one the cursor was last jumped to), if any — the
+    /// render path paints it with the emphasis tint (P8).
+    pub fn active_match(&self) -> Option<Match> {
+        self.search.active_match().cloned()
+    }
+
+    /// Every match inside the viewport grown by `margin` rows, capped at
+    /// [`MAX_VIEWPORT_MATCHES`](crate::search::MAX_VIEWPORT_MATCHES).
+    ///
+    /// Recomputed per frame by design (P8): the grid rotates under a streaming
+    /// pane, so any cached match set would go stale — a viewport-bounded rescan
+    /// is cheaper than the invalidation bookkeeping that would avoid it. Empty
+    /// when no search is live, the query does not compile, or the session has not
+    /// spawned.
+    pub fn viewport_matches(&self, margin: usize) -> Vec<Match> {
+        let Some(term_arc) = self.session.term() else {
+            return Vec::new();
+        };
+        let term = term_arc.lock();
+        self.search
+            .with_regex(|regex| viewport_matches_in(&term, regex, margin, MAX_VIEWPORT_MATCHES))
+            .unwrap_or_default()
+    }
+
     /// The hyperlink under the given **buffer** cell (`buffer_line` is negative
     /// for scrollback), if any: the URL text with trailing punctuation trimmed,
     /// plus the trimmed match range in buffer coordinates for underline painting.
@@ -813,6 +1146,100 @@ fn drag_selection_extend<L: alacritty_terminal::event::EventListener>(
         }
         None => false,
     }
+}
+
+/// Core of [`TerminalSessionHandle::exit_copy_mode`] — P6's ordering, generic
+/// over the `Term` listener so the tests observe the production mutation on a
+/// real `Term<VoidListener>`.
+///
+/// Selection first, then the viewport, then the mode bit: `scroll_display`
+/// recomputes a live selection's end while VI is still set, so clearing the
+/// selection first keeps the exit from dragging a doomed selection down the
+/// buffer on its way out. The search half is the handle's (it is Nice state,
+/// not the `Term`'s) and is cleared before this runs.
+fn exit_copy_mode_in<L: EventListener>(term: &mut Term<L>) {
+    term.selection = None;
+    term.scroll_display(Scroll::Bottom);
+    if term.mode().contains(TermMode::VI) {
+        term.toggle_vi_mode();
+    }
+}
+
+/// Core of [`TerminalSessionHandle::vi_page`]: move the vi cursor by the page
+/// delta, then scroll the viewport by the same delta so the cursor keeps its
+/// row on screen.
+///
+/// A full page is the grid height, a half page reuses [`half_page_lines`] — the
+/// same magnitude the Phase 1 ⌃⌘↑/⌃⌘↓ chords step by, so `⌃u` in copy mode and
+/// `⌃⌘↑` outside it travel identically.
+fn vi_page_in<L: EventListener>(term: &mut Term<L>, toward_history: bool, half: bool) {
+    if !term.mode().contains(TermMode::VI) {
+        return;
+    }
+    let screen_lines = term.screen_lines();
+    let lines = if half {
+        half_page_lines(screen_lines)
+    } else {
+        // Floored at one line for the same reason `half_page_lines` is: a 0-row
+        // grid is reachable mid-resize and must not yield a 0-line page.
+        i32::try_from(screen_lines).unwrap_or(i32::MAX).max(1)
+    };
+    let delta = if toward_history { lines } else { -lines };
+    let cursor = term.vi_mode_cursor.scroll(&*term, delta);
+    term.vi_mode_cursor = cursor;
+    term.scroll_display(Scroll::Delta(delta));
+}
+
+/// Core of [`TerminalSessionHandle::toggle_copy_selection`] — P5's toggle
+/// matrix, with `anchor` as the caller-owned anchor slot (alacritty does not
+/// expose the `Selection`'s own anchor).
+///
+/// "A live selection" is read off the `Term`, not off `anchor`: the `Term` can
+/// drop a selection out from under us (an erase intersecting it, a column
+/// resize, a rotation off the top of history), and after that the next `v`
+/// must start a fresh selection rather than clear a selection that is
+/// already gone.
+fn toggle_copy_selection_in<L: EventListener>(
+    term: &mut Term<L>,
+    anchor: &mut Option<(Point, SelectionType)>,
+    ty: SelectionType,
+) {
+    if !term.mode().contains(TermMode::VI) {
+        return;
+    }
+    let cursor = term.vi_mode_cursor.point;
+    let live = term.selection.is_some();
+    let start = match *anchor {
+        // Same kind again: put the selection away.
+        Some((_, prev)) if live && prev == ty => {
+            term.selection = None;
+            *anchor = None;
+            return;
+        }
+        // Different kind: keep the anchor, rebuild at the new granularity.
+        Some((point, _)) if live => point,
+        // Nothing live (never started, or the Term dropped it): start here.
+        _ => cursor,
+    };
+    *anchor = Some((start, ty));
+    term.selection = Some(copy_mode_selection(ty, start, cursor));
+}
+
+/// The `Selection` a copy-mode `v`/`V`/`⌃v` installs: anchored at `anchor`,
+/// ending at the vi `cursor`.
+///
+/// The `update` is not optional even when the two points coincide. A bare
+/// `Selection::new` is **empty** (both anchors identical, same side), and
+/// alacritty's `vi_mode_recompute_selection` skips empty selections — so a
+/// never-updated `v` would sit dead through every subsequent motion. Updating
+/// the end makes it a live one-cell selection, which is also what vim paints
+/// the instant you press `v`. `include_all` then assigns both endpoint sides
+/// from the direction, the same rule [`selection_sides`] encodes.
+fn copy_mode_selection(ty: SelectionType, anchor: Point, cursor: Point) -> Selection {
+    let mut sel = Selection::new(ty, anchor, Side::Left);
+    sel.update(cursor, Side::Right);
+    sel.include_all();
+    sel
 }
 
 /// Fold a fractional line `delta` into the scroll accumulator `accum`, returning
@@ -1931,5 +2358,314 @@ mod tests {
         // The floor applies to both directions.
         assert_eq!(half_page_delta(1, true), 1);
         assert_eq!(half_page_delta(1, false), -1);
+    }
+
+    // ---- Copy mode (Phase 3) --------------------------------------------------
+    //
+    // Copy mode IS `TermMode::VI` (P1), so these drive a real `Term<VoidListener>`
+    // through the production cores (`exit_copy_mode_in`, `vi_page_in`,
+    // `toggle_copy_selection_in`) and alacritty's own `toggle_vi_mode` /
+    // `vi_motion` — never a mimic. The handle methods around them are the same
+    // code plus a `FairMutex` lock and an `Option` for the unspawned session.
+
+    use alacritty_terminal::term::TermMode;
+    use alacritty_terminal::vi_mode::ViMotion;
+
+    /// Shorthand for a buffer point.
+    fn p(line: i32, column: usize) -> Point {
+        Point::new(Line(line), Column(column))
+    }
+
+    /// A 20x5 grid with content shaped for the motion table:
+    ///
+    /// ```text
+    /// row 0: alpha beta
+    /// row 1:   gamma (delta)
+    /// row 2:
+    /// row 3: omega
+    /// row 4:            <- terminal cursor
+    /// ```
+    ///
+    /// Words with and without semantic escape chars, a bracket pair, a leading
+    /// indent and a blank line — enough to tell `w` from `W` and to give the
+    /// paragraph motions something to find. Copy mode is already on.
+    fn motion_grid() -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(20, 5), VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"alpha beta\r\n  gamma (delta)\r\n\r\nomega\r\n");
+        term.toggle_vi_mode();
+        term
+    }
+
+    /// Entry seeds the vi cursor where alacritty says it should: at the terminal
+    /// cursor when that is visible, at the viewport's top-left when it is not
+    /// (P6's "entry seeds the cursor is library behaviour" — pinned so an
+    /// alacritty bump that changed it would be caught here, not by feel).
+    #[test]
+    fn entering_copy_mode_seeds_the_vi_cursor() {
+        let (mut term, _parser) = numbered_term();
+        let shell_cursor = term.grid().cursor.point;
+        term.toggle_vi_mode();
+        assert!(term.mode().contains(TermMode::VI));
+        assert_eq!(term.vi_mode_cursor.point, shell_cursor, "seeded at the shell cursor");
+
+        // Scrolled far enough that the shell cursor is off-screen: the vi cursor
+        // seeds at the top-left of what the user is actually looking at.
+        super::exit_copy_mode_in(&mut term);
+        term.scroll_display(Scroll::Delta(10));
+        term.toggle_vi_mode();
+        assert_eq!(term.vi_mode_cursor.point, p(-10, 0), "seeded at the viewport top-left");
+    }
+
+    /// P6's exit ordering, observed through what it leaves behind: no selection,
+    /// viewport parked at the bottom, VI off. The selection must be cleared
+    /// BEFORE the scroll — `scroll_display` recomputes a live selection's end
+    /// while VI is still set, so the wrong order would drag the selection down
+    /// the buffer on the way out instead of dropping it.
+    #[test]
+    fn exiting_copy_mode_clears_the_selection_and_returns_to_live_output() {
+        let (mut term, _parser) = numbered_term();
+        term.scroll_display(Scroll::Delta(6));
+        term.toggle_vi_mode();
+        let mut anchor = None;
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        term.vi_motion(ViMotion::Down);
+        assert!(term.selection.is_some(), "a live selection to clear");
+        assert_eq!(term.grid().display_offset(), 6, "parked in scrollback");
+
+        super::exit_copy_mode_in(&mut term);
+        assert!(term.selection.is_none(), "selection cleared");
+        assert_eq!(term.grid().display_offset(), 0, "back at the live bottom");
+        assert!(!term.mode().contains(TermMode::VI), "VI off");
+    }
+
+    /// Exit is idempotent: calling it on a pane that is not in copy mode still
+    /// parks the viewport at the bottom and leaves VI off — it must never
+    /// *enter* the mode by toggling a bit that was already clear.
+    #[test]
+    fn exiting_when_not_in_copy_mode_never_toggles_the_mode_on() {
+        let (mut term, _parser) = numbered_term();
+        term.scroll_display(Scroll::Delta(4));
+        super::exit_copy_mode_in(&mut term);
+        assert!(!term.mode().contains(TermMode::VI));
+        assert_eq!(term.grid().display_offset(), 0);
+    }
+
+    /// Every D3 motion, on the seeded grid, landing where vim lands. The mapping
+    /// from keys to these variants is Slice 2's table; this pins the variants
+    /// themselves at this alacritty pin.
+    #[test]
+    fn vi_motions_move_the_cursor_the_way_vim_does() {
+        let mut term = motion_grid();
+        // (start, motion, expected end)
+        let cases: &[(Point, ViMotion, Point)] = &[
+            // hjkl
+            (p(1, 3), ViMotion::Up, p(0, 3)),
+            (p(1, 3), ViMotion::Down, p(2, 3)),
+            (p(1, 3), ViMotion::Left, p(1, 2)),
+            (p(0, 3), ViMotion::Right, p(0, 4)),
+            // 0 / $ / ^
+            (p(1, 5), ViMotion::First, p(1, 0)),
+            (p(0, 2), ViMotion::Last, p(0, 9)),
+            (p(1, 10), ViMotion::FirstOccupied, p(1, 2)),
+            // H / M / L — first occupied cell of the top / middle / bottom row.
+            (p(3, 4), ViMotion::High, p(0, 0)),
+            (p(3, 4), ViMotion::Middle, p(1, 2)),
+            (p(0, 0), ViMotion::Low, p(4, 0)),
+            // w / b / e (semantic: "(" and ")" are word boundaries)
+            (p(0, 0), ViMotion::SemanticRight, p(0, 6)),
+            (p(0, 6), ViMotion::SemanticLeft, p(0, 0)),
+            (p(0, 0), ViMotion::SemanticRightEnd, p(0, 4)),
+            (p(0, 9), ViMotion::SemanticLeftEnd, p(0, 4)),
+            // W (whitespace-only words): from "(" it skips the whole "(delta)"
+            // and the blank row, where semantic `w` would stop at "delta".
+            (p(1, 8), ViMotion::SemanticRight, p(1, 9)),
+            (p(1, 8), ViMotion::WordRight, p(3, 0)),
+            (p(3, 0), ViMotion::WordLeft, p(1, 8)),
+            // % — matching bracket, both ways.
+            (p(1, 8), ViMotion::Bracket, p(1, 14)),
+            (p(1, 14), ViMotion::Bracket, p(1, 8)),
+            // { / } — the blank row 2 is the paragraph break.
+            (p(0, 0), ViMotion::ParagraphDown, p(2, 0)),
+            (p(3, 0), ViMotion::ParagraphUp, p(0, 0)),
+        ];
+
+        for &(from, motion, expected) in cases {
+            term.vi_goto_point(from);
+            term.vi_motion(motion);
+            assert_eq!(term.vi_mode_cursor.point, expected, "{motion:?} from {from:?}");
+        }
+    }
+
+    /// Motions are inert while copy mode is off — the guarantee that lets the
+    /// view fall through to the pty for a bare `h` (P3).
+    #[test]
+    fn vi_motions_are_inert_outside_copy_mode() {
+        let mut term = motion_grid();
+        super::exit_copy_mode_in(&mut term);
+        let before = term.vi_mode_cursor.point;
+        term.vi_motion(ViMotion::Up);
+        term.vi_motion(ViMotion::WordRight);
+        assert_eq!(term.vi_mode_cursor.point, before);
+    }
+
+    /// `⌃u`/`⌃d`/`⌃f`/`⌃b`: the viewport pages AND the cursor keeps its row on
+    /// screen. Doing only one of the two is the bug this pins — a bare
+    /// `scroll_display` would clamp the cursor to the viewport edge, and a bare
+    /// `ViModeCursor::scroll` would move the cursor with no scroll at all.
+    #[test]
+    fn paging_moves_the_viewport_and_carries_the_cursor() {
+        // Deep history on purpose: `numbered_term`'s 17 scrollback rows are
+        // shallower than the two pages this walks, and a clamp at the top of
+        // history would hide the very thing being asserted.
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        for i in 0..200 {
+            parser.advance(&mut term, format!("line {i}\r\n").as_bytes());
+        }
+        term.toggle_vi_mode();
+        // Halfway down a 24-row screen, parked at the bottom.
+        term.vi_goto_point(p(12, 0));
+        assert_eq!(term.grid().display_offset(), 0);
+
+        super::vi_page_in(&mut term, true, true);
+        assert_eq!(term.grid().display_offset(), 12, "half page toward history");
+        assert_eq!(term.vi_mode_cursor.point.line, Line(0), "cursor kept its screen row");
+
+        super::vi_page_in(&mut term, true, false);
+        assert_eq!(term.grid().display_offset(), 12 + 24, "full page toward history");
+        assert_eq!(term.vi_mode_cursor.point.line, Line(-24), "cursor kept its screen row");
+
+        super::vi_page_in(&mut term, false, false);
+        assert_eq!(term.grid().display_offset(), 12, "full page back toward the bottom");
+        assert_eq!(term.vi_mode_cursor.point.line, Line(0));
+    }
+
+    /// Paging is a copy-mode verb only: outside the mode the ⌃⌘↑/⌃⌘↓ chords own
+    /// the viewport, and these keys belong to the pty.
+    #[test]
+    fn paging_is_inert_outside_copy_mode() {
+        let (mut term, _parser) = numbered_term();
+        super::vi_page_in(&mut term, true, true);
+        assert_eq!(term.grid().display_offset(), 0);
+    }
+
+    /// `g` / `G`: the ends of the buffer.
+    #[test]
+    fn top_and_bottom_jump_to_the_ends_of_the_scrollback() {
+        let (mut term, _parser) = numbered_term();
+        term.toggle_vi_mode();
+
+        let top = Point::new(term.topmost_line(), Column(0));
+        term.vi_goto_point(top);
+        assert_eq!(term.vi_mode_cursor.point, p(-17, 0), "g — oldest line in history");
+        assert_eq!(row_text(&term, -17), "line 0");
+
+        let bottom_line = term.grid().cursor.point.line;
+        term.vi_goto_point(Point::new(bottom_line, Column(0)));
+        assert_eq!(term.vi_mode_cursor.point, p(23, 0), "G — the terminal cursor's line");
+        assert_eq!(term.grid().display_offset(), 0, "and the viewport followed it back");
+    }
+
+    /// P5's toggle matrix, in one pass: nothing → a live one-cell selection at
+    /// the cursor; a DIFFERENT kind → same anchor, new granularity; the SAME
+    /// kind → cleared. Plus the load-bearing part in the middle: motions extend
+    /// the selection through alacritty's own recompute, which only happens
+    /// because the fresh selection is non-empty.
+    #[test]
+    fn copy_selection_toggles_vim_style() {
+        let mut term = motion_grid();
+        let mut anchor = None;
+
+        // (1) Nothing live: start at the cursor, one cell, immediately painted.
+        term.vi_goto_point(p(0, 2));
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        assert_eq!(anchor, Some((p(0, 2), SelectionType::Simple)));
+        assert_eq!(drag_range(&term), (p(0, 2), p(0, 2)), "the cursor cell is selected");
+
+        // Motions extend it; the anchor stays put.
+        term.vi_motion(ViMotion::Right);
+        term.vi_motion(ViMotion::Right);
+        assert_eq!(drag_range(&term), (p(0, 2), p(0, 4)));
+
+        // (2) A different kind: same anchor, line granularity.
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Lines);
+        assert_eq!(anchor, Some((p(0, 2), SelectionType::Lines)));
+        assert_eq!(drag_range(&term), (p(0, 0), p(0, 19)), "the whole row");
+
+        // (3) The same kind again: put it away.
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Lines);
+        assert!(term.selection.is_none());
+        assert_eq!(anchor, None);
+    }
+
+    /// `⌃v` is the same toggle at block granularity — the one `SelectionType`
+    /// variant Nice had never used before Phase 3.
+    #[test]
+    fn block_selection_selects_a_column_range() {
+        let mut term = motion_grid();
+        let mut anchor = None;
+        term.vi_goto_point(p(0, 2));
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Block);
+        term.vi_motion(ViMotion::Down);
+        term.vi_motion(ViMotion::Right);
+
+        let range = term.selection.as_ref().unwrap().to_range(&term).expect("non-empty");
+        assert!(range.is_block, "⌃v selects a block");
+        assert_eq!((range.start, range.end), (p(0, 2), p(1, 3)));
+    }
+
+    /// The `Term` can drop a selection out from under copy mode (here an ED All
+    /// clear). The next `v` must START a fresh selection, not "clear" one that
+    /// is already gone — so liveness is read off the `Term`, never off the
+    /// anchor slot alone.
+    #[test]
+    fn a_dropped_selection_makes_the_next_toggle_start_a_fresh_one() {
+        let (mut term, mut parser) = numbered_term();
+        term.toggle_vi_mode();
+        let mut anchor = None;
+        term.vi_goto_point(p(2, 0));
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        term.vi_motion(ViMotion::Right);
+        assert!(term.selection.is_some());
+
+        parser.advance(&mut term, b"\x1b[2J");
+        assert!(term.selection.is_none(), "ED All dropped it");
+
+        term.vi_goto_point(p(4, 1));
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        assert_eq!(anchor, Some((p(4, 1), SelectionType::Simple)), "re-anchored, not cleared");
+        assert!(term.selection.is_some());
+    }
+
+    /// Selection toggling is copy-mode-only, like the motions.
+    #[test]
+    fn selection_toggle_is_inert_outside_copy_mode() {
+        let mut term = motion_grid();
+        super::exit_copy_mode_in(&mut term);
+        let mut anchor = None;
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        assert!(term.selection.is_none());
+        assert_eq!(anchor, None);
+    }
+
+    /// `y` over a selection that starts in scrollback and ends on screen — the
+    /// flagship copy-mode case (grab the thing that scrolled past). The text
+    /// comes from alacritty's `selection_to_string`, the same source ⌘C uses.
+    #[test]
+    fn yank_reads_text_across_the_history_boundary() {
+        let (mut term, _parser) = numbered_term();
+        term.toggle_vi_mode();
+        let mut anchor = None;
+        // Line(-1) is "line 16", the last history row; Line(0) is "line 17".
+        assert_eq!(row_text(&term, -1), "line 16");
+        assert_eq!(row_text(&term, 0), "line 17");
+
+        term.vi_goto_point(p(-1, 0));
+        super::toggle_copy_selection_in(&mut term, &mut anchor, SelectionType::Simple);
+        term.vi_motion(ViMotion::Down);
+        term.vi_motion(ViMotion::Last);
+
+        assert_eq!(term.selection_to_string().as_deref(), Some("line 16\nline 17"));
     }
 }

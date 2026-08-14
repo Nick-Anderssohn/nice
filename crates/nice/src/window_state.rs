@@ -84,6 +84,7 @@ use nice_term_view::TerminalEvent;
 
 use crate::confirmation_modal::ConfirmationModal;
 use crate::restore::WindowSeed;
+use crate::search_bar::SearchBarState;
 use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, SocketMessage};
 use crate::window_strip_actions::{ModelWindowStripActions, WindowStripActions};
 use crate::pty_manager::{
@@ -535,6 +536,17 @@ pub(crate) struct WindowState {
     /// window has painted once, which the readers treat as "no px context"
     /// (split at an even ratio, resize no-op) rather than guessing.
     pane_content_size: Option<(f32, f32)>,
+    /// Phase 3: the open scrollback-search field, if any — at most one per
+    /// window, keyed to the pane it searches (see
+    /// [`SearchBarState`](crate::search_bar::SearchBarState)).
+    ///
+    /// It lives on the window state rather than on the host view for the same
+    /// reason [`pane_content_size`](Self::pane_content_size) does: the two ways
+    /// it opens are an App-level keymap handler (`⌃⌘/`) and an entity
+    /// subscription callback (in-mode `/` / `?`), and neither has a `&mut
+    /// Window` or a view to write to. `WindowHostView` reads it back on the next
+    /// render and mounts the field over the pane it names.
+    search_bar: Option<SearchBarState>,
 }
 
 /// Selftest instrumentation: a process-global count of demand-present kicks fired
@@ -614,6 +626,7 @@ impl WindowState {
             fork_job_probe: Box::new(probe_fork_job),
             window_host: None,
             pane_content_size: None,
+            search_bar: None,
         }
     }
 
@@ -724,6 +737,106 @@ impl WindowState {
     /// The px context the pane actions and the divider drag measure against.
     pub(crate) fn pane_content_size(&self) -> Option<(f32, f32)> {
         self.pane_content_size
+    }
+
+    // ---- Phase 3: the scrollback search bar (P2/P7) --------------------------
+
+    /// Open the search field over `pane`, replacing any bar that was open
+    /// elsewhere. Both entry points land here — the `⌃⌘/` keymap action and the
+    /// in-mode `/` / `?` keys, which arrive as a routed
+    /// [`TerminalEvent::SearchRequested`].
+    ///
+    /// Opening a search ENTERS copy mode (P7: highlights are live while typing,
+    /// and D1 makes search "copy mode with a query"), then starts a fresh search
+    /// in `backward`'s direction — dropping any previous query, so a re-open
+    /// never inherits the last one's matches.
+    ///
+    /// **Unless the very same search is already open**: a click into the pane
+    /// leaves the bar open and merely unfocused, and P7 says `⌃⌘/` (or in-mode
+    /// `/` / `?`) REFOCUSES that bar. So when a bar is already open over this
+    /// pane pointing the same way, this is the refocus — the editor, the live
+    /// query, its highlights and the active match all stay. A bar over another
+    /// pane, or one pointing the other way, is a different search and is
+    /// rebuilt.
+    ///
+    /// Key focus is moved by a DEFERRED re-entry through the window handle. It
+    /// cannot be done inline: neither caller has a `&mut Window`, and focusing
+    /// from here would silently do nothing (P2's note). A `WindowState` with no
+    /// stashed handle — unit tests, headless scenarios — simply opens the bar
+    /// without focusing it.
+    pub(crate) fn open_search_bar(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        backward: bool,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        let Some(handle) = self.ptys.pane_handle(session_id, term_window_id, pane_id) else {
+            return;
+        };
+        // Resolved (and the handle cloned out) before the borrow of `self` is
+        // needed again below.
+        let reopened = self.search_bar.as_ref().and_then(|bar| {
+            (bar.pane_key() == (session_id, term_window_id, pane_id) && bar.backward == backward)
+                .then(|| (bar.focus.clone(), bar.query()))
+        });
+        handle.update(cx, |h, hcx| {
+            // Idempotent, and the safety net for the one path that can leave a
+            // bar open over a pane that already left the mode: the close is a
+            // render-time sweep, and nothing has painted since.
+            h.enter_copy_mode();
+            match reopened.as_ref() {
+                // Re-push what the field still holds rather than restart: with
+                // an unchanged query this is a no-op that keeps the compiled
+                // matcher and the active match, and after a copy-mode exit
+                // cleared the engine's copy it puts the highlights back.
+                Some((_, query)) => h.set_search_query(query),
+                None => h.begin_search(backward),
+            }
+            hcx.notify();
+        });
+        let focus = match reopened {
+            Some((focus, _)) => focus,
+            None => {
+                let focus = cx.focus_handle();
+                self.search_bar = Some(SearchBarState::new(
+                    focus.clone(),
+                    backward,
+                    session_id,
+                    term_window_id,
+                    pane_id,
+                ));
+                focus
+            }
+        };
+        if let Some(window) = self.window_handle {
+            cx.defer(move |app| {
+                let _ = window.update(app, |_root, window, app| {
+                    window.focus(&focus, app);
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    /// Close the search field, returning the bar that was open (if any). The
+    /// pane's copy mode and its live query are left alone — Esc closes the field
+    /// and leaves the user IN copy mode where they stand (P7); the Esc after
+    /// that is the one that exits the mode and clears the search (P6).
+    pub(crate) fn close_search_bar(&mut self) -> Option<SearchBarState> {
+        self.search_bar.take()
+    }
+
+    /// The open search field, if any.
+    pub(crate) fn search_bar(&self) -> Option<&SearchBarState> {
+        self.search_bar.as_ref()
+    }
+
+    /// The open search field, mutably — the key handler edits its editor
+    /// through this.
+    pub(crate) fn search_bar_mut(&mut self) -> Option<&mut SearchBarState> {
+        self.search_bar.as_mut()
     }
 
     /// Mirror the model's active session into the multi-selection — the Rust analog of
@@ -925,6 +1038,15 @@ impl WindowState {
                 else {
                     return;
                 };
+                // Phase 3: in-mode `/` and `?` ask the app crate to open the
+                // search field over THIS pane (P2 — the query UI cannot live in
+                // the view crate). Routed here rather than in
+                // `route_terminal_event` because opening the bar is window-state
+                // work, not pty-model routing.
+                if let TerminalEvent::SearchRequested { backward } = event {
+                    ws.open_search_bar(&t, &term_window_id, &pane, *backward, cx);
+                    return;
+                }
                 let workspace = &mut ws.workspace;
                 let selection = &mut ws.selection;
                 let routed = ws.ptys.route_terminal_event(

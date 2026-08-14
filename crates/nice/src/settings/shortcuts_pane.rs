@@ -1036,10 +1036,11 @@ mod tests {
     }
 
     /// One chord per group, spelled out — the guard is not just "whatever the
-    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS, ⌃⌘/ future).
-    /// The future-phase example used to be ⌃⌘Z; Phase 2 spent that chord on Zoom
-    /// Pane, which is exactly why a reserved entry has to disappear when its
-    /// phase claims it.
+    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS). The
+    /// future-phase group has no example left: it held ⌃⌘Z until Phase 2 spent
+    /// it on Zoom Pane and ⌃⌘/ until Phase 3 spent it on Search Scrollback,
+    /// which is exactly why a reserved entry has to disappear when its phase
+    /// claims it (see `phase_three_freed_the_search_chord` below).
     #[test]
     fn reserved_groups_are_each_covered() {
         let refuse = |token: &str, modifiers, key| {
@@ -1067,9 +1068,25 @@ mod tests {
             refuse("cmd-ctrl-space", Modifiers::CONTROL_COMMAND, "space"),
             "Reserved: the macOS emoji picker"
         );
+    }
+
+    /// Phase 3's promotion, at the recorder: ⌃⌘/ was the last `FuturePhase`
+    /// entry and is now Search Scrollback's default, so capturing it reports an
+    /// ordinary conflict the user can Replace instead of a flat refusal.
+    #[test]
+    fn phase_three_freed_the_search_chord() {
         assert_eq!(
-            refuse("cmd-ctrl-/", Modifiers::CONTROL_COMMAND, "/"),
-            "Reserved for a future Nice feature"
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                Modifiers::CONTROL_COMMAND,
+                "/",
+                false,
+                &default_bindings_vec(),
+            ),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-/"),
+                other: ShortcutAction::SearchScrollback,
+            }
         );
     }
 
@@ -1111,11 +1128,8 @@ mod tests {
                 other: ShortcutAction::ResizePaneLeft,
             },
         );
-        // ⌃⌘/ is the one still held for a later phase.
-        assert!(matches!(
-            capture(Modifiers::CONTROL_COMMAND, "/"),
-            CaptureOutcome::Reserved { .. }
-        ));
+        // ⌃⌘/ was the last chord still held for a later phase; Phase 3 spent it
+        // on Search Scrollback (`phase_three_freed_the_search_chord` above).
     }
 
     /// The guard runs BEFORE the conflict check. No SHIPPED default sits on a

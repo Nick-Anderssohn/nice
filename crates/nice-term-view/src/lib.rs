@@ -43,6 +43,12 @@
 //!   the pane mounted + readable, writes the dim in-buffer footer, and a
 //!   single-pane-era dismiss respawns a fresh shell). Both are driven off the R3
 //!   [`TerminalEvent`] stream the [`TerminalView`] now subscribes to.
+//! * [`search`] — the Phase 3 scrollback-search engine behind copy mode: the
+//!   per-pane [`SearchState`] (query, lazily compiled `RegexSearch`, confirmed
+//!   direction, active match), the viewport-bounded match scan the render path
+//!   recomputes per frame, and the `n`/`N` origin advance that keeps a step from
+//!   re-finding the match it is standing on. Copy mode itself is alacritty's
+//!   `TermMode::VI`, driven through [`TerminalSessionHandle`]'s copy-mode API.
 //!
 //! ## What this crate covers so far
 //!
@@ -81,6 +87,7 @@ pub mod hyperlink;
 pub mod input;
 pub mod mouse;
 pub mod overlay;
+pub mod search;
 pub mod session_handle;
 pub mod theme;
 pub mod view;
@@ -104,9 +111,10 @@ pub use font::{
 pub use hyperlink::{UrlOpener, UrlRegexCache, MAX_SEARCH_LINES, URL_REGEX};
 pub use input::{KeyCodeProbe, TermInputHandler};
 pub use overlay::{
-    held_exit_footer, HeldPane, LaunchDeadline, LaunchDeadlineFuture, LaunchOverlay,
-    DEFAULT_LAUNCH_OVERLAY_GRACE, HELD_FOOTER_LABEL,
+    copy_mode_badge_label, held_exit_footer, HeldPane, LaunchDeadline, LaunchDeadlineFuture,
+    LaunchOverlay, COPY_BADGE_QUERY_CHARS, DEFAULT_LAUNCH_OVERLAY_GRACE, HELD_FOOTER_LABEL,
 };
+pub use search::{SearchState, MAX_VIEWPORT_MATCHES, VIEWPORT_MATCH_MARGIN};
 pub use session_handle::{PresentKick, TerminalEvent, TerminalSessionHandle};
 pub use theme::{TerminalColor, TerminalTheme};
 pub use view::TerminalView;

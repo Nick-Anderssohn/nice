@@ -154,7 +154,7 @@
 <header>
   <h1>Nice × tmux port</h1>
   <p class="sub">Bringing tmux's session / window / pane model into Nice, natively.</p>
-  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-12</span></p>
+  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-13</span></p>
 </header>
 
 <div class="overall">
@@ -255,12 +255,17 @@
     <h2>Phase 3 — copy mode &amp; search</h2><span class="effort">M</span>
     <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
   </div>
-  <p class="blurb">Keyboard-driven scrollback on top of alacritty primitives already linked.</p>
+  <p class="blurb">Keyboard-driven scrollback on top of alacritty primitives already linked. Per-pane: copy mode <em>is</em> <code>TermMode::VI</code>, and search is copy mode with a query (D1).</p>
   <ul class="tasks">
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Copy-mode state machine; vi motions over scrollback</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Keyboard selection via existing handle API + copy</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘/</kbd> search overlay (InlineRename pattern) + <code>RegexSearch</code> over scrollback</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Match highlighting in <code>element.rs</code>; n/N navigation</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Copy-mode engine on <code>TerminalSessionHandle</code>: enter/exit/toggle, every <code>ViMotion</code>, <kbd>g</kbd>/<kbd>G</kbd>, half- and full-page paging <span class="note">P6 exit order — clear selection, clear search, scroll to bottom, VI off</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Keyboard selection via the existing selection API: <kbd>v</kbd>/<kbd>V</kbd>/<kbd>^v</kbd> toggle char/line/block off a tracked anchor, motions extend it, <kbd>y</kbd> yanks and exits <span class="note">P5; ⌘C copies and stays in the mode</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">In-mode key table plus the four extra gates <span class="note">P4: key-up release reports, the three IME callbacks, bare-modifier reports and mouse reporting are suspended too — <code>on_key_down</code> is not the only pty writer</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><kbd>^⌘/</kbd> search field (the inline-rename editor, re-dressed) + <code>RegexSearch</code> over scrollback <span class="note">P7: backward by default, smart-case, wrapping; Esc closes the field and leaves you in copy mode</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Match highlighting in <code>element.rs</code> (a third <code>SnapshotKey</code> channel, recomputed per frame) + <kbd>n</kbd>/<kbd>N</kbd> over the full scrollback <span class="note">P8: tints derived from the selection colour and the caret accent, no new theme keys in v1</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Block vi cursor + a top-right <code>COPY</code> badge naming the live query <span class="note">P9: <code>vi_mode_cursor_style</code> pinned so a DECSCUSR beam can't hide the keyboard cursor</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Two rebindable actions — <kbd>^⌘c</kbd> Copy Mode, <kbd>^⌘/</kbd> Search Scrollback <span class="note">34 → 36 actions; <code>RESERVED_COMBOS</code> 9 → 8, spending its last <code>FuturePhase</code> entry</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Live gate: the <code>copy-mode</code> self-test scenario (motions, paging, yank, search confirm and n/N asserted on their effect AND on zero pty bytes)</span></li>
+    <li data-status="deferred"><span class="chip">deferred</span><span class="t">Match counter in the search field — <span class="note">P7: needs a full-scrollback walk per keystroke; revisit if its absence grates</span></span></li>
   </ul>
 </section>
 
@@ -329,7 +334,7 @@
     <li><strong>D1</strong> — <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> become the <code>PrevWindow</code>/<code>NextWindow</code> <em>defaults</em> (frozen ids unchanged); <kbd>⌘⌥←</kbd>/<kbd>⌘⌥→</kbd> are freed, no dual-chord installs — <em>chords revised by the hjkl ladder below; the ids-stay-frozen rule still holds</em> <span class="d">2026-08-11</span></li>
     <li><strong>D2</strong> — <kbd>^⌘1-9</kbd> is ONE rebindable row (<code>windowByIndex</code>): the recorded modifier set applies to every digit; nine separate rows rejected <span class="d">2026-08-11</span></li>
     <li><strong>D3</strong> — the <code>FocusPaneLeft/Down/Up/Right</code> actions are named for their Phase 2 spatial meaning, so Phase 2 swaps handlers only — <em>the ladder moved them to <kbd>^⌘⇧hjkl</kbd>, where all four are inert; nothing aliases the pill strip any more</em> <span class="d">2026-08-11</span></li>
-    <li><strong>D4</strong> — the future-phase chords (<kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd>) go in the reserved-combo guard rather than shipping as no-op actions — <em>Phase 2 claimed <kbd>^⌘z</kbd> and the eight ladder rungs and freed <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd>, taking the table 20 → 9; only <kbd>^⌘/</kbd> is still held, for Phase 3</em> <span class="d">2026-08-11</span></li>
+    <li><strong>D4</strong> — the future-phase chords (<kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd>) go in the reserved-combo guard rather than shipping as no-op actions — <em>Phase 2 claimed <kbd>^⌘z</kbd> and the eight ladder rungs and freed <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd>, taking the table 20 → 9; Phase 3 then spent the last one, <kbd>^⌘/</kbd>, taking it to 8 with no <code>FuturePhase</code> group left</em> <span class="d">2026-08-11</span></li>
     <li><strong>D5</strong> — the hint overlay appears after ~200 ms of held <kbd>^⌘</kbd> and hides instantly on release or any change to the held set <span class="d">2026-08-11</span></li>
     <li><strong>hjkl ladder</strong> (revises D1/D3 post-ship) — the modifier set selects the verb: bare <kbd>^⌘</kbd> navigates containers (<kbd>h</kbd>/<kbd>l</kbd> pills, <kbd>j</kbd>/<kbd>k</kbd> sessions), <kbd>^⌘⇧</kbd> moves pane focus, <kbd>^⌥⌘</kbd> resizes, <kbd>^⌥⌘⇧</kbd> (Hyper) swaps. Sessions join the bare layer; <kbd>^⌘Space</kbd> for swap was rejected (macOS emoji picker, and Space is not a modifier). <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> and the <kbd>⌘⌥</kbd> arrows are freed <span class="d">2026-08-11</span></li>
     <li><strong>Half-page scroll moved to <kbd>^⌘↑</kbd>/<kbd>^⌘↓</kbd></strong> — real <kbd>^⌘D</kbd> keydowns are swallowed by the macOS dictionary hotkey before the app sees them (found in hand-testing; the gpui-level scenario injects downstream of the OS intercept and cannot detect it). <kbd>^⌘u</kbd>/<kbd>^⌘d</kbd> are freed, and <kbd>^⌘D</kbd> is a pure reserved entry again <span class="d">2026-08-11</span></li>
@@ -342,6 +347,11 @@
     <li><strong>Pane identity stays off the frozen surfaces</strong> — pane ids are internal strings; every pane's pty keeps the pill's <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code>, so <code>paneId</code> permanently means "pill" and socket traffic still routes there. Pane-level addressing waits for Phase 5 <span class="d">2026-08-12</span></li>
     <li><strong>Zoom is transient, focus does not wrap</strong> — <code>zoomed</code> is never persisted and any structural or focus change un-zooms first (tmux <code>select-pane</code> behavior); directional pane focus stops at the edges rather than wrapping or falling through to pill nav, since bare <kbd>^⌘h</kbd>/<kbd>^⌘l</kbd> is how you leave the pill <span class="d">2026-08-12</span></li>
     <li><strong>Accepted wart</strong> — after break-pane the moved pty's <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code> still name the source pill (env is fixed at fork), so socket traffic from that shell targets the old pill. Same class of staleness as moving any live process <span class="d">2026-08-12</span></li>
+    <li><strong>Phase 3 D1</strong> — one integrated mode: search is "copy mode with a query". Confirming a search jumps the keyboard cursor to the match and leaves you IN copy mode, so search → land → <kbd>v</kbd> → <kbd>y</kbd> is one flow. tmux's model <span class="d">2026-08-13</span></li>
+    <li><strong>Phase 3 D2</strong> — <kbd>^⌘c</kbd> enters copy mode directly, beside the other pane verbs. Accepted cost: it neighbours ⌘C copy, so a slipped Ctrl enters the mode instead of copying — Esc recovers <span class="d">2026-08-13</span></li>
+    <li><strong>Phase 3 D3</strong> — the FULL vi key set, not a minimal one: the library models every motion, so the cost over a subset is key-table size, not machinery <span class="d">2026-08-13</span></li>
+    <li><strong>Copy mode is orthogonal to every Phase 2 gate</strong> (P10) — it never counts as busy, never blocks close, works on the alternate screen and on HELD panes (the copy gate runs before the held gate), and SUSPENDS mouse reporting so wheel/click/drag act locally, the way tmux captures the mouse in copy mode <span class="d">2026-08-13</span></li>
+    <li><strong>No match counter in v1</strong> (P7) and <strong>no new theme keys</strong> (P8) — a counter needs a full-scrollback walk per keystroke, and the match tints derive from the selection colour and the caret accent. Both revisit at the feel-check <span class="d">2026-08-13</span></li>
   </ul>
 </section>
 
@@ -362,7 +372,8 @@
       <tr><td><kbd>^⌘-</kbd> / <kbd>^⌘\</kbd></td><td>Split down / split right — divider mnemonics (D2). <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> are freed</td><td>2 ✓</td></tr>
       <tr><td><kbd>^⌘b</kbd></td><td>Break the focused shell pane out into its own pill (refused on the Claude pane)</td><td>2 ✓</td></tr>
       <tr><td><kbd>^⌘↑</kbd> / <kbd>^⌘↓</kbd></td><td>Half-page scrollback up / down (inert on the alt screen)</td><td>1 ✓</td></tr>
-      <tr><td><kbd>^⌘/</kbd></td><td>Scrollback search</td><td>3</td></tr>
+      <tr><td><kbd>^⌘c</kbd></td><td>Copy Mode — vi keys over the focused pane's scrollback (toggle; Esc or <kbd>q</kbd> also leaves)</td><td>3 ✓</td></tr>
+      <tr><td><kbd>^⌘/</kbd></td><td>Search Scrollback — open the focused pane's search field, searching toward history</td><td>3 ✓</td></tr>
       <tr><td><em>hold</em> <kbd>^⌘</kbd></td><td>Window-index badges on the pills while held (~200 ms)</td><td>1 ✓</td></tr>
     </tbody>
   </table>

@@ -231,9 +231,72 @@ pub fn held_exit_footer(name: &str, status: ExitStatus) -> String {
     format!("\r\n\x1b[2m[{name} exited ({status_str})]\x1b[0m\r\n")
 }
 
+/// How many characters of a live search query the copy-mode badge shows before
+/// it elides. A long query would otherwise stretch the badge across the pane and
+/// cover the very output the user is searching through.
+pub const COPY_BADGE_QUERY_CHARS: usize = 24;
+
+/// The copy-mode badge's text (Phase 3, P9): `COPY` on its own, or `COPY` plus
+/// the live search query, elided at [`COPY_BADGE_QUERY_CHARS`].
+///
+/// Pure so the wording and the eliding are testable without a window — the paint
+/// (a small top-right pill) is [`TerminalView`](crate::TerminalView)'s. A
+/// live-but-blank query cannot occur (the handle calls a search active only
+/// while the query is non-empty), but it degrades to the bare `COPY` rather than
+/// leaving a dangling separator.
+pub fn copy_mode_badge_label(query: Option<&str>) -> String {
+    match query.map(str::trim).filter(|q| !q.is_empty()) {
+        None => "COPY".to_string(),
+        Some(query) => {
+            let mut shown: String = query.chars().take(COPY_BADGE_QUERY_CHARS).collect();
+            if query.chars().nth(COPY_BADGE_QUERY_CHARS).is_some() {
+                shown.push('…');
+            }
+            format!("COPY  {shown}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Copy-mode badge (Phase 3, P9) ----------------------------------------
+
+    #[test]
+    fn the_badge_names_the_mode_and_the_live_query() {
+        // With no search running the badge is just the mode; with one running it
+        // carries the query, so the highlights on screen keep a visible cause
+        // even after the search field has closed.
+        assert_eq!(copy_mode_badge_label(None), "COPY");
+        assert_eq!(copy_mode_badge_label(Some("needle")), "COPY  needle");
+        // A blank query must not leave a dangling separator behind.
+        assert_eq!(copy_mode_badge_label(Some("")), "COPY");
+        assert_eq!(copy_mode_badge_label(Some("   ")), "COPY");
+    }
+
+    #[test]
+    fn a_long_query_is_elided_on_a_char_boundary() {
+        // The badge must not grow to cover the output being searched — and the
+        // cut is by CHARACTER, so a multi-byte query cannot panic the paint.
+        let long = "x".repeat(COPY_BADGE_QUERY_CHARS + 10);
+        assert_eq!(
+            copy_mode_badge_label(Some(&long)),
+            format!("COPY  {}…", "x".repeat(COPY_BADGE_QUERY_CHARS))
+        );
+
+        let wide = "é".repeat(COPY_BADGE_QUERY_CHARS + 3);
+        let label = copy_mode_badge_label(Some(&wide));
+        assert!(label.ends_with('…'));
+        assert_eq!(
+            label.chars().count(),
+            "COPY  ".chars().count() + COPY_BADGE_QUERY_CHARS + 1
+        );
+
+        // Exactly at the limit there is nothing to elide.
+        let exact = "y".repeat(COPY_BADGE_QUERY_CHARS);
+        assert_eq!(copy_mode_badge_label(Some(&exact)), format!("COPY  {exact}"));
+    }
 
     // -- LaunchOverlay (T9) ---------------------------------------------------
 

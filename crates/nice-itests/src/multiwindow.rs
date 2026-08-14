@@ -103,6 +103,12 @@ gpui::actions!(
         SwapPaneDown,
         SwapPaneUp,
         SwapPaneRight,
+        // tmux Phase 3 (copy mode + search). Probe actions for the same reason
+        // as Phase 2's: both verbs drive a pane's live terminal handle, which
+        // this window-isolation probe never stands up. What this mirror proves
+        // is that ⌃⌘C and ⌃⌘/ parse into gpui bindings.
+        CopyMode,
+        SearchScrollback,
     ]
 );
 
@@ -417,6 +423,9 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &SwapPaneDown, _cx: &mut App| {});
     cx.on_action(|_: &SwapPaneUp, _cx: &mut App| {});
     cx.on_action(|_: &SwapPaneRight, _cx: &mut App| {});
+    // Phase 3's copy-mode verbs — registered for the same reason.
+    cx.on_action(|_: &CopyMode, _cx: &mut App| {});
+    cx.on_action(|_: &SearchScrollback, _cx: &mut App| {});
 }
 
 /// Route a window-scoped action to the key window's state (mirror of
@@ -481,6 +490,8 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
         ShortcutAction::SwapPaneDown => KeyBinding::new(chord, SwapPaneDown, None),
         ShortcutAction::SwapPaneUp => KeyBinding::new(chord, SwapPaneUp, None),
         ShortcutAction::SwapPaneRight => KeyBinding::new(chord, SwapPaneRight, None),
+        ShortcutAction::CopyMode => KeyBinding::new(chord, CopyMode, None),
+        ShortcutAction::SearchScrollback => KeyBinding::new(chord, SearchScrollback, None),
     }
 }
 

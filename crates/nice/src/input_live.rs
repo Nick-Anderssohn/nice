@@ -38,14 +38,16 @@
 //! grid shows both the echoed command and its output, proving the whole path
 //! reaches a real login shell and its output round-trips back to the grid.
 //!
-//! ## `scrollback-keys` / `keybind-scheme` / `splits` — grant-free keystroke scenarios
+//! ## `scrollback-keys` / `keybind-scheme` / `splits` / `copy-mode` — grant-free keystroke scenarios
 //!
-//! All three drive `Window::dispatch_keystroke` instead of CGEvents (the exact
+//! All four drive `Window::dispatch_keystroke` instead of CGEvents (the exact
 //! path an OS key event takes AFTER the platform hop), so none needs an
 //! Accessibility grant: `scrollback-keys` is Phase 0's keyboard-scrollback gate,
-//! `keybind-scheme` is Phase 1's held-`⌃⌘` scheme gate, and `splits` is Phase
+//! `keybind-scheme` is Phase 1's held-`⌃⌘` scheme gate, `splits` is Phase
 //! 2's pane-verb gate (splits, directional focus, resize, swap, zoom,
-//! break-pane, pane close, layout persistence).
+//! break-pane, pane close, layout persistence), and `copy-mode` is Phase 3's
+//! copy-mode + scrollback-search gate (vi motions, paging, yank, the search
+//! bar's confirm/`n`/`N`, and P4's "nothing leaks to the pty while VI is on").
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -973,7 +975,13 @@ struct KeybindFixture {
 /// focus, `⌃⌥⌘` resize, `⌃⌥⌘⇧` swap) and the rest of Phase 2's board (`⌃⌘\`,
 /// `⌃⌘-`, `⌃⌘z`, `⌃⌘b`, and the freed `⌃⌘v`/`⌃⌘s` — D2 spent the split verbs on
 /// the divider mnemonics instead) belong to the [`splits`](open_splits_window)
-/// scenario, which has a pane tree to move them against.
+/// scenario, which has a pane tree to move them against; Phase 3's two rungs
+/// (`⌃⌘c` copy mode, `⌃⌘/` search scrollback) belong to
+/// [`copy-mode`](open_copy_mode_window), which has the scrollback to move them
+/// against. `⌃⌘/` is deliberately NOT in the freed-chord leg below: Phase 3
+/// spent `RESERVED_COMBOS`' last `FuturePhase` entry on it, so it is a bound
+/// default now and asserting it inert would be asserting the opposite of what
+/// ships.
 ///
 /// Keystrokes ride `Window::dispatch_keystroke`, so no Accessibility grant is
 /// needed — at the cost of one BLIND SPOT worth naming: injection happens
@@ -2495,6 +2503,738 @@ fn persistence_checks(
             "persistence: a mangled layout hydrated as {:?} instead of a single leaf",
             fallback.layout
         ));
+    }
+}
+
+// -- scenario: copy-mode (Phase 3 copy mode + scrollback search) --------------
+
+/// Seeded output lines for the copy-mode legs — eight screens' worth at the
+/// spawn size, so history stays deep even after the mounted view refits the pty
+/// to the (taller) real window, and `g`/`⌃u` have somewhere to go.
+const COPY_SEED_LINES: usize = ROWS as usize * 8;
+
+/// The token the search legs look for. Deliberately not a substring of the
+/// `copyline-N` body, so "how many matches" is exactly
+/// [`COPY_NEEDLE_LINES`]`.len()`.
+const COPY_NEEDLE: &str = "needlezz";
+
+/// Which seeded lines carry [`COPY_NEEDLE`]. THREE of them, spread through the
+/// history: two is not enough to tell `n` (keep going) from `N` (come back) —
+/// with two matches both verbs land on the same other match.
+const COPY_NEEDLE_LINES: [usize; 3] = [20, 80, 140];
+
+/// Everything [`run_copy_mode`] needs from the setup phase.
+struct CopyModeFixture {
+    state: Entity<crate::window_state::WindowState>,
+    /// The capture-tee pty of the pill's only pane — the surface every
+    /// zero-leak assertion measures.
+    handle: Entity<TerminalSessionHandle>,
+    session_id: String,
+    window_id: String,
+    /// The pane copy mode and the search bar both belong to.
+    pane0: String,
+}
+
+/// The `copy-mode` scenario: Phase 3's copy mode and scrollback search, end to
+/// end, over the SHIPPED dispatch path — the `keybind-scheme` / `splits` gate's
+/// Phase 3 twin, and built the same way (real keymap + a `WindowState` in the
+/// `WindowRegistry` + a capture-tee pty spawned THROUGH that state's
+/// `PtyManager`), for the same reason: `⌃⌘c` and `⌃⌘/` are keymap actions that
+/// resolve through the model, so a bare view would no-op every one of them and
+/// the zero-leak assertions would pass vacuously.
+///
+/// The two halves it gates are the two P4 promises worth automating: the mode's
+/// verbs do what vi does (motions move `vi_cursor_point`, paging moves
+/// `display_offset`, `v`+`y` puts the seeded line on the clipboard), and while
+/// the mode is on NOTHING reaches the pty — asserted with the `chord_leak`
+/// byte-counter on every key, and kept honest by the plain-`u` differential
+/// after each exit, which proves the same capture file WOULD have shown a leak.
+///
+/// What it deliberately does NOT cover, and why:
+///
+/// * **The IME path.** `dispatch_keystroke` enters below the
+///   `NSTextInputClient`, so dead keys and live compositions — B1's third gate
+///   — never run here at all. Those gates are unit-tested as pure predicates in
+///   `nice-term-view`'s `input.rs` and hand-checked at the feel-check.
+/// * **Chord DELIVERY.** Injection happens downstream of the OS hotkey layer,
+///   so a chord macOS itself swallows still looks live here (the `⌃⌘D`
+///   lesson). `⌃⌘c` and `⌃⌘/` arriving on a real keyboard is a hand check.
+/// * **Paint.** No `WindowHostView` is mounted, so the `COPY` badge, the block
+///   vi cursor and the match tints are unit + feel-check territory. The search
+///   BAR is likewise unpainted: this driver feeds it the way the host's key
+///   handler does (`dispatch_search_key` → push the query → confirm/close), so
+///   the engine and the bar's own state machine are gated while gpui's focus
+///   routing into the field is not.
+/// * **Mouse reporting suspension (P10)** and the **held-pane gate order**: the
+///   seeded pane is a plain capture-tee child with no mouse-mode TUI and no
+///   corpse, so both are unit-tested predicates plus feel-check items.
+pub fn open_copy_mode_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
+    use crate::window_registry::WindowRegistry;
+    use crate::window_state::WindowState;
+
+    let base = prepare_dir("copy-mode")?;
+    let cap_path = base.join("capture.bin");
+    let base_s = base.to_string_lossy().to_string();
+    let cap_s = cap_path.to_string_lossy().to_string();
+    let store_path = base.join("ui_settings.json");
+
+    // Capture-tee child (the `input-live` pattern): pty-bound bytes land in the
+    // capture file verbatim AND echo back, so `write_child` renders as terminal
+    // OUTPUT (the scrollback seed) while encoded keystrokes stay observable.
+    let inner = format!("stty raw -echo; exec tee {cap_s}");
+    let spec = SpawnSpec::command(format!("sh -c '{inner}'"), base_s.clone())
+        .with_env(vec![("ZDOTDIR".to_string(), base_s.clone())])
+        .with_size(ROWS, COLS);
+
+    let fixture = cx.update(|app| -> Result<CopyModeFixture> {
+        crate::keymap::install_shortcuts(app);
+        app.set_global(crate::shortcuts_store::ShortcutBindings::with_defaults(
+            store_path,
+        ));
+        crate::keymap::rebuild_keymap(app);
+
+        let state = app.new(|_cx| WindowState::new(base_s.clone()));
+        let (session_id, window_id) = state.update(app, |s, _cx| {
+            let session_id = s
+                .workspace
+                .active_session_id()
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let window_id = s
+                .workspace
+                .session_for(&session_id)
+                .and_then(|sess| sess.windows.first().map(|w| w.id.clone()))
+                .unwrap_or_default();
+            (session_id, window_id)
+        });
+        if session_id.is_empty() || window_id.is_empty() {
+            return Err(anyhow!("copy-mode: a fresh WindowState seeded no pill"));
+        }
+
+        state.update(app, |s, cx| {
+            let spawned = s.ptys.spawn_window(&session_id, &window_id, spec, cx);
+            // The SHIPPED per-pane subscription, in the same update as the spawn
+            // (the `session_lifecycle` precedent). In-mode `/` and `?` reach the
+            // bar only through it — the view emits `SearchRequested` and this
+            // subscription routes it to `open_search_bar` — so without the sweep
+            // the §6b leg below would be asserting against a dead wire.
+            s.subscribe_spawned_windows(cx);
+            spawned
+        })?;
+        state.update(app, |s, _cx| {
+            s.window_strip_actions
+                .select_window(&mut s.workspace, &session_id, &window_id);
+        });
+        let pane0 = state
+            .read(app)
+            .workspace
+            .session_for(&session_id)
+            .and_then(|sess| sess.windows.iter().find(|w| w.id == window_id))
+            .map(|w| w.effective_pane_id())
+            .ok_or_else(|| anyhow!("copy-mode: the seeded pill vanished"))?;
+        let handle = state
+            .read(app)
+            .ptys
+            .pane_handle(&session_id, &window_id, &pane0)
+            .ok_or_else(|| anyhow!("copy-mode: the seeded pane has no pty handle"))?;
+
+        Ok(CopyModeFixture {
+            state,
+            handle,
+            session_id,
+            window_id,
+            pane0,
+        })
+    })?;
+
+    let terminal = make_view(fixture.handle.clone(), cx);
+
+    let whandle = cx.open_window(crate::app::window_options(), {
+        let terminal = terminal.clone();
+        let state = fixture.state.clone();
+        move |window, cx| {
+            // `register`, not `install` — the close observer's quit-when-empty
+            // would end the suite when this window closes (`keybind-scheme`).
+            let id = window.window_handle().window_id();
+            WindowRegistry::register(cx, id, state.clone());
+            cx.new(|_cx| InputTermView { terminal })
+        }
+    })?;
+    let window: AnyWindowHandle = whandle.into();
+    crate::app::install_present_kick(&fixture.handle, window, cx);
+
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let report = run_copy_mode(acx, window, terminal, fixture, cap_path).await;
+        eprintln!("[selftest] scenario 'copy-mode': {}", report.detail);
+        nice_harness::selftest::report_gate(report);
+    })
+    .detach();
+
+    Ok(window)
+}
+
+/// Whether the scenario's pane has `TermMode::VI` set — copy mode's single
+/// source of truth (P1), read exactly as every shipped gate reads it.
+fn copy_mode_on(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> bool {
+    fixture.handle.update(cx, |h, _| h.copy_mode_active())
+}
+
+/// The vi cursor as `(buffer line, column)` — negative lines are scrollback.
+/// Flattened to plain integers so the driver never has to name alacritty's
+/// `Point` (the `nice` crate does not depend on `alacritty_terminal`).
+fn vi_point(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> Option<(i32, usize)> {
+    fixture
+        .handle
+        .update(cx, |h, _| h.vi_cursor_point().map(|p| (p.line.0, p.column.0)))
+}
+
+/// The focused match's START, same flattening as [`vi_point`].
+fn active_match_start(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> Option<(i32, usize)> {
+    fixture.handle.update(cx, |h, _| {
+        h.active_match().map(|m| (m.start().line.0, m.start().column.0))
+    })
+}
+
+/// The pane's viewport offset: `0` is parked at the live bottom.
+fn copy_offset(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> usize {
+    fixture.handle.update(cx, |h, _| h.display_offset())
+}
+
+/// Whether the search bar is open, and in which direction.
+fn search_bar_open(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> Option<bool> {
+    fixture
+        .state
+        .update(cx, |ws, _| ws.search_bar().map(|bar| bar.backward))
+}
+
+/// The text the open field is holding, if a bar is open.
+fn search_bar_query(cx: &mut AsyncApp, fixture: &CopyModeFixture) -> Option<String> {
+    fixture
+        .state
+        .update(cx, |ws, _| ws.search_bar().map(|bar| bar.query()))
+}
+
+/// Close the bar the way the host's sweep does, so the next leg starts from a
+/// known state (nothing paints here, so the sweep itself never runs).
+fn close_search_bar(cx: &mut AsyncApp, fixture: &CopyModeFixture) {
+    fixture.state.update(cx, |ws, _| {
+        let _ = ws.close_search_bar();
+    });
+}
+
+/// Dispatch one in-mode key and assert it reached the pty with NOTHING to show
+/// for it — P4's leak-proof guarantee, measured the `chord_leak` way (byte
+/// count on the capture file) on keys that are not chords at all.
+async fn copy_key(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    cap_path: &Path,
+    failures: &mut Vec<String>,
+    keystroke: &str,
+    label: &str,
+) {
+    let leaked = chord_leak(cx, window, cap_path, keystroke).await;
+    if !leaked.is_empty() {
+        failures.push(format!(
+            "{keystroke} ({label}): leaked \"{}\" to the pty in copy mode",
+            esc(&leaked)
+        ));
+    }
+}
+
+/// Feed one keystroke to the open search bar exactly as `WindowHostView`'s key
+/// handler does — dispatch into the field's editor, then act on the outcome
+/// (push the query, confirm it, or close the bar).
+///
+/// The host itself cannot run here (no `WindowHostView` is mounted, so nothing
+/// paints the bar and nothing focuses it), so this driver stands in for the
+/// FOCUS ROUTING and nothing else: the editor, the query push and the two verbs
+/// are the shipped ones. Returns `None` when no bar is open.
+async fn search_bar_key(
+    cx: &mut AsyncApp,
+    fixture: &CopyModeFixture,
+    key: &str,
+    key_char: Option<&str>,
+) -> Option<crate::search_bar::SearchKeyOutcome> {
+    use crate::search_bar::{dispatch_search_key, SearchKeyOutcome};
+
+    let stepped = fixture.state.update(cx, |ws, wcx| {
+        let bar = ws.search_bar_mut()?;
+        let outcome = dispatch_search_key(
+            &mut bar.editor,
+            &mut **wcx,
+            key,
+            key_char,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        Some((outcome, bar.query()))
+    });
+    let (outcome, query) = stepped?;
+
+    match outcome {
+        SearchKeyOutcome::Edited => {
+            fixture.handle.update(cx, |h, hcx| {
+                h.set_search_query(&query);
+                hcx.notify();
+            });
+        }
+        SearchKeyOutcome::Confirm => {
+            fixture.handle.update(cx, |h, hcx| {
+                // The final query first: the keystroke before Enter may have
+                // been the one that completed it.
+                h.set_search_query(&query);
+                h.confirm_search();
+                hcx.notify();
+            });
+            fixture.state.update(cx, |ws, _| {
+                let _ = ws.close_search_bar();
+            });
+        }
+        SearchKeyOutcome::Close => {
+            fixture.state.update(cx, |ws, _| {
+                let _ = ws.close_search_bar();
+            });
+        }
+        SearchKeyOutcome::Ignored => {}
+    }
+    settle(cx, 60).await;
+    Some(outcome)
+}
+
+/// Put a known string on the clipboard so "the yank wrote this" is provable
+/// rather than inherited from whatever was there before.
+fn seed_clipboard(cx: &mut AsyncApp, sentinel: &str) {
+    let sentinel = sentinel.to_string();
+    let _ = cx.update(|app| app.write_to_clipboard(ClipboardItem::new_string(sentinel)));
+}
+
+/// The clipboard's text, if any.
+fn clipboard_text(cx: &mut AsyncApp) -> Option<String> {
+    cx.update(|app| app.read_from_clipboard().and_then(|item| item.text()))
+}
+
+async fn run_copy_mode(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    terminal: Entity<TerminalView>,
+    fixture: CopyModeFixture,
+    cap_path: PathBuf,
+) -> CadenceReport {
+    let _ = cx.update(|app| app.activate(true));
+    settle(cx, 500).await;
+
+    // Focus the mounted view — `dispatch_keystroke` walks the focus path, and
+    // the plain-`u` differential needs the view's own input path live.
+    let _ = window.update(cx, |_root, window, cx| {
+        let fh = terminal.read(cx).focus_handle_ref().clone();
+        window.focus(&fh, cx);
+    });
+    settle(cx, 200).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let last_line = format!("copyline-{COPY_SEED_LINES}");
+
+    // --- §0 seed the scrollback --------------------------------------------
+    let seed: String = (1..=COPY_SEED_LINES)
+        .map(|i| {
+            if COPY_NEEDLE_LINES.contains(&i) {
+                format!("copyline-{i} {COPY_NEEDLE}\r\n")
+            } else {
+                format!("copyline-{i}\r\n")
+            }
+        })
+        .collect();
+    if let Err(e) = write_child(cx, &fixture.handle, seed.as_bytes()) {
+        return CadenceReport::error(format!("copy-mode: seeding failed: {e}"));
+    }
+    let mut seeded = false;
+    for _ in 0..80 {
+        settle(cx, 100).await;
+        let text = fixture
+            .handle
+            .update(cx, |h, _| h.session().grid_lines().join("\n"));
+        if text.contains(&last_line) {
+            seeded = true;
+            break;
+        }
+    }
+    if !seeded {
+        return CadenceReport::error(format!(
+            "copy-mode: the seed never rendered ({last_line} absent from the grid)"
+        ));
+    }
+    if copy_offset(cx, &fixture) != 0 {
+        failures.push("seed: viewport not parked at the bottom after output".into());
+    }
+    if copy_mode_on(cx, &fixture) {
+        return CadenceReport::error("copy-mode: the pane started IN copy mode".to_string());
+    }
+
+    // --- §1 ⌃⌘c enters, and the mode swallows everything -------------------
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-c").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-c: leaked \"{}\"", esc(&leaked)));
+    }
+    if !copy_mode_on(cx, &fixture) {
+        return CadenceReport::error("copy-mode: ⌃⌘c did not enter copy mode".to_string());
+    }
+    let Some(entry) = vi_point(cx, &fixture) else {
+        return CadenceReport::error("copy-mode: no vi cursor after entering".to_string());
+    };
+
+    // Every one of these moves the vi cursor and must write nothing at all —
+    // the whole point of the mode's default-`Swallow` arm.
+    for key in ["h", "j", "k", "l", "w", "b", "e", "^"] {
+        copy_key(cx, window, &cap_path, &mut failures, key, "motion").await;
+    }
+
+    // --- §2 motions move the vi cursor as vi moves it ----------------------
+    // Back to a known cell first: `G` parks on the terminal cursor's line,
+    // `0` on its first column.
+    copy_key(cx, window, &cap_path, &mut failures, "shift-g", "G").await;
+    copy_key(cx, window, &cap_path, &mut failures, "0", "0").await;
+    let Some(home) = vi_point(cx, &fixture) else {
+        return CadenceReport::error("copy-mode: the vi cursor vanished mid-run".to_string());
+    };
+    if home != (entry.0, 0) {
+        failures.push(format!(
+            "G then 0: cursor is {home:?}, expected line {} column 0",
+            entry.0
+        ));
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "k", "k").await;
+    if vi_point(cx, &fixture).map(|p| p.0) != Some(home.0 - 1) {
+        failures.push(format!(
+            "k: cursor is {:?}, expected one line above {home:?}",
+            vi_point(cx, &fixture)
+        ));
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "$", "$").await;
+    match vi_point(cx, &fixture) {
+        Some((line, col)) if line == home.0 - 1 && col > 0 => {}
+        other => failures.push(format!("$: cursor is {other:?}, expected the line's last column")),
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "0", "0 again").await;
+    if vi_point(cx, &fixture).map(|p| p.1) != Some(0) {
+        failures.push("0: cursor did not return to the first column".into());
+    }
+
+    // `g` / `G` — the ends of the buffer.
+    copy_key(cx, window, &cap_path, &mut failures, "g", "g").await;
+    match (vi_point(cx, &fixture), copy_offset(cx, &fixture)) {
+        (Some((line, _)), offset) if line < 0 && offset > 0 => {}
+        (point, offset) => failures.push(format!(
+            "g: cursor {point:?} at offset {offset}, expected a history line with the viewport \
+             scrolled up"
+        )),
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "shift-g", "G").await;
+    if vi_point(cx, &fixture).map(|p| p.0) != Some(entry.0) || copy_offset(cx, &fixture) != 0 {
+        failures.push(format!(
+            "G: cursor {:?} at offset {}, expected line {} parked at the bottom",
+            vi_point(cx, &fixture),
+            copy_offset(cx, &fixture),
+            entry.0
+        ));
+    }
+
+    // --- §3 paging moves the viewport, and Shift+PageUp still works IN mode -
+    copy_key(cx, window, &cap_path, &mut failures, "ctrl-u", "⌃u").await;
+    let half = copy_offset(cx, &fixture);
+    if half == 0 {
+        failures.push("ctrl-u: display offset stayed 0 (no half-page scroll)".into());
+    }
+    // I4: today's scrollback keys must not go dead exactly while the user is
+    // navigating scrollback — they live inside `dispatch_key`, which the
+    // copy-mode gate never reaches, so the key table re-maps them.
+    copy_key(cx, window, &cap_path, &mut failures, "shift-pageup", "Shift+PageUp").await;
+    if copy_offset(cx, &fixture) <= half {
+        failures.push(format!(
+            "shift-pageup: offset {} did not move past the half-page {half}",
+            copy_offset(cx, &fixture)
+        ));
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "shift-end", "Shift+End").await;
+    if copy_offset(cx, &fixture) != 0 {
+        failures.push("shift-end: the viewport did not return to the bottom".into());
+    }
+
+    // --- §4 v + motions + y: the seeded line lands on the clipboard --------
+    seed_clipboard(cx, "copy-mode-sentinel-yank");
+    copy_key(cx, window, &cap_path, &mut failures, "k", "onto the last seeded line").await;
+    copy_key(cx, window, &cap_path, &mut failures, "0", "0").await;
+    copy_key(cx, window, &cap_path, &mut failures, "v", "v").await;
+    copy_key(cx, window, &cap_path, &mut failures, "$", "$").await;
+    copy_key(cx, window, &cap_path, &mut failures, "y", "y").await;
+    match clipboard_text(cx) {
+        Some(text) if text.contains(&last_line) => {}
+        other => failures.push(format!(
+            "y: the clipboard holds {other:?}, expected it to contain {last_line}"
+        )),
+    }
+    if copy_mode_on(cx, &fixture) {
+        failures.push("y: yanking did not leave copy mode (P4)".into());
+    }
+    if copy_offset(cx, &fixture) != 0 {
+        failures.push("y: the viewport did not return to the live bottom (P6)".into());
+    }
+
+    // The differential: with the mode off, a plain `u` reaches the pty again —
+    // without it every zero-byte assertion above could pass vacuously.
+    let start = cap_len(&cap_path);
+    dispatch_key(cx, window, "u");
+    settle(cx, 250).await;
+    expect_bytes(&mut failures, "post-yank u", b"u", &cap_since(&cap_path, start));
+
+    // --- §5 ⌃⌘/ searches the scrollback ------------------------------------
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-/").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-/: leaked \"{}\"", esc(&leaked)));
+    }
+    // Opening the field ENTERS copy mode (P7/D1: search is copy mode with a
+    // query) and searches backward (the "find what scrolled past" direction).
+    if !copy_mode_on(cx, &fixture) {
+        failures.push("cmd-ctrl-/: did not enter copy mode".into());
+    }
+    if search_bar_open(cx, &fixture) != Some(true) {
+        return CadenceReport::error(format!(
+            "copy-mode: ⌃⌘/ left the search bar {:?}, expected an open backward search",
+            search_bar_open(cx, &fixture)
+        ));
+    }
+    for ch in COPY_NEEDLE.chars() {
+        let key = ch.to_string();
+        if search_bar_key(cx, &fixture, &key, Some(&key)).await.is_none() {
+            failures.push(format!("search: the bar closed while typing {COPY_NEEDLE}"));
+            break;
+        }
+    }
+    let query = fixture
+        .handle
+        .update(cx, |h, _| h.active_search_query().map(str::to_owned));
+    if query.as_deref() != Some(COPY_NEEDLE) {
+        failures.push(format!(
+            "search: the live query is {query:?}, expected {COPY_NEEDLE}"
+        ));
+    }
+    if search_bar_key(cx, &fixture, "enter", None).await
+        != Some(crate::search_bar::SearchKeyOutcome::Confirm)
+    {
+        failures.push("search: Enter did not confirm the query".into());
+    }
+    if search_bar_open(cx, &fixture).is_some() {
+        failures.push("search: Enter left the bar open".into());
+    }
+    if !copy_mode_on(cx, &fixture) {
+        failures.push("search: confirming dropped out of copy mode (D1)".into());
+    }
+    let Some(first) = active_match_start(cx, &fixture) else {
+        return CadenceReport::error(
+            "copy-mode: confirming the search found no match at all".to_string(),
+        );
+    };
+    if vi_point(cx, &fixture) != Some(first) {
+        failures.push(format!(
+            "search: the cursor is {:?}, expected the match at {first:?}",
+            vi_point(cx, &fixture)
+        ));
+    }
+
+    // `n` repeats in the confirmed (backward) direction — further into history;
+    // `N` reverses and comes straight back. Asserted as an ORDER on the buffer
+    // lines rather than absolute numbers, because the mounted view refits the
+    // pty and the driver cannot know the laid-out row count.
+    copy_key(cx, window, &cap_path, &mut failures, "n", "n").await;
+    let Some(second) = active_match_start(cx, &fixture) else {
+        return CadenceReport::error("copy-mode: `n` found no further match".to_string());
+    };
+    if second.0 >= first.0 {
+        failures.push(format!(
+            "n: landed on {second:?}, expected a match above {first:?}"
+        ));
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "shift-n", "N").await;
+    if active_match_start(cx, &fixture) != Some(first) {
+        failures.push(format!(
+            "N: landed on {:?}, expected to come back to {first:?}",
+            active_match_start(cx, &fixture)
+        ));
+    }
+
+    // --- §6 the Esc ladder: field → copy mode → normal ---------------------
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-/").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-/ (reopen): leaked \"{}\"", esc(&leaked)));
+    }
+    if search_bar_open(cx, &fixture).is_none() {
+        failures.push("search: ⌃⌘/ did not re-open the bar".into());
+    }
+    // A click into the pane leaves the bar OPEN and merely unfocused, and P7
+    // says ⌃⌘/ then refocuses it — so a second ⌃⌘/ over the same pane, pointing
+    // the same way, must keep what is typed rather than start over. (Nothing
+    // paints here, so "unfocused" is the state this driver is always in.)
+    for ch in COPY_NEEDLE.chars().take(3) {
+        let key = ch.to_string();
+        if search_bar_key(cx, &fixture, &key, Some(&key)).await.is_none() {
+            failures.push("search: the bar closed while typing the refocus query".into());
+            break;
+        }
+    }
+    let typed = search_bar_query(cx, &fixture);
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-/").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-/ (refocus): leaked \"{}\"", esc(&leaked)));
+    }
+    if search_bar_query(cx, &fixture) != typed || search_bar_open(cx, &fixture) != Some(true) {
+        failures.push(format!(
+            "search: ⌃⌘/ over the bar it already opened left it {:?}/{:?}, expected the typed \
+             {typed:?} refocused (P7)",
+            search_bar_open(cx, &fixture),
+            search_bar_query(cx, &fixture)
+        ));
+    }
+    let live = fixture
+        .handle
+        .update(cx, |h, _| h.active_search_query().map(str::to_owned));
+    if live != typed {
+        failures.push(format!(
+            "search: the refocus left the live query {live:?}, expected the field's {typed:?}"
+        ));
+    }
+    if search_bar_key(cx, &fixture, "escape", None).await
+        != Some(crate::search_bar::SearchKeyOutcome::Close)
+    {
+        failures.push("search: Escape did not close the field".into());
+    }
+    if search_bar_open(cx, &fixture).is_some() {
+        failures.push("search: Escape left the bar open".into());
+    }
+    if !copy_mode_on(cx, &fixture) {
+        failures.push("search: Escape in the field also left copy mode (P7 says it stays)".into());
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "escape", "escape").await;
+    if copy_mode_on(cx, &fixture) {
+        failures.push("escape: the second Escape did not leave copy mode".into());
+    }
+
+    // --- §6b in-mode `/` and `?` open the bar through the EVENT path -------
+    // Everything above drove the bar in through the `⌃⌘/` ACTION, which calls
+    // `open_search_bar` directly. The two in-mode keys take the OTHER route:
+    // `perform_copy_mode` emits `TerminalEvent::SearchRequested` and the
+    // per-pane subscription routes it. That routing sits behind a match whose
+    // wildcard arm swallows an unrouted variant SILENTLY — deleting the arm
+    // still compiles and every other assertion here still passes — so this leg
+    // is its guard. `/` searches forward, `?` (shift-folded `/`) backward.
+    copy_key(cx, window, &cap_path, &mut failures, "cmd-ctrl-c", "re-enter for `/`").await;
+    if !copy_mode_on(cx, &fixture) {
+        failures.push("`/` leg: ⌃⌘c did not re-enter copy mode".into());
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "/", "in-mode /").await;
+    if search_bar_open(cx, &fixture) != Some(false) {
+        failures.push(format!(
+            "`/`: the bar is {:?}, expected an open FORWARD search (the routed SearchRequested)",
+            search_bar_open(cx, &fixture)
+        ));
+    }
+    close_search_bar(cx, &fixture);
+    copy_key(cx, window, &cap_path, &mut failures, "shift-/", "in-mode ?").await;
+    if search_bar_open(cx, &fixture) != Some(true) {
+        failures.push(format!(
+            "`?`: the bar is {:?}, expected an open BACKWARD search (the routed SearchRequested)",
+            search_bar_open(cx, &fixture)
+        ));
+    }
+    close_search_bar(cx, &fixture);
+    copy_key(cx, window, &cap_path, &mut failures, "escape", "escape out of the `/` leg").await;
+    if copy_mode_on(cx, &fixture) {
+        failures.push("`/` leg: Escape did not leave copy mode".into());
+    }
+
+    // --- §7 ⌘C copies and STAYS in the mode (P4) ---------------------------
+    seed_clipboard(cx, "copy-mode-sentinel-cmd-c");
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-c").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-c (re-enter): leaked \"{}\"", esc(&leaked)));
+    }
+    copy_key(cx, window, &cap_path, &mut failures, "k", "onto the last seeded line").await;
+    copy_key(cx, window, &cap_path, &mut failures, "0", "0").await;
+    copy_key(cx, window, &cap_path, &mut failures, "v", "v").await;
+    copy_key(cx, window, &cap_path, &mut failures, "$", "$").await;
+    copy_key(cx, window, &cap_path, &mut failures, "cmd-c", "⌘C").await;
+    match clipboard_text(cx) {
+        Some(text) if text.contains(&last_line) => {}
+        other => failures.push(format!(
+            "⌘C: the clipboard holds {other:?}, expected it to contain {last_line}"
+        )),
+    }
+    if !copy_mode_on(cx, &fixture) {
+        failures.push("⌘C: copying left copy mode (P4 says it stays)".into());
+    }
+
+    // --- §8 ⌃⌘c toggles out from any state, bar open included --------------
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-/").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-/ (toggle leg): leaked \"{}\"", esc(&leaked)));
+    }
+    if search_bar_open(cx, &fixture).is_none() {
+        failures.push("toggle: ⌃⌘/ did not open the bar for the toggle-out leg".into());
+    }
+    let leaked = chord_leak(cx, window, &cap_path, "cmd-ctrl-c").await;
+    if !leaked.is_empty() {
+        failures.push(format!("cmd-ctrl-c (toggle out): leaked \"{}\"", esc(&leaked)));
+    }
+    if copy_mode_on(cx, &fixture) {
+        failures.push("toggle: ⌃⌘c with the bar open did not leave copy mode".into());
+    }
+    // The bar's CLOSE is the host's render sweep, which no mounted view runs
+    // here — so assert the predicate that sweep consults (I2). Then close the
+    // bar so the scenario ends on the state the host would have left.
+    if !crate::search_bar::search_bar_is_stale(&fixture.pane0, Some(&fixture.pane0), false) {
+        failures.push("toggle: the bar over a pane that left copy mode did not read as stale".into());
+    }
+    fixture.state.update(cx, |ws, _| {
+        let _ = ws.close_search_bar();
+    });
+
+    // --- §9 the pane types again ------------------------------------------
+    let start = cap_len(&cap_path);
+    dispatch_key(cx, window, "u");
+    settle(cx, 250).await;
+    expect_bytes(&mut failures, "final u", b"u", &cap_since(&cap_path, start));
+
+    // The fixture's ids are load-bearing for the pane-keyed legs above; name
+    // them in the failure text so a broken run says WHICH pane it was driving.
+    if failures.is_empty() {
+        CadenceReport {
+            passed: true,
+            stats: IntervalStats::default(),
+            detail: "copy mode OK end to end: ⌃⌘c entered and every in-mode key stayed off the \
+                     pty, hjkl/0/$/g/G moved the vi cursor, ⌃u and Shift+PageUp paged the \
+                     viewport, v+y put the seeded line on the clipboard and returned to the live \
+                     bottom, ⌃⌘/ opened a backward search whose Enter landed on a match and \
+                     whose n/N walked them, a second ⌃⌘/ refocused the open bar with its query \
+                     intact, in-mode / and ? opened it forward/backward through the routed \
+                     SearchRequested, the Esc ladder unwound field → mode → normal, ⌘C copied \
+                     without leaving, and ⌃⌘c toggled out with the bar open — with a plain `u` \
+                     reaching the pty after every exit"
+                .to_string(),
+        }
+    } else {
+        CadenceReport {
+            passed: false,
+            stats: IntervalStats::default(),
+            detail: format!(
+                "copy-mode FAILED (session {} / pill {} / pane {}):\n  - {}",
+                fixture.session_id,
+                fixture.window_id,
+                fixture.pane0,
+                failures.join("\n  - ")
+            ),
+        }
     }
 }
 

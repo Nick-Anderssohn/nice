@@ -229,7 +229,8 @@ Everything else on the scheme is unchanged:
 | `^⌘-` / `^⌘\` | Split Down / Split Right — **Phase 2 D2**: divider mnemonics. The `^⌘v`/`^⌘s` penciled in here are FREED and bind to nothing | 2 |
 | `^⌘b` | Break pane out to its own window | 2 |
 | `^⌘↑` / `^⌘↓` | Half-page scrollback up / down (no-op on the alternate screen) — moved off `^⌘u`/`^⌘d` on 2026-08-11; both of those are now bound to nothing | 1 |
-| `^⌘/` | Scrollback search | 3 |
+| `^⌘c` | Copy Mode — toggle the focused pane's vi-keys copy mode | 3 |
+| `^⌘/` | Search Scrollback — open the focused pane's search field, searching toward history | 3 |
 | *hold* `^⌘` | Window-index badges on the pills — **D5**, ~200 ms debounce | 1 |
 
 **DECIDED (2026-08-11): half-page scroll moved to `^⌘↑`/`^⌘↓`** — real `^⌘D`
@@ -260,6 +261,12 @@ change. Phase 2 claimed `^⌘z` and all eight ladder rungs, and freed
 `^⌘v`/`^⌘s` outright (D2 spent the split verbs on the divider mnemonics
 instead), leaving the five fixed accelerators, `^⌘Q`/`^⌘Space`/`^⌘D`, and
 `^⌘/` held for Phase 3.
+
+**Phase 3 spent the last reservation, 9 → 8.** `^⌘/` was the table's only
+`FuturePhase` entry; it is now `searchScrollback`'s default, so the group is
+empty and the table holds nothing but OS-claimed and Nice-claimed chords.
+`^⌘c` needed no deletion — it was never reserved, only free. Recording `^⌘/`
+in Settings ▸ Shortcuts is accepted from Phase 3 on.
 
 - **Hold-to-hint overlay (D5, shipped):** holding `^⌘` for ~200 ms with no
   chord committed paints the jump digit on each of the first nine pills;
@@ -402,10 +409,110 @@ Accepted warts, recorded rather than fixed:
 Full implementation plan: `docs/plans/phase-2-splits.md`. Live gate: the
 `splits` self-test scenario.
 
-### Phase 3 — copy mode + scrollback search (M)
-- Keyboard selection state machine over the existing selection API; vi keys.
-- Search overlay + `RegexSearch` over scrollback + match highlighting +
-  n/N navigation.
+### Phase 3 — copy mode + scrollback search (M) — SHIPPED
+
+Copy mode and search are **per-pane** — they belong to one pane's terminal,
+not to the pill or the OS window. `^⌘c` toggles the focused pane into vi
+keys; `^⌘/` opens that pane's search field. A pane not in copy mode types
+exactly as it always did.
+
+The whole thing rides `alacritty_terminal`'s vi-mode engine, which Nice has
+linked all along and never used. `TermMode::VI`, `vi_motion`,
+`vi_goto_point`, `vi_mode_recompute_selection` and `RegexSearch` are the
+library's; Nice supplies the key tables, the gates, the query field, and the
+three behaviours the library does not have (exit ordering, paging that moves
+the cursor AND the viewport, and a non-empty one-cell `v` selection).
+
+What shipped:
+
+- **Engine** (`nice-term-view/src/session_handle.rs` + a new `search.rs`):
+  the copy-mode API over the term lock — enter/exit/toggle, every `ViMotion`,
+  `g`/`G`, half- and full-page paging, the selection toggle with its tracked
+  anchor, `yank`, and the search verbs (query push, confirm, `n`/`N`,
+  viewport match scan). Search state (query, lazily compiled `RegexSearch`,
+  direction, active match) lives on `TerminalSessionHandle` — entity-scoped,
+  survives view unmounts, dies with the pane, never persisted.
+- **View gating** (`nice-term-view/src/input.rs` + `view.rs`): a pure
+  `copy_mode_key_action` table holds the whole vi key set in one match, with
+  a default arm that SWALLOWS — that arm is the no-leak guarantee. It runs
+  ahead of the held-pane and IME gates in `on_key_down`, and four more
+  writers are gated with it (key-up release reports, the three IME
+  callbacks, bare-modifier reports, and mouse reporting), because
+  `on_key_down` is not the only path to the pty.
+- **Render** (`nice-term-view/src/element.rs`, `nice-term-core`'s term
+  config): a third highlight channel on `SnapshotKey` (viewport matches +
+  the active match), tints derived from the existing selection colour and
+  the caret accent, plus a pinned non-blinking BLOCK `vi_mode_cursor_style`
+  so the keyboard cursor stays readable after an app set a beam via DECSCUSR.
+  A small top-right `COPY` badge names the mode and the live query.
+- **App** (`nice-model/src/shortcuts.rs`, `keymap.rs`, a new
+  `crates/nice/src/search_bar.rs`, `window_state.rs`, `app_shell.rs`): two
+  new rebindable actions (`copyMode` `^⌘c`, `searchScrollback` `^⌘/`), `ALL`
+  34 → 36 and `RESERVED_COMBOS` 9 → 8. The query field re-dresses the inline
+  rename editor rather than adding a second one, and mounts as an absolute
+  child of the focused leaf's own box (the Phase-2 corner-tick parentage), so
+  zoom, divider drags and window resizes place it for free.
+
+#### Decisions
+
+Product decisions (Nick, 2026-08-13):
+
+- **D1 — one integrated mode; search is "copy mode with a query."** `^⌘/`
+  opens the field; confirming jumps the keyboard cursor to the match and
+  leaves you IN copy mode with matches highlighted. `n`/`N`, every motion,
+  `v`/`y` work from there: search → land → `v` → `y`. tmux's model.
+- **D2 — `^⌘c` enters copy mode directly**, beside the other pane verbs
+  (`z` zoom, `b` break). Accepted cost: it neighbours ⌘C copy, so a slipped
+  Ctrl enters the mode instead of copying — Esc recovers.
+- **D3 — the full vi key set**, not a minimal one: `hjkl`; `w`/`b`/`e` +
+  `W`/`B`/`E`; `0`/`$`/`^`; `H`/`M`/`L`; `%`; `{`/`}`; `g`/`G`;
+  `^u`/`^d`/`^f`/`^b`; `v`/`V`/`^v`; `y`; Esc/`q`. The library models every
+  motion, so the cost over a minimal set is table size, not machinery.
+
+Plan-level decisions:
+
+- **P1 — copy mode IS `TermMode::VI`.** No second Nice-side flag to drift.
+- **P2 — the query field lives in the app crate.** `nice-term-view` has no
+  `nice-model` dependency by doctrine, and the only text editor in the tree
+  is `nice-model`'s. In-mode `/` and `?` reach it as a new typed handle event
+  (`SearchRequested`), routed pane-keyed like every other terminal event.
+- **P3 — routing splits by dispatch order.** gpui actions run before view key
+  listeners, so the two mode chords are global actions while in-mode bare
+  keys are intercepted in the view, where "not in copy mode" still falls
+  through to the pty.
+- **P4 — nothing leaks while the mode is on.** ⌘C copies and STAYS; `y` and
+  Enter copy and EXIT; both no-op with nothing selected; ⌘V is swallowed;
+  every unrecognized key no-ops. Accepted asymmetry: a press whose release
+  straddles entry or exit is sent without its pair.
+- **P5 — `v`/`V`/`^v` toggle vim-style** — same kind again clears, a
+  different kind rebuilds from the same anchor.
+- **P6 — exit returns you to live**: clear selection → clear search →
+  scroll to the bottom → VI off, in that order (`scroll_display` would
+  otherwise drag a doomed selection down the buffer).
+- **P7 — `^⌘/` searches BACKWARD** (the flagship "find what scrolled past"
+  direction); in-mode `/` and `?` keep vim's meanings; `n` repeats and `N`
+  reverses; smart-case; wrapping. Esc in the field closes it and leaves you
+  in copy mode where you stand. **No match counter in v1** — it needs a
+  full-scrollback walk per keystroke; revisit if its absence grates.
+- **P8 — match highlighting is viewport-bounded and recomputed per frame**,
+  so grid rotation can never stale it. Two costs named and accepted: a
+  streaming pane re-plans per throttled frame while a search is live, and
+  per-cell containment is O(matches). No new theme keys in v1.
+- **P9 — the vi cursor replaces the shell cursor** while the mode is on
+  (alacritty semantics), as a block.
+- **P10 — orthogonal to every Phase-2 gate.** Copy mode never counts as
+  busy, never blocks close, works on the alternate screen and on HELD panes
+  (the copy gate runs before the held gate — keyboard-selecting what a dead
+  process printed is that pane's whole remaining purpose), and SUSPENDS
+  mouse reporting, so wheel/click/drag act locally the way tmux captures the
+  mouse in copy mode.
+
+**Deferred**: the match counter (P7), promoting the derived match tints to
+real theme keys (P8), and any `select-layout`-style presets carried over from
+Phase 2's deferral list.
+
+Full implementation plan: `docs/plans/phase-3-copy-mode-search.md`. Live
+gate: the `copy-mode` self-test scenario.
 
 ### Phase 4 — detach, adopt, tear-off (M-L)
 - App-global session registry; "detached sessions" sidebar section;

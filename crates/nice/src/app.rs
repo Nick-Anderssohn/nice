@@ -3883,6 +3883,21 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "copy-mode",
+            open: crate::input_live::open_copy_mode_window,
+            gate: Gate::SelfReported {
+                // A 192-line seed render poll plus ~40 dispatched keys and
+                // chords, each with its settle, plus the typed search query.
+                // Needs NO Accessibility grant (in-process
+                // `dispatch_keystroke`, not CGEvents). Registered BEFORE
+                // `multiwindow` for the same reason `keybind-scheme` and
+                // `splits` are: it only `register`s its window, so closing it
+                // never trips the quit-when-empty terminus.
+                budget: Duration::from_secs(75),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "compose-live",
             open: crate::compose_live::open_compose_live_window,
             gate: Gate::SelfReported {

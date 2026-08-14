@@ -33,7 +33,7 @@ use std::time::Duration;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor};
 
 use crate::deferred::SessionEvent;
 use crate::osc7::Osc7Scanner;
@@ -174,6 +174,17 @@ impl TermSession {
             // ⌘↩ replay. Real terminals (kitty, Ghostty, alacritty-the-app)
             // all track it; the `osc_plumbing` push/pop test pins it here.
             kitty_keyboard: true,
+            // Copy mode (`TermMode::VI`) hands the vi cursor the caret's job.
+            // Left unset, alacritty lets it inherit whatever shape the running
+            // app last asked for via DECSCUSR — a beam, or nothing at all —
+            // which would leave copy mode without a visible keyboard cursor in
+            // exactly the panes it matters most for. Pinning a non-blinking
+            // block makes it unmissable and matches the block Nice paints for
+            // the live caret (Phase 3, P9).
+            vi_mode_cursor_style: Some(CursorStyle {
+                shape: CursorShape::Block,
+                blinking: false,
+            }),
             ..Config::default()
         };
         let term: SharedTerm = Arc::new(FairMutex::new(Term::new(

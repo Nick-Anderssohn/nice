@@ -169,6 +169,19 @@ pub enum ShortcutAction {
     SwapPaneUp,
     /// Trade places with the pane to the RIGHT (⌃⌥⌘⇧L) — tmux `swap-pane` (P8).
     SwapPaneRight,
+    // -- Phase 3 (tmux port): copy mode + scrollback search ------------------
+    /// Enter / leave the focused pane's copy mode (⌃⌘C) — tmux `copy-mode`
+    /// (D2). "c = Copy Mode"; it sits beside the other directionless pane verbs
+    /// on the bare ⌃⌘ rung. Copy mode IS the terminal's vi mode (P1), so the
+    /// action is a straight toggle on the pane's handle.
+    CopyMode,
+    /// Open the focused pane's scrollback search field (⌃⌘/) — tmux
+    /// `copy-mode` + `search-backward` (D1/P7). Searching enters copy mode
+    /// first: confirming a query lands the keyboard cursor on the match with
+    /// the mode still on, so `n`/`N`, the motions and `v`/`y` all work from
+    /// there. The default direction is BACKWARD — the flagship "find what
+    /// scrolled past" direction.
+    SearchScrollback,
 }
 
 /// The nine key tokens the single [`ShortcutAction::WindowByIndex`] row expands
@@ -193,7 +206,7 @@ impl ShortcutAction {
     /// Every action, in a stable order. Used by the completeness test and by
     /// R24's recorder (which renders one row per action). The order matches the
     /// enum declaration and Swift's `allCases`.
-    pub const ALL: [ShortcutAction; 34] = [
+    pub const ALL: [ShortcutAction; 36] = [
         ShortcutAction::NextSidebarSession,
         ShortcutAction::PrevSidebarSession,
         ShortcutAction::NextWindow,
@@ -229,6 +242,9 @@ impl ShortcutAction {
         ShortcutAction::SwapPaneDown,
         ShortcutAction::SwapPaneUp,
         ShortcutAction::SwapPaneRight,
+        // Phase 3 (copy mode + search).
+        ShortcutAction::CopyMode,
+        ShortcutAction::SearchScrollback,
     ];
 
     /// Human-readable label for the (future) recorder row. Ported verbatim from
@@ -273,6 +289,9 @@ impl ShortcutAction {
             ShortcutAction::SwapPaneDown => "Swap Pane Down",
             ShortcutAction::SwapPaneUp => "Swap Pane Up",
             ShortcutAction::SwapPaneRight => "Swap Pane Right",
+            // Phase 3 (copy mode + search) — same pane-family capitalization.
+            ShortcutAction::CopyMode => "Copy Mode",
+            ShortcutAction::SearchScrollback => "Search Scrollback",
         }
     }
 
@@ -345,6 +364,9 @@ impl ShortcutAction {
             ShortcutAction::SwapPaneDown => "swapPaneDown",
             ShortcutAction::SwapPaneUp => "swapPaneUp",
             ShortcutAction::SwapPaneRight => "swapPaneRight",
+            // Phase 3 (tmux port) — additive again, same load rule 5.
+            ShortcutAction::CopyMode => "copyMode",
+            ShortcutAction::SearchScrollback => "searchScrollback",
         }
     }
 
@@ -477,8 +499,9 @@ impl KeyCombo {
 /// spelling) and `⌘⌥↑`/`⌘⌥↓` are freed — nothing binds them.
 /// The Phase 2 rows finish the ladder: `⌃⌥⌘hjkl` resizes and `⌃⌥⌘⇧hjkl` swaps,
 /// with the pane verbs that have no direction (`⌃⌘-`, `⌃⌘\`, `⌃⌘z`, `⌃⌘b`) on
-/// the bare rung.
-pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 34] {
+/// the bare rung. Phase 3 adds two more of those: `⌃⌘c` (copy mode) and `⌃⌘/`
+/// (search scrollback).
+pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 36] {
     use ShortcutAction::*;
     [
         // The ladder's bare-⌃⌘ rung, vertical axis: j = down the sidebar list
@@ -744,6 +767,25 @@ pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 34] {
                 key: "l",
             },
         ),
+        // -- Phase 3 (tmux port): copy mode + scrollback search --------------
+        // Two more directionless pane verbs on the bare ⌃⌘ rung. `c` was free
+        // there (D2); `/` was the table's last `FuturePhase` reservation, and a
+        // chord may never be both reserved and a default, so that entry is gone
+        // (the disjointness test enforces it).
+        (
+            CopyMode,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "c",
+            },
+        ),
+        (
+            SearchScrollback,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "/",
+            },
+        ),
     ]
 }
 
@@ -920,11 +962,12 @@ pub enum ReservedKind {
     /// Nice (⌃⌘Q lock screen, ⌃⌘Space emoji picker, ⌃⌘D dictionary lookup).
     SystemReserved,
     /// Group (c) — held for a later tmux-port phase, so nothing can squat on
-    /// the chord before that phase claims it. Phase 2 emptied most of this
-    /// group: ⌃⌘Z and ⌃⌘B became real actions, the ⌃⌥⌘hjkl / ⌃⌥⌘⇧hjkl rungs
-    /// became the resize + swap families, and ⌃⌘V / ⌃⌘S were simply released
-    /// (D2 gave the split verbs the divider mnemonics instead). Only ⌃⌘/ is
-    /// still held, for Phase 3.
+    /// the chord before that phase claims it. **Empty since Phase 3.** Phase 2
+    /// emptied most of it (⌃⌘Z and ⌃⌘B became real actions, the ⌃⌥⌘hjkl /
+    /// ⌃⌥⌘⇧hjkl rungs became the resize + swap families, and ⌃⌘V / ⌃⌘S were
+    /// released outright), and Phase 3 spent the last one: ⌃⌘/ is now
+    /// [`ShortcutAction::SearchScrollback`]. The variant stays for the next
+    /// phase that needs to hold a chord.
     FuturePhase,
 }
 
@@ -1006,14 +1049,17 @@ pub const RESERVED_TOGGLE_FULL_SCREEN: ReservedCombo = ReservedCombo {
 /// again, and the `no_default_combo_is_reserved` test pins that the table and the
 /// defaults stay disjoint.
 ///
-/// **Phase 2 shrank this table 20 → 9.** Reserving a chord is a promise to claim
-/// it later, and the disjointness test makes good on that promise the only way it
-/// can: an entry must be REMOVED to become a default. So ⌃⌘Z (zoom), ⌃⌘B
-/// (break-pane) and the eight ⌃⌥⌘[⇧]hjkl rungs (resize + swap) left this table
-/// the moment they became actions, and ⌃⌘V / ⌃⌘S left with them — D2 spent the
-/// split verbs on the divider mnemonics ⌃⌘- / ⌃⌘\ instead, so those two are now
-/// ordinary free chords a user may record (the same end state ⌃⌘U reached).
-pub const RESERVED_COMBOS: [ReservedCombo; 9] = [
+/// **Phase 2 shrank this table 20 → 9; Phase 3 took it to 8.** Reserving a chord
+/// is a promise to claim it later, and the disjointness test makes good on that
+/// promise the only way it can: an entry must be REMOVED to become a default. So
+/// ⌃⌘Z (zoom), ⌃⌘B (break-pane) and the eight ⌃⌥⌘[⇧]hjkl rungs (resize + swap)
+/// left this table the moment they became actions, and ⌃⌘V / ⌃⌘S left with them —
+/// D2 spent the split verbs on the divider mnemonics ⌃⌘- / ⌃⌘\ instead, so those
+/// two are now ordinary free chords a user may record (the same end state ⌃⌘U
+/// reached). Phase 3 spent the last one: ⌃⌘/ is
+/// [`ShortcutAction::SearchScrollback`]'s default, so the group-(c) block is
+/// gone and what remains is only OS chords plus Nice's own fixed accelerators.
+pub const RESERVED_COMBOS: [ReservedCombo; 8] = [
     // (a) Nice's own fixed accelerators.
     RESERVED_QUIT,
     RESERVED_NEW_WINDOW,
@@ -1045,16 +1091,9 @@ pub const RESERVED_COMBOS: [ReservedCombo; 9] = [
         kind: ReservedKind::SystemReserved,
         reason: "Reserved: the macOS dictionary lookup",
     },
-    // (c) Held for a later tmux-port phase. One entry left after Phase 2 spent
-    // the rest: ⌃⌘/ is Phase 3's.
-    ReservedCombo {
-        combo: KeyCombo {
-            modifiers: Modifiers::CONTROL_COMMAND,
-            key: "/",
-        },
-        kind: ReservedKind::FuturePhase,
-        reason: "Reserved for a future Nice feature",
-    },
+    // (c) Held for a later tmux-port phase — EMPTY since Phase 3 claimed ⌃⌘/
+    // for `SearchScrollback`. The next phase that needs to hold a chord adds
+    // its entry back here.
 ];
 
 /// The reserved entry claiming `combo`, or `None` when the chord is free to
@@ -1077,11 +1116,11 @@ mod tests {
     #[test]
     fn table_is_complete_every_action_bound_exactly_once() {
         let table = default_bindings();
-        assert_eq!(table.len(), 34, "34 rebindable actions");
+        assert_eq!(table.len(), 36, "36 rebindable actions");
         assert_eq!(
             ShortcutAction::ALL.len(),
-            34,
-            "ALL enumerates all 34 actions"
+            36,
+            "ALL enumerates all 36 actions"
         );
         // Every action in ALL appears exactly once as a table key.
         for action in ShortcutAction::ALL {
@@ -1163,6 +1202,9 @@ mod tests {
         assert_eq!(combo(ShortcutAction::SwapPaneDown), "cmd-ctrl-alt-shift-j");
         assert_eq!(combo(ShortcutAction::SwapPaneUp), "cmd-ctrl-alt-shift-k");
         assert_eq!(combo(ShortcutAction::SwapPaneRight), "cmd-ctrl-alt-shift-l");
+        // -- Phase 3 (copy mode + search) -------------------------------------
+        assert_eq!(combo(ShortcutAction::CopyMode), "cmd-ctrl-c");
+        assert_eq!(combo(ShortcutAction::SearchScrollback), "cmd-ctrl-/");
     }
 
     /// The pane family's ids, spelled out — they are persistence keys the moment
@@ -1182,6 +1224,19 @@ mod tests {
             (ShortcutAction::SwapPaneDown, "swapPaneDown"),
             (ShortcutAction::SwapPaneUp, "swapPaneUp"),
             (ShortcutAction::SwapPaneRight, "swapPaneRight"),
+        ] {
+            assert_eq!(action.id(), id);
+            assert_eq!(ShortcutAction::from_id(id), Some(action));
+        }
+    }
+
+    /// The Phase 3 ids, spelled out for the same reason as the pane family's:
+    /// they are persistence keys from the moment this ships.
+    #[test]
+    fn phase_three_action_ids_are_spelled_out() {
+        for (action, id) in [
+            (ShortcutAction::CopyMode, "copyMode"),
+            (ShortcutAction::SearchScrollback, "searchScrollback"),
         ] {
             assert_eq!(action.id(), id);
             assert_eq!(ShortcutAction::from_id(id), Some(action));
@@ -1525,16 +1580,20 @@ mod tests {
         }
     }
 
-    /// All three groups are represented, with the counts Phase 2 leaves behind:
-    /// five fixed Nice accelerators, three macOS chords, and the ONE remaining
-    /// future-phase chord (⌃⌘/, Phase 3's).
+    /// Two groups are left, with the counts Phase 3 leaves behind: five fixed
+    /// Nice accelerators and three macOS chords. The future-phase group is
+    /// EMPTY — ⌃⌘/ was its last entry and is now `SearchScrollback`'s default.
     #[test]
     fn reserved_table_covers_the_three_groups() {
         let count = |kind| RESERVED_COMBOS.iter().filter(|r| r.kind == kind).count();
         assert_eq!(count(ReservedKind::FixedAccelerator), 5, "⌘Q ⌘N ⌘W ⌘, ⌃⌘F");
         assert_eq!(count(ReservedKind::SystemReserved), 3, "⌃⌘Q ⌃⌘Space ⌃⌘D");
-        assert_eq!(count(ReservedKind::FuturePhase), 1, "⌃⌘/ is Phase 3's");
-        assert_eq!(RESERVED_COMBOS.len(), 9, "the table is 9 entries after Phase 2");
+        assert_eq!(
+            count(ReservedKind::FuturePhase),
+            0,
+            "Phase 3 spent the last reservation"
+        );
+        assert_eq!(RESERVED_COMBOS.len(), 8, "the table is 8 entries after Phase 3");
 
         // The exact chord spellings, by token.
         let tokens: HashSet<String> = RESERVED_COMBOS
@@ -1550,11 +1609,34 @@ mod tests {
             "cmd-ctrl-q",
             "cmd-ctrl-space",
             "cmd-ctrl-d",
-            "cmd-ctrl-/",
         ] {
             assert!(tokens.contains(token), "{token} must be reserved");
         }
         assert_eq!(tokens.len(), RESERVED_COMBOS.len(), "no duplicate entries");
+        // ⌃⌘/ is no longer reserved: it is a shipped default now, which is what
+        // the doctrine above demands of a promoted reservation.
+        assert!(!tokens.contains("cmd-ctrl-/"), "⌃⌘/ was promoted, not held");
+    }
+
+    /// Phase 3's promotion, from the other side: the recorder no longer refuses
+    /// ⌃⌘/, and the chord belongs to `SearchScrollback`. Recording it is now the
+    /// ordinary conflict path (a user can resolve that), not a refusal they
+    /// cannot.
+    #[test]
+    fn phase_three_promoted_the_last_reserved_chord() {
+        let search = OwnedCombo::from_token("cmd-ctrl-/").unwrap();
+        assert_eq!(reserved_combo(&search), None, "⌃⌘/ is recordable now");
+        assert_eq!(
+            default_combo(ShortcutAction::SearchScrollback).map(|c| OwnedCombo::from(c)),
+            Some(search)
+        );
+        // ⌃⌘C was never reserved — it was simply free on the bare rung (D2).
+        let copy = OwnedCombo::from_token("cmd-ctrl-c").unwrap();
+        assert_eq!(reserved_combo(&copy), None);
+        assert_eq!(
+            default_combo(ShortcutAction::CopyMode).map(|c| OwnedCombo::from(c)),
+            Some(copy)
+        );
     }
 
     /// The chords Phase 2 took off the reserved table are FREE to record now —

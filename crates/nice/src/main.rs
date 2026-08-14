@@ -154,6 +154,7 @@ mod pty_manager;
 mod release_check;
 mod rename_migration;
 mod restore;
+mod search_bar;
 mod session_lifecycle;
 mod session_store;
 mod settings;

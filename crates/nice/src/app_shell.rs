@@ -82,7 +82,12 @@ use nice_model::{Pane, PaneLayout, PaneRect, Side, SplitOrient};
 use nice_term_view::{FontSettings, TerminalSessionHandle, TerminalTheme, TerminalView};
 use nice_theme::color::Srgba;
 
+use crate::inline_rename::{apply_rename_click, FieldColors};
+use crate::search_bar::{
+    dispatch_search_key, search_bar_element, search_bar_is_stale, SearchKeyOutcome,
+};
 use crate::sidebar_shell::SidebarShellView;
+use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::toolbar::WindowToolbarView;
 use crate::window_state::WindowState;
 
@@ -588,6 +593,18 @@ impl WindowHostView {
     /// moves focus here.
     fn leaf_element(&self, pane: &Pane, ctx: &TreeCtx, cx: &mut Context<Self>) -> AnyElement {
         let focused = pane.id == ctx.active_pane_id;
+        // Phase 3: the scrollback search field, when one is open over THIS pane.
+        // Read as an owned snapshot so the state borrow ends before the
+        // listeners below (which mutate that same entity) are built.
+        let search_bar = focused
+            .then(|| {
+                let ws = self.state.read(cx);
+                ws.search_bar()
+                    .filter(|bar| bar.targets_pane(&pane.id))
+                    .map(|bar| bar.paint_snapshot())
+            })
+            .flatten()
+            .map(|bar| self.search_bar_child(bar, ctx.accent, cx));
         let inner: AnyElement = match self.cache.get(&pane.id) {
             Some(view) => view.clone().into_any_element(),
             None => window_placeholder().into_any_element(),
@@ -610,6 +627,11 @@ impl WindowHostView {
                 // roots the corner ticks.
                 el.relative().overflow_hidden()
             })
+            // The search bar is absolute, so its pane's box has to be its
+            // positioning root. In a split that is already true (above); a
+            // single-pane pill becomes `relative` only while a bar is open, so
+            // a pill with no search running still renders exactly as before.
+            .when(!ctx.multi && search_bar.is_some(), |el| el.relative())
             // Capture phase: the terminal's own mouse-down handling (selection,
             // app mouse reporting) stops propagation in some modes, so a bubble
             // listener would miss exactly the clicks that matter most.
@@ -639,7 +661,198 @@ impl WindowHostView {
             // dimming it costs the unfocused panes' legibility nothing.
             // Decided over mocks 2026-08-13: `docs/mocks/pane-focus-mocks.html`.
             .when(ctx.multi && focused, |el| el.children(corner_ticks(ctx.accent)))
+            // Last child, so the field paints over the grid and the ticks.
+            .children(search_bar)
             .into_any_element()
+    }
+
+    /// Build the open search field for the focused pane (Phase 3, P2). Its
+    /// parentage — an absolute child of the pane's own box — is what makes zoom,
+    /// divider drags, window resizes and tree restructures place it correctly
+    /// for free, and it keeps the field off the `TerminalView`'s focus/bubble
+    /// path (the terminal never sees the keys the field is typing).
+    fn search_bar_child(
+        &self,
+        bar: crate::search_bar::SearchBarPaint,
+        accent: Srgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let slots = crate::theme_settings::active_chrome_slots(cx);
+        let colors = FieldColors {
+            bg: slot_to_rgba(slots.panel),
+            border: slot_to_rgba(slots.line_strong),
+            text: slot_to_rgba(slots.ink),
+            caret: srgba_to_rgba(accent),
+            selection: srgba_to_rgba(srgba_with_alpha(accent, 0.3)),
+        };
+        let focus = bar.focus.clone();
+        let click_view = cx.weak_entity();
+        let drag_view = cx.weak_entity();
+        search_bar_element(
+            bar,
+            colors,
+            cx.listener(Self::on_search_key),
+            move |index, click_count, window, app| {
+                // The pane wrapper's CAPTURE-phase mouse-down focuses the pane's
+                // terminal before this bubble-phase handler runs, so a click in
+                // the field would otherwise hand the keyboard back to the grid
+                // mid-edit. Re-take focus here, after that has happened.
+                window.focus(&focus, app);
+                let _ = click_view.update(app, |this, cx| {
+                    this.state.update(cx, |ws, wcx| {
+                        if let Some(bar) = ws.search_bar_mut() {
+                            apply_rename_click(&mut bar.editor, index, click_count);
+                            wcx.notify();
+                        }
+                    });
+                    cx.notify();
+                });
+            },
+            move |index, _window, app| {
+                let _ = drag_view.update(app, |this, cx| {
+                    this.state.update(cx, |ws, wcx| {
+                        if let Some(bar) = ws.search_bar_mut() {
+                            bar.editor.extend_to(index);
+                            wcx.notify();
+                        }
+                    });
+                    cx.notify();
+                });
+            },
+        )
+        .into_any_element()
+    }
+
+    /// One keystroke into the open search field (P7). Editing is the shared
+    /// inline-rename dispatch; the two verbs that are this field's own are Enter
+    /// (confirm: jump to the nearest match, close, stay in copy mode) and Escape
+    /// (close, stay in copy mode where you are).
+    ///
+    /// Every edit pushes the query down to the pane's handle, which is what
+    /// makes the highlighting incremental (P8) — there is no separate "run the
+    /// search" step while typing.
+    fn on_search_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ks = &event.keystroke;
+        let capslock = window.capslock().on;
+        let Some(handle) = self.search_bar_handle(cx) else {
+            return;
+        };
+        let outcome = self.state.update(cx, |ws, wcx| {
+            let bar = ws.search_bar_mut()?;
+            let outcome = dispatch_search_key(
+                &mut bar.editor,
+                // The clipboard chords read/write through the `App` this
+                // `Context` derefs to; the editor borrow above is the entity's,
+                // so the two never overlap.
+                &mut **wcx,
+                &ks.key,
+                ks.key_char.as_deref(),
+                ks.modifiers.shift,
+                ks.modifiers.alt,
+                ks.modifiers.platform,
+                ks.modifiers.control,
+                capslock,
+            );
+            Some((outcome, bar.query()))
+        });
+        let Some((outcome, query)) = outcome else {
+            return;
+        };
+        match outcome {
+            SearchKeyOutcome::Edited => {
+                handle.update(cx, |h, hcx| {
+                    h.set_search_query(&query);
+                    hcx.notify();
+                });
+                cx.notify();
+                cx.stop_propagation();
+            }
+            SearchKeyOutcome::Confirm => {
+                handle.update(cx, |h, hcx| {
+                    // Push the final query first: the last keystroke before
+                    // Enter may have been the one that completed it.
+                    h.set_search_query(&query);
+                    h.confirm_search();
+                    hcx.notify();
+                });
+                self.close_search_bar(window, cx);
+                cx.stop_propagation();
+            }
+            SearchKeyOutcome::Close => {
+                self.close_search_bar(window, cx);
+                cx.stop_propagation();
+            }
+            // Not the field's key (⌃⌘c, ⌘Q, …): let it reach the app keymap.
+            SearchKeyOutcome::Ignored => {}
+        }
+    }
+
+    /// The [`TerminalSessionHandle`] of the pane the open search field is
+    /// driving, if both still exist.
+    fn search_bar_handle(&self, cx: &App) -> Option<Entity<TerminalSessionHandle>> {
+        let ws = self.state.read(cx);
+        let (session_id, term_window_id, pane_id) = ws.search_bar()?.pane_key();
+        ws.ptys.pane_handle(session_id, term_window_id, pane_id)
+    }
+
+    /// Close the search field and hand the keyboard back to the pane's terminal.
+    /// The refocus is the load-bearing half: the field's focus handle dies with
+    /// the element, and a window whose focus points at a handle nothing renders
+    /// is a keyboard-dead window.
+    fn close_search_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, wcx| {
+            if ws.close_search_bar().is_some() {
+                wcx.notify();
+            }
+        });
+        self.focus_active_terminal(window, cx);
+        cx.notify();
+    }
+
+    /// Close an open search field that has gone stale, returning whether it did
+    /// — the three conditions are
+    /// [`search_bar_is_stale`](crate::search_bar::search_bar_is_stale)'s. Run at
+    /// the top of every render, before the tree is built, so a stale bar is
+    /// never painted; the caller re-focuses the terminal on a `true`, which is
+    /// what recovers the keyboard when `⌃⌘c` ended copy mode while the field
+    /// held focus.
+    ///
+    /// Deliberately silent (no `cx.notify()`): this runs inside a render, and
+    /// this pass already reads the closed state.
+    fn sweep_stale_search_bar(
+        &mut self,
+        active: Option<&(String, String, String)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((session_id, term_window_id, pane_id)) = ({
+            let ws = self.state.read(cx);
+            ws.search_bar()
+                .map(|bar| {
+                    let (s, w, p) = bar.pane_key();
+                    (s.to_string(), w.to_string(), p.to_string())
+                })
+        }) else {
+            return false;
+        };
+        let copy_mode = self
+            .state
+            .read(cx)
+            .ptys
+            .pane_handle(&session_id, &term_window_id, &pane_id)
+            .is_some_and(|handle| handle.read(cx).copy_mode_active());
+        let focused = active.map(|(_, _, pane)| pane.as_str());
+        if !search_bar_is_stale(&pane_id, focused, copy_mode) {
+            return false;
+        }
+        self.state.update(cx, |ws, _| {
+            ws.close_search_bar();
+        });
+        true
     }
 
     /// The invisible hit zone between a split's two children — the sidebar
@@ -1407,6 +1620,13 @@ impl Render for WindowHostView {
             self.cache.remove(&stale);
         }
 
+        // Phase 3: an open search bar whose pane lost focus, died, or left copy
+        // mode closes here — before the tree is built, so it is never painted
+        // stale. The keyboard follows it back to the terminal in the focus block
+        // below (a bar that closed while focused would otherwise leave key focus
+        // on a handle nothing renders).
+        let bar_closed = self.sweep_stale_search_bar(active.as_ref(), cx);
+
         // On a PILL switch, run the sole activation path (which now spawns every
         // un-live leaf of the pill's tree, not just one).
         let window_changed = active.as_ref().map(|(s, w, _)| (s.clone(), w.clone()))
@@ -1526,7 +1746,7 @@ impl Render for WindowHostView {
         // just-activated terminal window (spawned synchronously by
         // `activate_term_window`) is focusable this same render. A pane with no
         // hosted view (Claude placeholder) has nothing to focus.
-        if activation_changed || mounted_new {
+        if activation_changed || mounted_new || bar_closed {
             if let Some((_, _, pane)) = &active {
                 if let Some(view) = self.cache.get(pane) {
                     let fh = view.read(cx).focus_handle_ref().clone();
