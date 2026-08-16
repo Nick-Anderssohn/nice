@@ -16,6 +16,13 @@
 //!   Claude windows, [`Session::waiting_acknowledged`], and the
 //!   [`Session::recover_next_terminal_index`] hydration helper.
 //! * [`Project`] — an ordered group of sessions.
+//! * [`PaneLayout`] / [`Pane`] ([`pane_layout`]) — the tmux-port Phase 2 split
+//!   tree hanging off each [`TermWindow`]: the binary `Leaf`/`Split` shape, its
+//!   mutations (split / remove / swap / resize), and the one geometry
+//!   ([`PaneLayout::leaf_rects`], [`directional_neighbor`],
+//!   [`spatial_refocus`]) that render, hit-testing, directional focus, and
+//!   close-refocus all share. Pre-splits every window is a single-leaf tree, so
+//!   nothing about a never-split pill changes.
 //!
 //! **The persistence leaves** (`SessionStore.swift`, model-shaped half):
 //!
@@ -136,6 +143,7 @@
 
 pub mod file_browser;
 pub mod key_hint;
+pub mod pane_layout;
 mod persisted;
 mod project;
 pub mod rename_gate;
@@ -149,7 +157,14 @@ mod term_window;
 mod window_strip_drop;
 mod workspace_model;
 
-pub use persisted::{snapshot_projects, PersistedProject, PersistedSession, PersistedTermWindow};
+pub use pane_layout::{
+    directional_neighbor, spatial_refocus, Pane, PaneDirection, PaneLayout, PaneRect, Side,
+    SplitOrient,
+};
+pub use persisted::{
+    snapshot_projects, PersistedPane, PersistedPaneLayout, PersistedProject, PersistedSession,
+    PersistedTermWindow,
+};
 pub use project::Project;
 pub use key_hint::KeyHintModel;
 pub use rename_gate::InlineRenameClickGate;

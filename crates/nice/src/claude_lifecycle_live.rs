@@ -511,7 +511,11 @@ async fn run_claude_lifecycle(
                                     .update(cx, |shell, _w, _a| shell.scenario_window_host())
                                     .ok()
                                     .and_then(|ph| {
-                                        ph.update(cx, |ph, _| ph.scenario_terminal_for(&parent_window))
+                                        // Pane-keyed cache since Phase 2: ask by pill,
+                                        // the host resolves its focused pane.
+                                        ph.update(cx, |ph, hcx| {
+                                            ph.scenario_terminal_for_window(&parent_window, hcx)
+                                        })
                                     });
                                 match view {
                                     None => failures.push(

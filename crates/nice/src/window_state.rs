@@ -43,7 +43,7 @@
 //! below are exercised by this module's tests.
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The kitty CSI-u encoding of ⌘↩ (`Enter` = codepoint 13, modifier field
 /// 1+super(8) = 9) — the exact bytes the terminal view forwarded for an unbound
@@ -64,13 +64,27 @@ enum ComposeRoute {
     Noop,
 }
 
-use gpui::{AnyWindowHandle, AppContext, Entity};
+/// One pane's inputs to the D-BUSY close gate — see
+/// [`WindowState::window_is_busy`].
+#[derive(Debug, Clone, Copy)]
+struct PaneBusySignal {
+    kind: TermWindowKind,
+    /// The pane's pty AND its pill are both alive.
+    alive: bool,
+    /// The pane's own status (the Claude arm's signal).
+    status: SessionStatus,
+    /// The pane's own `tcgetpgrp`/synthetic answer (the shell arm's signal).
+    has_foreground_child: bool,
+}
+
+use gpui::{AnyWindowHandle, AppContext, Entity, Subscription};
 use nice_model::file_browser::FileBrowserStore;
 use nice_model::{Session, TermWindow, TermWindowKind, KeyHintModel, SidebarMode, SidebarModel, SidebarSessionSelection, WorkspaceModel, SessionStatus};
 use nice_term_view::TerminalEvent;
 
 use crate::confirmation_modal::ConfirmationModal;
 use crate::restore::WindowSeed;
+use crate::search_bar::SearchBarState;
 use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, SocketMessage};
 use crate::window_strip_actions::{ModelWindowStripActions, WindowStripActions};
 use crate::pty_manager::{
@@ -448,13 +462,20 @@ pub(crate) struct WindowState {
     /// on a `WindowState` never mounted by the shipped builder (unit tests /
     /// headless scenarios that assert the routed model mutation only).
     window_handle: Option<AnyWindowHandle>,
-    /// R15 subscription lift: the `<session>:<window>` keys already wired to
+    /// R15 subscription lift, pane-keyed since Phase 2: the live
+    /// `<session>:<window>:<pane>` subscriptions wired to
     /// [`route_terminal_event`](crate::pty_manager::PtyManager::route_terminal_event)
-    /// via [`subscribe_spawned_windows`](WindowState::subscribe_spawned_windows). The
-    /// subscribe-once dedupe: the sweep runs on every `WindowHostView` render, but a
-    /// window is subscribed exactly once (its entity's `Drop` retires the
-    /// subscription when the window leaves the model / teardown).
-    subscribed_windows: HashSet<String>,
+    /// via [`subscribe_spawned_windows`](WindowState::subscribe_spawned_windows).
+    /// The sweep runs on every `WindowHostView` render; a pane is subscribed
+    /// exactly once, and unsubscribed by dropping its [`Subscription`] when the
+    /// pane's pty is gone from the manager.
+    ///
+    /// **Retained, not `.detach()`ed** — that is the load-bearing part. Break-pane
+    /// re-homes a live pane under a different pill, which changes its key; a
+    /// detached subscription could never be re-keyed, so the sweep would either
+    /// leak a subscription per move or (with a window-level key) never subscribe
+    /// a background pane at all.
+    pane_subscriptions: HashMap<String, Subscription>,
     /// W5: the user explicitly closed this window (red traffic light / ⌘W). Set
     /// ONLY by the confirmed close path
     /// ([`set_user_initiated_close`](Self::set_user_initiated_close)); read by
@@ -505,6 +526,28 @@ pub(crate) struct WindowState {
     /// `None` on a `WindowState` never mounted by the shipped builder (unit tests /
     /// headless scenarios), so the fan-out simply skips it.
     window_host: Option<gpui::Entity<crate::app_shell::WindowHostView>>,
+    /// Phase 2: the pane area's last painted size in px (width, height) — the
+    /// region [`crate::app_shell::WindowHostView`] lays the active pill's split
+    /// tree out in, recorded by that host on every render.
+    ///
+    /// It lives here because the pane ACTIONS need px context and cannot
+    /// measure anything: an App-level action handler has no `&mut Window`, and
+    /// the split-refusal (P6 minimum pane size) and the resize step's
+    /// px → ratio conversion both need the painted extent. `None` until the
+    /// window has painted once, which the readers treat as "no px context"
+    /// (split at an even ratio, resize no-op) rather than guessing.
+    pane_content_size: Option<(f32, f32)>,
+    /// Phase 3: the open scrollback-search field, if any — at most one per
+    /// window, keyed to the pane it searches (see
+    /// [`SearchBarState`](crate::search_bar::SearchBarState)).
+    ///
+    /// It lives on the window state rather than on the host view for the same
+    /// reason [`pane_content_size`](Self::pane_content_size) does: the two ways
+    /// it opens are an App-level keymap handler (`⌃⌘/`) and an entity
+    /// subscription callback (in-mode `/` / `?`), and neither has a `&mut
+    /// Window` or a view to write to. `WindowHostView` reads it back on the next
+    /// render and mounts the field over the pane it names.
+    search_bar: Option<SearchBarState>,
 }
 
 /// Selftest instrumentation: a process-global count of demand-present kicks fired
@@ -572,7 +615,7 @@ impl WindowState {
             save_drain: None,
             claude_settings_path: None,
             window_handle: None,
-            subscribed_windows: HashSet::new(),
+            pane_subscriptions: HashMap::new(),
             user_initiated_close: false,
             pending_modal: None,
             modal_sub: None,
@@ -583,6 +626,8 @@ impl WindowState {
             file_browser: FileBrowserStore::new(),
             fork_job_probe: Box::new(probe_fork_job),
             window_host: None,
+            pane_content_size: None,
+            search_bar: None,
         }
     }
 
@@ -677,6 +722,122 @@ impl WindowState {
     /// [`crate::theme_settings::apply_theme_fanout`] reads it to reach the windows.
     pub(crate) fn window_host(&self) -> Option<gpui::Entity<crate::app_shell::WindowHostView>> {
         self.window_host.clone()
+    }
+
+    /// Record the pane area's painted size — see
+    /// [`pane_content_size`](Self::pane_content_size). Written by
+    /// [`crate::app_shell::WindowHostView`]'s render from the size its bounds
+    /// probe captured on the previous paint. Deliberately silent (no
+    /// `cx.notify()`): a size write must never itself schedule a render, or a
+    /// window resize would loop.
+    pub(crate) fn set_pane_content_size(&mut self, size: Option<(f32, f32)>) {
+        self.pane_content_size = size;
+    }
+
+    /// The pane area's last painted size in px, `None` before the first paint.
+    /// The px context the pane actions and the divider drag measure against.
+    pub(crate) fn pane_content_size(&self) -> Option<(f32, f32)> {
+        self.pane_content_size
+    }
+
+    // ---- Phase 3: the scrollback search bar (P2/P7) --------------------------
+
+    /// Open the search field over `pane`, replacing any bar that was open
+    /// elsewhere. Both entry points land here — the `⌃⌘/` keymap action and the
+    /// in-mode `/` / `?` keys, which arrive as a routed
+    /// [`TerminalEvent::SearchRequested`].
+    ///
+    /// Opening a search ENTERS copy mode (P7: highlights are live while typing,
+    /// and D1 makes search "copy mode with a query"), then starts a fresh search
+    /// in `backward`'s direction — dropping any previous query, so a re-open
+    /// never inherits the last one's matches.
+    ///
+    /// **Unless the very same search is already open**: a click into the pane
+    /// leaves the bar open and merely unfocused, and P7 says `⌃⌘/` (or in-mode
+    /// `/` / `?`) REFOCUSES that bar. So when a bar is already open over this
+    /// pane pointing the same way, this is the refocus — the editor, the live
+    /// query, its highlights and the active match all stay. A bar over another
+    /// pane, or one pointing the other way, is a different search and is
+    /// rebuilt.
+    ///
+    /// Key focus is moved by a DEFERRED re-entry through the window handle. It
+    /// cannot be done inline: neither caller has a `&mut Window`, and focusing
+    /// from here would silently do nothing (P2's note). A `WindowState` with no
+    /// stashed handle — unit tests, headless scenarios — simply opens the bar
+    /// without focusing it.
+    pub(crate) fn open_search_bar(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        backward: bool,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        let Some(handle) = self.ptys.pane_handle(session_id, term_window_id, pane_id) else {
+            return;
+        };
+        // Resolved (and the handle cloned out) before the borrow of `self` is
+        // needed again below.
+        let reopened = self.search_bar.as_ref().and_then(|bar| {
+            (bar.pane_key() == (session_id, term_window_id, pane_id) && bar.backward == backward)
+                .then(|| (bar.focus.clone(), bar.query()))
+        });
+        handle.update(cx, |h, hcx| {
+            // Idempotent, and the safety net for the one path that can leave a
+            // bar open over a pane that already left the mode: the close is a
+            // render-time sweep, and nothing has painted since.
+            h.enter_copy_mode();
+            match reopened.as_ref() {
+                // Re-push what the field still holds rather than restart: with
+                // an unchanged query this is a no-op that keeps the compiled
+                // matcher and the active match, and after a copy-mode exit
+                // cleared the engine's copy it puts the highlights back.
+                Some((_, query)) => h.set_search_query(query),
+                None => h.begin_search(backward),
+            }
+            hcx.notify();
+        });
+        let focus = match reopened {
+            Some((focus, _)) => focus,
+            None => {
+                let focus = cx.focus_handle();
+                self.search_bar = Some(SearchBarState::new(
+                    focus.clone(),
+                    backward,
+                    session_id,
+                    term_window_id,
+                    pane_id,
+                ));
+                focus
+            }
+        };
+        if let Some(window) = self.window_handle {
+            cx.defer(move |app| {
+                let _ = window.update(app, |_root, window, app| {
+                    window.focus(&focus, app);
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    /// Close the search field, returning the bar that was open (if any). The
+    /// pane's copy mode and its live query are left alone — Esc closes the field
+    /// and leaves the user IN copy mode where they stand (P7); the Esc after
+    /// that is the one that exits the mode and clears the search (P6).
+    pub(crate) fn close_search_bar(&mut self) -> Option<SearchBarState> {
+        self.search_bar.take()
+    }
+
+    /// The open search field, if any.
+    pub(crate) fn search_bar(&self) -> Option<&SearchBarState> {
+        self.search_bar.as_ref()
+    }
+
+    /// The open search field, mutably — the key handler edits its editor
+    /// through this.
+    pub(crate) fn search_bar_mut(&mut self) -> Option<&mut SearchBarState> {
+        self.search_bar.as_mut()
     }
 
     /// Mirror the model's active session into the multi-selection — the Rust analog of
@@ -795,7 +956,7 @@ impl WindowState {
     /// `session-lifecycle` scenario's `spawn_and_subscribe` (the tranche's known
     /// integration gap: `route_terminal_event` was wired ONLY in that scenario, so
     /// in the shipped app OSC titles/cwd and exits dead-ended at the view adapter).
-    /// Sweeps every live window session and subscribes any not-yet-wired one's entity
+    /// Sweeps every live PANE and subscribes any not-yet-wired one's entity
     /// to [`route_terminal_event`](PtyManager::route_terminal_event), so the
     /// SHIPPED window retitles pills, updates window cwd, and removes exited windows.
     ///
@@ -803,8 +964,21 @@ impl WindowState {
     /// point every spawn flows past (the Main window is spawned before the first
     /// render; deferred terminals spawn through `activate_term_window` on activation; a
     /// Claude session's spawn + the socket newtab spawn each re-render the shell). It is
-    /// idempotent via [`subscribed_windows`](Self::subscribed_windows) (subscribe-once
+    /// idempotent via [`pane_subscriptions`](Self::pane_subscriptions) (subscribe-once
     /// dedupe), so running it every render is safe and cheap.
+    ///
+    /// Pane-level since Phase 2, in both directions:
+    ///
+    /// * a subscription is created per `(session, window, pane)`, so a
+    ///   BACKGROUND pane's exit routes — a window-keyed sweep would wire
+    ///   whichever pane spawned first and dedupe every later one away forever;
+    /// * subscriptions are RETAINED and dropped when their pane's key stops
+    ///   appearing in the sweep, which both frees a dead pane's subscription and
+    ///   re-keys a pane that break-pane re-homed under another pill.
+    ///
+    /// Each closure captures only `(session, pane)` and resolves the owning
+    /// WINDOW from the model at event time, so a re-homed pane's events land in
+    /// its current pill even before the next sweep re-keys it.
     ///
     /// The [`RoutedEvent`](crate::pty_manager) neighbor-refocus spawn is
     /// **composed by `WindowHostView`'s activation path**, not re-actuated here: the
@@ -838,17 +1012,31 @@ impl WindowState {
     /// restore arm. A new arming site must do the same; the sweep is idempotent, so
     /// the extra call costs a `HashSet` lookup per live window.
     pub(crate) fn subscribe_spawned_windows(&mut self, cx: &mut gpui::Context<WindowState>) {
-        for (session_id, term_window_id) in self.ptys.live_window_keys() {
-            let key = format!("{session_id}:{term_window_id}");
-            if self.subscribed_windows.contains(&key) {
+        let live = self.ptys.live_pane_keys();
+        // Retire subscriptions whose pane no longer has a pty under that key —
+        // the pane died, or break-pane moved it to another pill and it is about
+        // to be re-subscribed under the new key below.
+        let live_keys: HashSet<String> = live
+            .iter()
+            .map(|(t, w, pane)| format!("{t}:{w}:{pane}"))
+            .collect();
+        self.pane_subscriptions.retain(|key, _| live_keys.contains(key));
+
+        for (session_id, term_window_id, pane_id) in live {
+            let key = format!("{session_id}:{term_window_id}:{pane_id}");
+            if self.pane_subscriptions.contains_key(&key) {
                 continue;
             }
-            let Some(handle) = self.ptys.term_window_handle(&session_id, &term_window_id) else {
+            let Some(handle) = self
+                .ptys
+                .pane_handle(&session_id, &term_window_id, &pane_id)
+            else {
                 continue;
             };
-            self.subscribed_windows.insert(key);
-            let (t, p) = (session_id.clone(), term_window_id.clone());
-            cx.subscribe(&handle, move |ws, handle, event: &TerminalEvent, cx| {
+            let (t, pane) = (session_id.clone(), pane_id.clone());
+            // `handle` stays named (unlike a plain routing subscription): the
+            // app-typed prefill below writes into the emitting pane's pty.
+            let subscription = cx.subscribe(&handle, move |ws, handle, event: &TerminalEvent, cx| {
                 // Quit freeze: once quit has begun the model is read-only.
                 // `quit_cascade` has already flushed every window's snapshot
                 // (step 2) when its teardown (step 3) kills the windows — and an
@@ -865,16 +1053,42 @@ impl WindowState {
                 if cx.has_global::<crate::lifecycle::AppQuitting>() {
                     return;
                 }
+                // Which pill owns this pane RIGHT NOW — resolved from the model,
+                // not captured, so a pane break-pane re-homed since this
+                // subscription was made still routes to the pill it now lives in.
+                let Some(term_window_id) = ws
+                    .workspace
+                    .session_for(&t)
+                    .and_then(|s| s.window_for_pane(&pane))
+                    .map(|w| w.id.clone())
+                else {
+                    return;
+                };
+                // Phase 3: in-mode `/` and `?` ask the app crate to open the
+                // search field over THIS pane (P2 — the query UI cannot live in
+                // the view crate). Routed here rather than in
+                // `route_terminal_event` because opening the bar is window-state
+                // work, not pty-model routing.
+                if let TerminalEvent::SearchRequested { backward } = event {
+                    ws.open_search_bar(&t, &term_window_id, &pane, *backward, cx);
+                    return;
+                }
                 let workspace = &mut ws.workspace;
                 let selection = &mut ws.selection;
-                let routed = ws
-                    .ptys
-                    .route_terminal_event(workspace, selection, &t, &p, event);
+                let routed = ws.ptys.route_terminal_event(
+                    workspace,
+                    selection,
+                    &t,
+                    &term_window_id,
+                    &pane,
+                    event,
+                );
                 // App-typed prefill (design §6.4): this pane's FIRST OSC 7 handed
                 // back its deferred-resume line, because its shell has no
                 // `print -z` to pre-type it from the rc file. Typing it needs the
                 // session entity, which `route_terminal_event` has no access to —
-                // it arrives here as the subscription's emitter.
+                // it arrives here as the subscription's emitter, so the line goes
+                // to the EMITTING pane by construction, never a sibling's pty.
                 //
                 // **No trailing newline, ever.** The line must sit editable at the
                 // prompt; only the user's Enter runs it. A profile whose rc file
@@ -925,8 +1139,8 @@ impl WindowState {
                         });
                     }
                 }
-            })
-            .detach();
+            });
+            self.pane_subscriptions.insert(key, subscription);
         }
     }
 
@@ -1267,6 +1481,11 @@ impl WindowState {
         self.workspace.mutate_session(session_id, |session| {
             if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                 term_window.kind = TermWindowKind::Claude;
+                // The tree's half of the same flip: mark which LEAF is the Claude
+                // pane, so "kind == Claude iff exactly one Claude leaf" survives
+                // promotion. The socket names the pill, not the pane (P2), so the
+                // focused pane takes the mark.
+                term_window.mark_claude_pane();
                 // The ONLY production false→true flip of `is_claude_running` (the
                 // signal `window_title_changed`'s OSC gate releases on).
                 term_window.is_claude_running = true;
@@ -2482,34 +2701,73 @@ impl WindowState {
     // the two counters never chain.
 
     /// Whether one window is BUSY (D-BUSY, ported 1:1 from Swift's `isBusy`,
-    /// `CloseRequestCoordinator.swift:268-279`). Reads the terminal-foreground
-    /// signal from the [`PtyManager`] seam (synthetic-first, else the
-    /// `tcgetpgrp` probe) only for a `Terminal` window, then defers to the pure
-    /// [`window_is_busy_with`](Self::window_is_busy_with) core.
+    /// `CloseRequestCoordinator.swift:268-279`), **ORed across its panes** since
+    /// Phase 2: a build running in the shell pane beside Claude has to block the
+    /// pill's close, and no pill-level signal can see it.
+    ///
+    /// Each leaf contributes its own signal — the Claude leaf its status, a
+    /// shell leaf its own `tcgetpgrp` probe (synthetic seam first) — through the
+    /// pure [`pane_is_busy_with`](Self::pane_is_busy_with) core. A never-split
+    /// pill has one leaf, so this is the pre-splits predicate verbatim.
     fn window_is_busy(&self, session_id: &str, term_window: &TermWindow, cx: &gpui::App) -> bool {
-        // Short-circuit: only a Terminal window consults the shell foreground signal
-        // (the syscall is skipped entirely for Claude / dead windows).
-        let terminal_has_foreground_child = matches!(term_window.kind, TermWindowKind::Terminal)
-            && self.ptys.shell_has_foreground_child(session_id, &term_window.id, cx);
-        Self::window_is_busy_with(term_window, terminal_has_foreground_child)
+        let signals: Vec<PaneBusySignal> = term_window
+            .layout
+            .leaves()
+            .iter()
+            .map(|pane| {
+                let alive = term_window.is_alive && pane.is_alive;
+                PaneBusySignal {
+                    kind: pane.kind,
+                    alive,
+                    status: self.ptys.resolved_pane_status(session_id, term_window, pane),
+                    // Short-circuit: only a live shell pane consults the
+                    // foreground signal (the syscall is skipped entirely for
+                    // Claude / dead panes).
+                    has_foreground_child: matches!(pane.kind, TermWindowKind::Terminal)
+                        && alive
+                        && self.ptys.pane_has_foreground_child(
+                            session_id,
+                            &term_window.id,
+                            &pane.id,
+                            cx,
+                        ),
+                }
+            })
+            .collect();
+        Self::any_pane_busy(&signals)
     }
 
-    /// The pure D-BUSY predicate given the terminal-foreground signal — the
+    /// The pure OR — a pill is busy iff any of its panes is. Split out so the
+    /// across-leaves rule is testable without a `PtyManager` or a gpui `App`.
+    fn any_pane_busy(signals: &[PaneBusySignal]) -> bool {
+        signals
+            .iter()
+            .any(|s| Self::pane_is_busy_with(s.kind, s.alive, s.status, s.has_foreground_child))
+    }
+
+    /// The pure D-BUSY predicate for ONE pane, given its foreground signal — the
     /// gpui-free core of [`window_is_busy`](Self::window_is_busy), unit-testable
     /// without a `PtyManager` / gpui `App`:
-    /// 1. `!window.is_alive` ⇒ **not busy** (a held/dead window is never busy —
-    ///    dead-first guard).
+    /// 1. not alive ⇒ **not busy** (a held/dead pane is never busy — dead-first
+    ///    guard).
     /// 2. `Claude` ⇒ busy iff `status` is `Thinking`/`Waiting` (an idle Claude at
     ///    rest is disposable; read the PER-PANE status, not any session aggregate).
-    /// 3. `Terminal` ⇒ busy iff `terminal_has_foreground_child` (the caller's
-    ///    `tcgetpgrp`/synthetic signal; a terminal window's `status` is meaningless).
-    fn window_is_busy_with(term_window: &TermWindow, terminal_has_foreground_child: bool) -> bool {
-        if !term_window.is_alive {
+    /// 3. `Terminal` ⇒ busy iff `has_foreground_child` (the caller's
+    ///    `tcgetpgrp`/synthetic signal; a shell pane's status is meaningless).
+    fn pane_is_busy_with(
+        kind: TermWindowKind,
+        alive: bool,
+        status: SessionStatus,
+        has_foreground_child: bool,
+    ) -> bool {
+        if !alive {
             return false;
         }
-        match term_window.kind {
-            TermWindowKind::Claude => matches!(term_window.status, SessionStatus::Thinking | SessionStatus::Waiting),
-            TermWindowKind::Terminal => terminal_has_foreground_child,
+        match kind {
+            TermWindowKind::Claude => {
+                matches!(status, SessionStatus::Thinking | SessionStatus::Waiting)
+            }
+            TermWindowKind::Terminal => has_foreground_child,
         }
     }
 
@@ -2538,20 +2796,32 @@ impl WindowState {
         let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return;
         };
-        let (kind, alive) = (term_window.kind, term_window.is_alive);
-        // A model-only window (no cached session) has no pty to write to.
-        let Some(handle) = self.ptys.term_window_handle(&session_id, &term_window_id) else {
+        // The FOCUSED pane decides, not the pill: an idle shell pane focused
+        // inside a Claude pill is exactly the "shell beside Claude" layout D1
+        // exists for, and ⌘↩ has to compose there. A focused Claude leaf keeps
+        // the pill-era behavior because its own kind is Claude.
+        let pane_id = term_window.effective_pane_id();
+        let Some(pane) = term_window.layout.pane(&pane_id) else {
             return;
         };
-        let fg_child = self.ptys.shell_has_foreground_child(&session_id, &term_window_id, cx);
+        let (kind, alive) = (pane.kind, term_window.is_alive && pane.is_alive);
+        // A model-only pane (no cached session) has no pty to write to.
+        let Some(handle) = self.ptys.pane_handle(&session_id, &term_window_id, &pane_id) else {
+            return;
+        };
+        let fg_child = self
+            .ptys
+            .pane_has_foreground_child(&session_id, &term_window_id, &pane_id, cx);
         let kitty_super = handle.read(cx).session().kitty_forwards_super();
         // What this pane's shell can actually do with the trigger bytes, frozen at
-        // its spawn. A pane with no snapshot (nothing in production reaches here —
-        // the handle lookup above already required a live pty) falls back to the
-        // zsh capability, the pre-abstraction behavior.
+        // its spawn — THE focused pane's snapshot (resolved via `effective_pane_id`
+        // above), never the live profile and never a sibling pane's. A pane with
+        // no snapshot (nothing in production reaches here — the handle lookup
+        // above already required a live pty) falls back to the zsh capability,
+        // the pre-abstraction behavior.
         let compose = self
             .ptys
-            .pane_shell(&session_id, &term_window_id)
+            .pane_shell(&session_id, &term_window_id, &pane_id)
             .map(|shell| shell.compose)
             .unwrap_or(ComposeSupport::Trigger);
         let bytes: &[u8] = match Self::compose_route(kind, alive, fg_child, kitty_super, compose) {
@@ -2925,6 +3195,10 @@ impl WindowState {
         if let Some(socket) = self.control_socket.take() {
             socket.stop();
         }
+        // Drop every retained pane subscription with the ptys they listen to —
+        // the sweep that would otherwise retire them never runs again once this
+        // window is gone.
+        self.pane_subscriptions.clear();
         // Terminate this window's ptys: dropping each cached session handle tears
         // its child process group down (SIGHUP→SIGKILL), so no orphan zsh
         // survives. R18 flushes the session snapshot before this runs. Idempotent.
@@ -6130,6 +6404,22 @@ mod tests {
         p
     }
 
+    /// The pre-splits shape of the busy predicate — a never-split window's sole
+    /// leaf — so the ported Swift parity cases below still read as window-level
+    /// facts now that the core is per-pane.
+    fn window_is_busy_with(window: &TermWindow, terminal_has_foreground_child: bool) -> bool {
+        let pane = window
+            .layout
+            .single_leaf()
+            .expect("these cases model never-split windows");
+        WindowState::pane_is_busy_with(
+            pane.kind,
+            window.is_alive && pane.is_alive,
+            window.status,
+            terminal_has_foreground_child,
+        )
+    }
+
     #[test]
     fn busy_idle_claude_and_idle_shell_are_not_busy() {
         // The core parity assert (Swift `isBusy` `:268-279`): an idle Claude at
@@ -6137,12 +6427,12 @@ mod tests {
         // (no foreground child) is NOT busy — both close with no dialog.
         let idle_claude = claude_window("c", SessionStatus::Idle);
         assert!(
-            !WindowState::window_is_busy_with(&idle_claude, false),
+            !window_is_busy_with(&idle_claude, false),
             "an idle Claude is disposable, not busy"
         );
         let shell = TermWindow::new("t", "npm run dev", TermWindowKind::Terminal);
         assert!(
-            !WindowState::window_is_busy_with(&shell, false),
+            !window_is_busy_with(&shell, false),
             "a shell with no foreground child is idle, not busy"
         );
     }
@@ -6151,7 +6441,7 @@ mod tests {
     fn busy_thinking_or_waiting_claude_is_busy() {
         for status in [SessionStatus::Thinking, SessionStatus::Waiting] {
             assert!(
-                WindowState::window_is_busy_with(&claude_window("c", status), false),
+                window_is_busy_with(&claude_window("c", status), false),
                 "a {status:?} Claude is busy"
             );
         }
@@ -6161,11 +6451,11 @@ mod tests {
     fn busy_terminal_follows_the_foreground_child_signal() {
         let shell = TermWindow::new("t", "cat", TermWindowKind::Terminal);
         assert!(
-            WindowState::window_is_busy_with(&shell, true),
+            window_is_busy_with(&shell, true),
             "a shell WITH a foreground child is busy (the terminal arm follows the syscall/seam)"
         );
         assert!(
-            !WindowState::window_is_busy_with(&shell, false),
+            !window_is_busy_with(&shell, false),
             "the same shell WITHOUT a foreground child is not busy"
         );
     }
@@ -6176,12 +6466,92 @@ mod tests {
         // Claude frozen mid-`Thinking` or a terminal reporting a foreground child.
         let mut dead_claude = claude_window("c", SessionStatus::Thinking);
         dead_claude.is_alive = false;
-        assert!(!WindowState::window_is_busy_with(&dead_claude, false));
+        assert!(!window_is_busy_with(&dead_claude, false));
         let mut dead_shell = TermWindow::new("t", "cat", TermWindowKind::Terminal);
         dead_shell.is_alive = false;
         assert!(
-            !WindowState::window_is_busy_with(&dead_shell, true),
+            !window_is_busy_with(&dead_shell, true),
             "a dead shell is not busy even if a stale foreground-child signal is passed"
+        );
+    }
+
+    // MARK: - Phase 2: the gates go pane-aware
+
+    fn signal(
+        kind: TermWindowKind,
+        alive: bool,
+        status: SessionStatus,
+        has_foreground_child: bool,
+    ) -> PaneBusySignal {
+        PaneBusySignal {
+            kind,
+            alive,
+            status,
+            has_foreground_child,
+        }
+    }
+
+    #[test]
+    fn busy_ors_across_leaves_so_a_build_beside_claude_blocks_the_close() {
+        // The layout D1 exists for: Claude idle in one pane, a build running in
+        // the shell pane next to it. No pill-level signal can see that build —
+        // the pill's own kind is Claude, whose arm never reads a foreground
+        // child — so without the OR the close would go through unconfirmed.
+        let signals = [
+            signal(TermWindowKind::Claude, true, SessionStatus::Idle, false),
+            signal(TermWindowKind::Terminal, true, SessionStatus::Idle, true),
+        ];
+        assert!(WindowState::any_pane_busy(&signals));
+    }
+
+    #[test]
+    fn busy_ignores_a_dead_pane_and_falls_quiet_when_every_pane_is() {
+        // A held corpse pane keeps its last status; it must not hold the pill
+        // open (the dead-first guard, now per leaf).
+        let signals = [
+            signal(TermWindowKind::Claude, false, SessionStatus::Thinking, false),
+            signal(TermWindowKind::Terminal, true, SessionStatus::Idle, false),
+        ];
+        assert!(!WindowState::any_pane_busy(&signals));
+    }
+
+    #[test]
+    fn compose_routes_on_the_focused_pane_not_the_pill() {
+        // A Claude pill split with a shell. With the SHELL focused, ⌘↩ must
+        // compose — that is the whole point of "a shell beside Claude" (D1) —
+        // even though the pill's own kind is Claude.
+        let mut pill = TermWindow::new("c", "Claude", TermWindowKind::Claude);
+        assert!(pill.layout.split(
+            "c",
+            nice_model::SplitOrient::Beside,
+            nice_model::Pane::new("shell", TermWindowKind::Terminal),
+        ));
+        pill.active_pane_id = "shell".into();
+
+        let focused = pill.layout.pane(&pill.effective_pane_id()).unwrap();
+        assert_eq!(
+            WindowState::compose_route(
+                focused.kind,
+                pill.is_alive && focused.is_alive,
+                false,
+                false,
+                ComposeSupport::Trigger,
+            ),
+            ComposeRoute::Trigger
+        );
+
+        // Focus back on the Claude leaf ⇒ exactly today's behavior.
+        pill.active_pane_id = "c".into();
+        let focused = pill.layout.pane(&pill.effective_pane_id()).unwrap();
+        assert_eq!(
+            WindowState::compose_route(
+                focused.kind,
+                pill.is_alive && focused.is_alive,
+                false,
+                false,
+                ComposeSupport::Trigger,
+            ),
+            ComposeRoute::Noop
         );
     }
 
@@ -6398,7 +6768,7 @@ mod tests {
                 .spawn_window(&session_id, &window_id, spec, cx)
                 .expect("spawn a real bash pane");
             ws.ptys
-                .record_pending_prefill(&session_id, &window_id, LINE.to_string());
+                .record_pending_prefill(&session_id, &window_id, &window_id, LINE.to_string());
             ws.subscribe_spawned_windows(cx);
         });
 
@@ -6440,7 +6810,7 @@ mod tests {
         );
         state.update(cx, |ws, _| {
             assert_eq!(
-                ws.ptys.pending_prefill(&session_id, &window_id),
+                ws.ptys.pending_prefill(&session_id, &window_id, &window_id),
                 None,
                 "the slot is emptied by the delivery"
             );
@@ -6503,7 +6873,7 @@ mod tests {
                 cx,
             );
             assert_eq!(
-                ws.ptys.pending_prefill(&session_id, &window_id),
+                ws.ptys.pending_prefill(&session_id, &window_id, &window_id),
                 Some("claude --resume SID"),
                 "the bash spawn armed the pane's app-typed prefill"
             );
@@ -6519,7 +6889,7 @@ mod tests {
 
         state.update(cx, |ws, _| {
             assert_eq!(
-                ws.ptys.pending_prefill(&session_id, &window_id),
+                ws.ptys.pending_prefill(&session_id, &window_id, &window_id),
                 None,
                 "the first OSC 7 reached a subscriber — without the spawn-time subscribe it \
                  would have been dropped, leaving the line armed for the user's next `cd`"

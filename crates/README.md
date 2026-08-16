@@ -126,13 +126,16 @@ The GPUI application. Structure (grows over later cycles):
   `WindowState`, the toolbar, and the sidebar — re-rendering the whole subtree on any
   notify, so a pill/row click (which notifies only its own view) still switches the
   `WindowHostView` sibling's content. `WindowHostView` is the window-content host (the
-  PROTECTED activation decision): it maps the active `(session_id, window_id)` →
-  `PtyManager::term_window_handle` → a per-window, lazily-created, cached `TerminalView`
+  PROTECTED activation decision): it maps `(session_id, window_id, pane_id)` →
+  `PtyManager::pane_handle` → a per-PANE, lazily-created, cached `TerminalView`
   (shared theme/accent/font + the same platform probe injections `open_managed_window`
   used), with activation flowing **only** through `PtyManager::activate_term_window` (R13
   deferred-spawn + focus preserved verbatim, no view-side spawn), dropping a departed
-  window's view and re-pointing the demand-present kick to the active window on every
-  switch. **R15 subscription lift:** `WindowHostView`'s render also runs
+  pane's view and re-pointing the demand-present kick to every visible pane on every
+  switch. Since the tmux-port Phase 2 it mounts the active pill's whole `PaneLayout`
+  tree — N views, one per leaf, laid out as nested flex rows/columns whose bases are
+  the split ratios, so the painted rects match `PaneLayout::leaf_rects`; a never-split
+  pill is a single leaf and renders exactly as it did pre-splits. **R15 subscription lift:** `WindowHostView`'s render also runs
   `WindowState::subscribe_spawned_windows` — the single choke point every spawn flows
   past (the Main window forks before the first render; deferred terminals fork through
   `activate_term_window`; a Claude session / socket newtab spawn re-renders the shell). It
@@ -1229,11 +1232,20 @@ The GPUI application. Structure (grows over later cycles):
     (`table_bindings` and `rebuild_keymap`) go through, so the default board and
     the live board can never disagree. (b) `ScrollHalfPageUp`/`Down` is the first
     keymap action that reaches a terminal view: it resolves the active window's
-    handle through `PtyManager::term_window_handle`, no-ops on the alternate
-    screen (`is_alt_screen`), and follows `perform_scrollback`'s notify
-    discipline. (c) `FocusPaneUp`/`Down` are registered with EMPTY handlers (D3)
-    so the chord is consumed by the keymap instead of leaking to the pty, and
-    Phase 2 only has to fill the bodies in. `non_rebindable_bindings` now spells
+    FOCUSED PANE from the model (`TermWindow::effective_pane_id`) and asks
+    `PtyManager::pane_handle` for its handle — never the pty map's lagging
+    active-pane mirror, which a `⌃⌘⇧hjkl` move, a pane click or a split leaves
+    naming the pane the user just left — then no-ops on the alternate screen
+    (`is_alt_screen`) and follows `perform_scrollback`'s notify discipline. (c)
+    the four `FocusPane*` actions are the ladder's `⌃⌘⇧hjkl` rung — directional
+    PANE focus, tmux's `select-pane -L/-D/-U/-R`. Phase 1 shipped them
+    registered with EMPTY handlers (D3) so the chord was consumed by the keymap
+    instead of leaking to the pty while there were no panes to move between;
+    Phase 2 filled the bodies in — each now calls
+    `focus_pane(cx, PaneDirection::…)`, which walks
+    `TermWindow::nominal_leaf_rects` from the focused pane and re-points
+    `active_pane_id` (unzooming on the way). No binding moved.
+    `non_rebindable_bindings` now spells
     its five fixed accelerators FROM `RESERVED_COMBOS`, so the install and the
     recorder's guard read one table. `on_window_modifiers_changed` grew a second
     overlay beside the peek clear: `update_hint_overlay` arms/cancels the D5
@@ -1827,13 +1839,15 @@ rebindable (New Window ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent
 this table — they live as fixed actions in `crates/nice`.
 
 Phase 1 added two data structures beside the table. `RESERVED_COMBOS` is the
-20-entry reserved set the recorder refuses, each with a `ReservedKind` and a
-user-facing reason: the five fixed accelerators (⌘Q ⌘N ⌘W ⌘, ⌃⌘F — which
-`crates/nice` also INSTALLS from these entries, so guard and install cannot
-drift), the three macOS-owned chords (⌃⌘Q lock screen, ⌃⌘Space emoji, ⌃⌘D
-dictionary), and the twelve future-phase chords (D4's ⌃⌘z ⌃⌘v ⌃⌘s ⌃⌘/ plus the
-hjkl ladder's ⌃⌥⌘hjkl resize and ⌃⌥⌘⇧hjkl swap rungs); `reserved_combo()` looks
-a full masked (modifiers, key) pair up. `WINDOW_INDEX_KEYS` is
+reserved set the recorder refuses, each entry with a `ReservedKind` and a
+user-facing reason — now 9 entries: the five fixed accelerators (⌘Q ⌘N ⌘W ⌘,
+⌃⌘F — which `crates/nice` also INSTALLS from these entries, so guard and
+install cannot drift), the three macOS-owned chords (⌃⌘Q lock screen, ⌃⌘Space
+emoji, ⌃⌘D dictionary), and one future-phase chord, ⌃⌘/ (Phase 3 scrollback
+search). Phase 1 shipped the table at 20 entries; Phase 2 claimed ⌃⌘z and the
+hjkl ladder's ⌃⌥⌘hjkl resize / ⌃⌥⌘⇧hjkl swap rungs as real bindings and freed
+⌃⌘v/⌃⌘s outright (bound to nothing, recordable). `reserved_combo()` looks a
+full masked (modifiers, key) pair up. `WINDOW_INDEX_KEYS` is
 the nine digits `WindowByIndex` stands for — `conflicting_action` treats that
 action as claiming its modifiers paired with EVERY one of them, in both
 directions. The table and the defaults are DISJOINT, pinned by a test: ⌃⌘D was

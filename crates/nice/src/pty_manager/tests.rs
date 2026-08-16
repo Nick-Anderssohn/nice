@@ -800,6 +800,8 @@ fn route_title_changed_updates_terminal_window_pill() {
         &mut selection(),
         "t1",
         &terminal_id,
+        // A never-split window's sole pane carries the window's own id.
+        &terminal_id,
         &TerminalEvent::TitleChanged("nvim foo.rb".to_string()),
     );
 
@@ -823,6 +825,7 @@ fn route_cwd_changed_writes_window_cwd_only() {
         &mut model,
         &mut selection(),
         "t1",
+        "p1",
         "p1",
         &TerminalEvent::CwdChanged(std::path::PathBuf::from("/Users/nick/Downloads")),
     );
@@ -856,12 +859,14 @@ fn route_title_reset_and_output_started_leave_the_pill() {
         &mut selection(),
         "t1",
         &terminal_id,
+        &terminal_id,
         &TerminalEvent::TitleReset,
     );
     mgr.route_terminal_event(
         &mut model,
         &mut selection(),
         "t1",
+        &terminal_id,
         &terminal_id,
         &TerminalEvent::OutputStarted,
     );
@@ -1766,12 +1771,12 @@ fn spawned_pane_snapshots_the_active_profile(cx: &mut gpui::TestAppContext) {
         let mut mgr = PtyManager::new();
         mgr.set_event_wakes_enabled_for_test(false);
         mgr.spawn_window("t1", "p1", spec(), cx).unwrap();
-        assert_eq!(mgr.pane_shell("t1", "p1"), Some(zsh));
+        assert_eq!(mgr.pane_shell("t1", "p1", "p1"), Some(zsh));
 
         // 2. A zsh runtime ⇒ the same snapshot, read off the profile this time.
         crate::app::set_scenario_shell_inject_config(cx, None, None);
         mgr.spawn_window("t1", "p2", spec(), cx).unwrap();
-        assert_eq!(mgr.pane_shell("t1", "p2"), Some(zsh));
+        assert_eq!(mgr.pane_shell("t1", "p2", "p2"), Some(zsh));
 
         // 3. A fallback runtime ⇒ a pane that must never receive trigger bytes.
         cx.set_global(crate::shell::ShellRuntime {
@@ -1783,7 +1788,7 @@ fn spawned_pane_snapshots_the_active_profile(cx: &mut gpui::TestAppContext) {
         });
         mgr.spawn_window("t1", "p3", spec(), cx).unwrap();
         assert_eq!(
-            mgr.pane_shell("t1", "p3"),
+            mgr.pane_shell("t1", "p3", "p3"),
             Some(crate::shell::PaneShell {
                 kind: crate::shell::ShellKind::Other,
                 compose: crate::shell::ComposeSupport::None,
@@ -1792,12 +1797,12 @@ fn spawned_pane_snapshots_the_active_profile(cx: &mut gpui::TestAppContext) {
 
         // 4. The earlier panes keep THEIR snapshot — a mid-run profile swap never
         //    reaches back into a running pane (design §2: runtime-only, per pane).
-        assert_eq!(mgr.pane_shell("t1", "p1"), Some(zsh));
-        assert_eq!(mgr.pane_shell("t1", "p2"), Some(zsh));
+        assert_eq!(mgr.pane_shell("t1", "p1", "p1"), Some(zsh));
+        assert_eq!(mgr.pane_shell("t1", "p2", "p2"), Some(zsh));
 
         // 5. A window with no live pty has no snapshot.
-        assert_eq!(mgr.pane_shell("t1", "nope"), None);
-        assert_eq!(mgr.pane_shell("nope", "p1"), None);
+        assert_eq!(mgr.pane_shell("t1", "nope", "nope"), None);
+        assert_eq!(mgr.pane_shell("nope", "p1", "p1"), None);
 
         mgr.teardown();
     });
@@ -2323,7 +2328,7 @@ fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
         .expect("the deferred-resume spawn returns Ok even when the child dies at chdir");
 
         assert_eq!(
-            mgr.pending_prefill("t1", &claude_window),
+            mgr.pending_prefill("t1", &claude_window, &claude_window),
             Some("claude --settings '/s.json' --resume SID"),
             "an app-typed pane is armed at spawn"
         );
@@ -2335,6 +2340,8 @@ fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
             &mut model,
             &mut selection,
             "t1",
+            &claude_window,
+            // A never-split window's sole pane carries the window's own id.
             &claude_window,
             &TerminalEvent::CwdChanged("/tmp/first".into()),
         );
@@ -2357,11 +2364,13 @@ fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
             &mut selection,
             "t1",
             &claude_window,
+            // A never-split window's sole pane carries the window's own id.
+            &claude_window,
             &TerminalEvent::CwdChanged("/tmp/second".into()),
         );
         assert_eq!(routed.prefill, None, "the slot is emptied by the first take");
         assert_eq!(
-            mgr.pending_prefill("t1", &claude_window),
+            mgr.pending_prefill("t1", &claude_window, &claude_window),
             None,
             "and stays empty"
         );
@@ -2386,7 +2395,7 @@ fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
         )
         .expect("spawn");
         assert_eq!(
-            mgr.pending_prefill("t2", &zsh_window),
+            mgr.pending_prefill("t2", &zsh_window, &zsh_window),
             None,
             "a shell-side profile is never armed"
         );
@@ -2394,6 +2403,7 @@ fn deferred_resume_arms_the_pending_prefill_and_the_first_osc7_takes_it(
             &mut model,
             &mut selection,
             "t2",
+            &zsh_window,
             &zsh_window,
             &TerminalEvent::CwdChanged("/tmp/zsh".into()),
         );
@@ -2999,5 +3009,460 @@ fn dispatch_extra_args_bare_task_file_name_omits_add_dir() {
     assert_eq!(
         dispatch_extra_args("wt", "t.md", "", "", "P"),
         vec!["--worktree", "wt", "P"]
+    );
+}
+
+// ===========================================================================
+// tmux-port Phase 2 — panes: exit / hold / status / break-pane
+//
+// The pty CACHE half of these paths needs a gpui `App` to spawn a real handle,
+// which the `nice` binary crate cannot link (see this module's header), so what
+// is pinned here is the model half — which is where every user-visible
+// consequence lives. The handle moves and subscription re-keying are covered by
+// the `splits` live scenario.
+// ===========================================================================
+
+/// Split `window_id`'s pill by adding a shell leaf `new_pane_id` beside the
+/// existing one, focused — what the `^⌘\` action does to the model.
+fn split_window(model: &mut WorkspaceModel, session_id: &str, window_id: &str, new_pane_id: &str) {
+    model.mutate_session(session_id, |session| {
+        let window = session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == window_id)
+            .expect("window to split");
+        let target = window.active_pane_id.clone();
+        assert!(window.layout.split(
+            &target,
+            nice_model::SplitOrient::Beside,
+            nice_model::Pane::new(new_pane_id, TermWindowKind::Terminal),
+        ));
+        window.active_pane_id = new_pane_id.to_string();
+    });
+}
+
+fn window_in<'a>(model: &'a WorkspaceModel, session_id: &str, window_id: &str) -> &'a TermWindow {
+    model
+        .session_for(session_id)
+        .unwrap()
+        .windows
+        .iter()
+        .find(|w| w.id == window_id)
+        .expect("window still on the session")
+}
+
+#[test]
+fn pane_exit_in_a_split_pill_collapses_the_tree_and_keeps_the_pill() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    let res = mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id, "shell");
+
+    let window = window_in(&model, "t1", &claude_id);
+    assert_eq!(window.layout.leaf_count(), 1, "the split collapsed");
+    assert_eq!(
+        window.active_pane_id, claude_id,
+        "focus moved spatially to the surviving pane"
+    );
+    assert_eq!(
+        model.session_for("t1").unwrap().windows.len(),
+        2,
+        "a pane close is not a pill close"
+    );
+    assert_eq!(
+        res,
+        super::WindowExitResolution::default(),
+        "no session can dissolve while the pill still has panes"
+    );
+}
+
+#[test]
+fn last_pane_exit_delegates_to_the_pill_close_flow() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_session(&mut model, "t1");
+
+    // The pill's only pane — this is a pill close, index-neighbor refocus and all.
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id, &claude_id);
+
+    let session = model.session_for("t1").unwrap();
+    assert_eq!(
+        session.windows.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+        vec![terminal_id.clone()],
+        "the pill left the session"
+    );
+    assert_eq!(session.active_window_id.as_deref(), Some(terminal_id.as_str()));
+}
+
+#[test]
+fn a_claude_leaf_exiting_cleanly_flips_the_pill_to_terminal() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == claude_id)
+            .unwrap()
+            .is_claude_running = true;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id, &claude_id);
+
+    let window = window_in(&model, "t1", &claude_id);
+    assert_eq!(
+        window.kind,
+        TermWindowKind::Terminal,
+        "no Claude leaf, no Claude pill — the pill is just its shells now"
+    );
+    assert!(!window.is_claude_running);
+    assert!(
+        window.layout_is_valid(),
+        "the kind flip is what keeps the invariant true"
+    );
+    assert!(
+        !model.session_for("t1").unwrap().has_claude(),
+        "the sidebar dot must stop tracking a Claude that is gone"
+    );
+}
+
+#[test]
+fn a_held_claude_leaf_keeps_the_pill_claude_and_alive() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        let window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
+        window.is_claude_running = true;
+        window.status = SessionStatus::Thinking;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    mgr.pane_held(&mut model, "t1", &claude_id, &claude_id);
+
+    let window = window_in(&model, "t1", &claude_id);
+    assert_eq!(window.kind, TermWindowKind::Claude, "a held leaf is not removed");
+    assert!(
+        window.is_alive,
+        "the shell pane beside it keeps the pill alive — this is the whole point of per-leaf holds"
+    );
+    assert!(!window.layout.pane(&claude_id).unwrap().is_alive);
+    assert!(!window.is_claude_running, "a held pty is a corpse, not a live Claude");
+    assert_eq!(window.status, SessionStatus::Idle);
+    assert!(
+        !model.session_for("t1").unwrap().has_claude(),
+        "a dead Claude stops counting the moment it dies, not when the pill closes"
+    );
+}
+
+#[test]
+fn holding_the_last_pane_still_kills_the_pill() {
+    // The pre-splits behavior, unchanged for every never-split pill.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+
+    mgr.pane_held(&mut model, "t1", &claude_id, &claude_id);
+
+    let window = window_in(&model, "t1", &claude_id);
+    assert!(!window.is_alive);
+    assert!(!window.any_pane_alive());
+}
+
+#[test]
+fn a_shell_pane_holding_leaves_a_running_claude_alone() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        let window = session.windows.iter_mut().find(|w| w.id == claude_id).unwrap();
+        window.is_claude_running = true;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    mgr.pane_held(&mut model, "t1", &claude_id, "shell");
+
+    let window = window_in(&model, "t1", &claude_id);
+    assert!(window.is_alive);
+    assert!(
+        window.is_claude_running,
+        "the shell died, not Claude — the promotion guard must not be cleared"
+    );
+    assert!(model.session_for("t1").unwrap().has_claude());
+}
+
+#[test]
+fn pill_status_is_the_or_across_its_panes() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == claude_id)
+            .unwrap()
+            .is_claude_running = true;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    // Claude thinking, shell silent ⇒ the pill is thinking.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, &claude_id, "\u{2840} fix-bug");
+    assert_eq!(window_in(&model, "t1", &claude_id).status, SessionStatus::Thinking);
+
+    // A `claude` the user started by hand in the SHELL pane goes waiting; Claude
+    // stays thinking, so the OR keeps the pill thinking.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "\u{2733} needs-input");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Thinking,
+        "thinking beats waiting"
+    );
+
+    // Claude's pane dies. Its contribution drops out, but the shell's hand-run
+    // claude is still waiting, so the pill must stay lit — this is what the OR
+    // buys over a single window-level status.
+    mgr.pane_held(&mut model, "t1", &claude_id, &claude_id);
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Waiting,
+        "one pane falling silent can't un-light a pill whose other pane still wants attention"
+    );
+
+    // The last lit pane goes quiet ⇒ the pill goes dark.
+    mgr.pane_held(&mut model, "t1", &claude_id, "shell");
+    assert_eq!(window_in(&model, "t1", &claude_id).status, SessionStatus::Idle);
+}
+
+#[test]
+fn a_shell_panes_hand_run_claude_un_lights_the_pill_when_it_exits() {
+    // The clearing half of P9's OR. A shell pane has no exit signal of its own —
+    // the hand-run `claude` quits and the shell just goes back to printing its
+    // own title — so a title that parses to NO status has to mean "idle", or the
+    // pill stays lit over an idle prompt forever.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "\u{2733} needs-input");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Waiting,
+        "a hand-run claude in a shell pane lights the pill (P9's OR)"
+    );
+
+    // `claude` exits; the shell's next OSC title is its own again.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "zsh");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Idle,
+        "a spinner-less title must retire the pane's recorded status"
+    );
+
+    // And it can light up again on the next hand-run claude — the entry was
+    // cleared, not poisoned.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "\u{2840} fix-bug");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Thinking
+    );
+}
+
+#[test]
+fn a_shell_panes_plain_title_leaves_the_claude_leaf_lit() {
+    // The clearing rule is per-PANE: a shell pane going quiet must not reach
+    // across and idle the Claude leaf, whose status the control socket owns.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == claude_id)
+            .unwrap()
+            .is_claude_running = true;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, &claude_id, "\u{2840} fix-bug");
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "zsh");
+
+    assert_eq!(
+        window_in(&model, "t1", &claude_id).status,
+        SessionStatus::Thinking,
+        "the shell pane's silence is its own, not the Claude pane's"
+    );
+}
+
+#[test]
+fn a_never_split_terminal_pill_still_has_no_status() {
+    // The spinner parse is a SPLIT-pill affordance; a lone terminal window's
+    // status stays as meaningless as it has always been.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
+
+    mgr.pane_title_changed(&mut model, "t1", "p1", "p1", "\u{2840} fix-bug");
+
+    assert_eq!(window_in(&model, "t1", "p1").status, SessionStatus::Idle);
+}
+
+#[test]
+fn a_shell_pane_title_never_reaches_the_claude_branch() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == claude_id)
+            .unwrap()
+            .is_claude_running = true;
+    });
+    split_window(&mut model, "t1", &claude_id, "shell");
+    let title_before = model.session_for("t1").unwrap().title.clone();
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "shell", "\u{2840} nvim foo.rb");
+
+    assert_eq!(
+        model.session_for("t1").unwrap().title,
+        title_before,
+        "only the Claude leaf's label feeds the session auto-title"
+    );
+}
+
+#[test]
+fn only_the_focused_pane_writes_the_pill_label() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
+    split_window(&mut model, "t1", "p1", "shell"); // focus follows the new pane
+
+    let changed = mgr.pane_title_changed(&mut model, "t1", "p1", "p1", "nvim foo.rb");
+    assert!(!changed, "a background pane must not rename what the user is reading");
+    assert_eq!(window_in(&model, "t1", "p1").title, "zsh");
+
+    assert!(mgr.pane_title_changed(&mut model, "t1", "p1", "shell", "htop"));
+    assert_eq!(window_in(&model, "t1", "p1").title, "htop");
+}
+
+#[test]
+fn osc_cwd_lands_on_the_emitting_pane_and_the_pill_follows_focus() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
+    split_window(&mut model, "t1", "p1", "shell");
+
+    mgr.pane_cwd_changed(&mut model, "t1", "p1", "p1", "/tmp/background");
+    mgr.pane_cwd_changed(&mut model, "t1", "p1", "shell", "/tmp/focused");
+
+    let window = window_in(&model, "t1", "p1");
+    assert_eq!(window.layout.pane("p1").unwrap().cwd.as_deref(), Some("/tmp/background"));
+    assert_eq!(window.layout.pane("shell").unwrap().cwd.as_deref(), Some("/tmp/focused"));
+    assert_eq!(
+        window.cwd.as_deref(),
+        Some("/tmp/focused"),
+        "the pill's cwd tracks the pane the user is looking at"
+    );
+    assert_eq!(model.session_for("t1").unwrap().cwd, "/tmp/anchor", "Session.cwd stays anchored");
+}
+
+#[test]
+fn break_pane_inserts_the_moved_pane_as_the_next_pill() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+    mgr.pane_cwd_changed(&mut model, "t1", &claude_id, "shell", "/tmp/work");
+
+    let new_id = mgr
+        .move_pane_to_new_window(&mut model, "t1", &claude_id, "shell")
+        .expect("a shell pane in a split pill can break out");
+
+    let session = model.session_for("t1").unwrap();
+    assert_eq!(
+        session.windows.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+        vec![claude_id.clone(), new_id.clone(), terminal_id],
+        "the new pill lands right after the one it came from"
+    );
+    let source = window_in(&model, "t1", &claude_id);
+    assert_eq!(source.layout.leaf_count(), 1);
+    assert_eq!(source.active_pane_id, claude_id, "focus fell back into the source pill");
+
+    let moved = window_in(&model, "t1", &new_id);
+    assert_eq!(moved.kind, TermWindowKind::Terminal);
+    assert_eq!(moved.title, "Terminal 2", "the new pill takes the next auto-name slot");
+    assert_eq!(moved.cwd.as_deref(), Some("/tmp/work"));
+    assert_eq!(
+        moved.active_pane_id, "shell",
+        "the pane keeps its id, which is what lets its live pty re-key without respawning"
+    );
+    assert!(moved.layout_is_valid());
+}
+
+#[test]
+fn break_pane_refuses_the_claude_pane_and_an_unsplit_pill() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+
+    assert!(
+        mgr.move_pane_to_new_window(&mut model, "t1", &claude_id, &claude_id)
+            .is_none(),
+        "breaking out a pill's only pane is just a rename"
+    );
+
+    split_window(&mut model, "t1", &claude_id, "shell");
+    assert!(
+        mgr.move_pane_to_new_window(&mut model, "t1", &claude_id, &claude_id)
+            .is_none(),
+        "a Claude leaf must never become a pill through this path (P3)"
+    );
+    assert_eq!(model.session_for("t1").unwrap().windows.len(), 2);
+}
+
+// The pane-keyed cores guard against a stale pane id (a direct caller passing a
+// pane the tree no longer holds). The live subscription path resolves the owning
+// window from the pane first, so these guards are only reachable by such callers
+// — pin them as no-ops the way the window-level twins are pinned.
+
+#[test]
+fn pane_title_changed_unknown_pane_is_noop() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    let before = window_in(&model, "t1", &claude_id).clone();
+    let changed = mgr.pane_title_changed(&mut model, "t1", &claude_id, "ghost-pane", "\u{2840} fix-bug");
+    assert!(!changed, "a stale pane id must not report a change");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id),
+        &before,
+        "neither the pill title/status nor any pane may move"
+    );
+}
+
+#[test]
+fn pane_cwd_changed_unknown_pane_is_noop() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    let before = window_in(&model, "t1", &claude_id).clone();
+    let changed = mgr.pane_cwd_changed(&mut model, "t1", &claude_id, "ghost-pane", "/tmp/ghost");
+    assert!(!changed, "a stale pane id must not report a change");
+    assert_eq!(
+        window_in(&model, "t1", &claude_id),
+        &before,
+        "neither the pill cwd nor any pane may move"
     );
 }

@@ -199,18 +199,44 @@ pub(crate) struct RoutedEvent {
     pub(crate) prefill: Option<String>,
 }
 
-/// One live window session: the core→gpui adapter entity for this window. Dropping
-/// the entity tears the child process group down (SIGHUP→SIGKILL via
-/// `nice_term_core::Session::drop`), so a session entry removed from the cache leaks
+/// One window's live ptys — **one per pane** since tmux-port Phase 2. Dropping
+/// an entity tears its child process group down (SIGHUP→SIGKILL via
+/// `nice_term_core::Session::drop`), so an entry removed from the cache leaks
 /// no zsh.
 ///
-/// Key focus is NOT owned here. The window's `TerminalView` mints and tracks its
+/// Key focus is NOT owned here. Each pane's `TerminalView` mints and tracks its
 /// own focus handle, and the window host ([`crate::app_shell::WindowHostView`]) —
-/// which owns the views — routes key focus to it on activation. An earlier
-/// design minted a focus handle on this struct for the manager to drive, but it
-/// was never wired to any view, so focusing it did nothing; it has been removed.
+/// which owns the views — routes key focus to the focused pane's on activation.
 struct WindowPty {
-    /// The `nice-term-view` adapter entity owning this window's `Session`.
+    /// `pane_id -> that pane's live state` ([`PaneState`]: the nice-term-view
+    /// adapter entity owning the pane's Session, plus its per-pane shell facts).
+    /// Never empty: the last pane's removal drops the whole `WindowPty`, which
+    /// is what keeps [`PtyManager::has_window`] meaning "this pill has a pty".
+    panes: HashMap<String, PaneState>,
+    /// Which pane a **pane-less** lookup resolves to — the pill-scoped
+    /// [`PtyManager::term_window_handle`] callers, which today are the self-test
+    /// scenarios that pre-date splits and never split a pill.
+    ///
+    /// A mirror of the model's `TermWindow.active_pane_id`, not a second source
+    /// of truth — and a LAGGING one: it is re-synced from the model on window
+    /// activation and on a pane exit ([`PtyManager::sync_active_pane`]), and
+    /// repaired when the pane it names dies, but NOT on the focus moves that
+    /// never re-activate the pill (`⌃⌘⇧hjkl`, a pane click, a split). Anything
+    /// user-facing that means "the terminal the user is looking at" therefore
+    /// resolves the pane from the model
+    /// ([`effective_pane_id`](nice_model::TermWindow::effective_pane_id)) and
+    /// asks [`PtyManager::pane_handle`] — half-page scroll and Command Compose
+    /// both do. A never-split pill has exactly one pane, so the mirror is
+    /// unfalsifiable there, which is why the scenario seam can keep using it.
+    active_pane: String,
+}
+
+/// One pane's live pty plus the spawn-time facts routing keys on. Per-pane BY
+/// DESIGN (shell-abstraction design §1/§4): a pane snapshots the shell it was
+/// spawned under, so two panes of one pill can run different dialects after a
+/// mid-run profile change.
+struct PaneState {
+    /// The `nice-term-view` adapter entity owning this pane's `Session`.
     handle: Entity<TerminalSessionHandle>,
     /// What this pane's shell actually is, captured from the active profile at
     /// spawn ([`crate::shell::pane_shell`]). Runtime-only — never persisted, so a
@@ -230,13 +256,25 @@ struct WindowPty {
     /// first `cd` — splicing it into what they are typing at that moment. The one
     /// way to miss it is for the pane to emit before a subscriber exists (gpui
     /// drops a subscriber-less `cx.emit` rather than queueing it), so every arming
-    /// path subscribes the fresh window in the same synchronous update as the
+    /// path subscribes the fresh pane in the same synchronous update as the
     /// spawn. That rule, and the sites that keep it, live on
     /// [`WindowState::subscribe_spawned_windows`](crate::window_state::WindowState::subscribe_spawned_windows).
     ///
     /// Runtime-only, exactly like [`shell`](Self::shell): never persisted, so a
     /// restored pane is re-armed by whatever profile spawns it next.
     pending_prefill: Option<String>,
+}
+
+impl WindowPty {
+    /// The handle a pane-less lookup resolves to: the mirrored active pane,
+    /// else the sole pane (a never-split pill), else any — a stale mirror must
+    /// degrade to the wrong pane, never to "no terminal at all".
+    fn effective_handle(&self) -> Option<&Entity<TerminalSessionHandle>> {
+        self.panes
+            .get(&self.active_pane)
+            .or_else(|| self.panes.values().next())
+            .map(|pane| &pane.handle)
+    }
 }
 
 /// The per-window pty/session manager. Session-keyed: each session maps to its live window
@@ -361,6 +399,18 @@ pub(crate) struct PtyManager {
     /// route_terminal_event window-exit — funnels one removal list without rippling
     /// the store into `PtyManager`.
     dissolved_session_ids: Vec<String>,
+    /// Per-pane Claude status (P9), keyed `<session>:<window>:<pane>`. Watcher-side
+    /// on purpose: status is derived from what a pane's program is printing right
+    /// now, so it belongs beside the ptys and is never persisted onto the model
+    /// `Pane`.
+    ///
+    /// The window-level `TermWindow.status` the sidebar and the pill dot read is
+    /// the OR over this map's entries for that window
+    /// ([`PtyManager::recompute_window_status`]), which is what lets a `claude`
+    /// the user ran by hand in a shell pane light its pill — and what stops one
+    /// pane going idle from un-lighting a pill whose other pane is still
+    /// thinking. Entries are dropped with their pane.
+    pane_status: HashMap<String, SessionStatus>,
 }
 
 impl PtyManager {
@@ -390,6 +440,7 @@ impl PtyManager {
             window_shell_env: None,
             pending_project_removal: HashSet::new(),
             dissolved_session_ids: Vec::new(),
+            pane_status: HashMap::new(),
         }
     }
 
@@ -426,6 +477,15 @@ impl PtyManager {
         self.mint(prefix)
     }
 
+    /// Mint a fresh PANE id via the same seam — the split action's source of leaf
+    /// ids ([`crate::keymap`]). Pane ids have to be unique across the whole
+    /// window, not merely within one tree, because the host's view cache and this
+    /// manager's pty map both key on them; the shared minting counter gives that
+    /// for free.
+    pub(crate) fn mint_pane_id(&self, prefix: &str) -> String {
+        self.mint(prefix)
+    }
+
     // MARK: - Window title / cwd routing (pure model, unit-tested)
 
     /// A window's shell emitted OSC 7 with a new working directory. Stash it on
@@ -442,13 +502,53 @@ impl PtyManager {
         term_window_id: &str,
         cwd: &str,
     ) -> bool {
+        let Some(pane_id) = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.effective_pane_id())
+        else {
+            return false;
+        };
+        self.pane_cwd_changed(model, session_id, term_window_id, &pane_id, cwd)
+    }
+
+    /// The pane-precise core of [`window_cwd_changed`](Self::window_cwd_changed):
+    /// OSC 7 lands on the emitting PANE, so a restored multi-pane pill puts each
+    /// pane back where it was.
+    ///
+    /// The window's own `cwd` — what a new pill in this session inherits, and
+    /// what a single-leaf window respawns in — follows the pill's TITLE-bearing
+    /// pane (the focused one), so it keeps tracking what the user is looking at.
+    /// For a never-split pill both writes are the same write.
+    pub(crate) fn pane_cwd_changed(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        cwd: &str,
+    ) -> bool {
         let mut changed = false;
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
-                if term_window.cwd.as_deref() != Some(cwd) {
-                    term_window.cwd = Some(cwd.to_string());
-                    changed = true;
+            let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id)
+            else {
+                return;
+            };
+            let speaks_for_the_pill = pane_speaks_for_the_pill(term_window, pane_id);
+            match term_window.layout.pane_mut(pane_id) {
+                Some(pane) => {
+                    if pane.cwd.as_deref() != Some(cwd) {
+                        pane.cwd = Some(cwd.to_string());
+                        changed = true;
+                    }
                 }
+                // A pane the tree doesn't know is a stale id — drop it silently,
+                // exactly as a stale window id is dropped.
+                None => return,
+            }
+            if speaks_for_the_pill && term_window.cwd.as_deref() != Some(cwd) {
+                term_window.cwd = Some(cwd.to_string());
+                changed = true;
             }
         });
         changed
@@ -479,6 +579,41 @@ impl PtyManager {
         term_window_id: &str,
         title: &str,
     ) -> bool {
+        let Some(pane_id) = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.effective_pane_id())
+        else {
+            return false;
+        };
+        self.pane_title_changed(model, session_id, term_window_id, &pane_id, title)
+    }
+
+    /// The pane-precise core of [`window_title_changed`](Self::window_title_changed)
+    /// — the same two policies, chosen by the EMITTING PANE's kind rather than
+    /// the pill's (P9):
+    ///
+    /// * the **Claude leaf**'s titles feed the spinner/status parse and the
+    ///   session auto-title, exactly as before;
+    /// * a **shell pane**'s titles take the terminal branch and can never reach
+    ///   the Claude branch, so a `vim` in the pane beside Claude cannot clobber
+    ///   Claude's spinner;
+    /// * only the pill's **focused** pane writes the pill label — tmux's
+    ///   window-title behavior. A background pane renaming the pill the user is
+    ///   reading would be a lie about what they are looking at.
+    ///
+    /// One addition beyond re-keying: in a SPLIT pill, a shell pane's title is
+    /// also parsed for Claude's spinner, so a `claude` the user ran by hand in a
+    /// pane still lights the pill (P9's OR). Never-split pills are untouched by
+    /// that — a lone terminal window's status stays meaningless, as it always was.
+    pub(crate) fn pane_title_changed(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        title: &str,
+    ) -> bool {
         // Read the window's kind + lock facts, then drop the borrow before the
         // mutation (Swift reads `pane` then re-enters via `mutateTab` — parity note).
         let Some(session) = model.session_for(session_id) else {
@@ -487,12 +622,45 @@ impl PtyManager {
         let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return false;
         };
-        let kind = term_window.kind;
+        let Some(pane) = term_window.layout.pane(pane_id) else {
+            return false;
+        };
+        let kind = pane.kind;
+        let is_split = term_window.layout.leaf_count() > 1;
+        let speaks_for_the_pill = pane_speaks_for_the_pill(term_window, pane_id);
         let title_manually_set = term_window.title_manually_set;
         let is_claude_running = term_window.is_claude_running;
 
         match kind {
             TermWindowKind::Terminal => {
+                // P9's OR: a `claude` the user started by hand inside a split
+                // pill's shell pane announces itself the only way it can — the
+                // spinner prefix on its OSC title. Never-split pills skip this
+                // entirely, so a lone terminal window's status stays exactly as
+                // meaningless as it has always been.
+                if is_split {
+                    match parse_claude_title(title) {
+                        (Some(new_status), _) => self.record_pane_status(
+                            model,
+                            session_id,
+                            term_window_id,
+                            pane_id,
+                            new_status,
+                        ),
+                        // No spinner, no sparkle ⇒ this pane is idle, and saying
+                        // so is not optional here. A shell pane has no exit
+                        // signal to fall back on — the hand-run `claude` quits
+                        // and the shell simply goes back to printing `zsh` /
+                        // a path — so the title stream is the ONLY thing that
+                        // can un-light the pill. Without this, one hand-run
+                        // claude leaves the pill lit until the pane itself dies.
+                        // (The Claude branch below deliberately does NOT do this:
+                        // a Claude leaf's idle arrives over the control socket.)
+                        (None, _) => {
+                            self.clear_pane_status(model, session_id, term_window_id, pane_id)
+                        }
+                    }
+                }
                 let trimmed = title.trim();
                 // Whitespace-only titles never overwrite the current pill label.
                 if trimmed.is_empty() {
@@ -501,6 +669,11 @@ impl PtyManager {
                 // A user pill-rename locks the title; OSC from the running program
                 // (vim's `vim foo`, zsh theme spam) must not win.
                 if title_manually_set {
+                    return false;
+                }
+                // Only the focused pane speaks for the pill (P9) — a background
+                // pane must not rename what the user is reading.
+                if !speaks_for_the_pill {
                     return false;
                 }
                 let clipped = clip_title(trimmed, WINDOW_TITLE_MAX);
@@ -531,18 +704,7 @@ impl PtyManager {
                 }
                 let (status, label) = parse_claude_title(title);
                 if let Some(new_status) = status {
-                    // Acknowledge the pulse only when the user is actually looking at
-                    // this window — the viewed session's active window (Swift's
-                    // `viewing && isActivePane`). A manually-renamed Claude window still
-                    // flips status: the title lock lives in the terminal branch, not
-                    // here (`AppStatePaneLifecycleTests.claudePane_manuallySet_...`).
-                    let viewing = model.active_session_id() == Some(session_id);
-                    model.mutate_session(session_id, |session| {
-                        let is_active_window = session.active_window_id.as_deref() == Some(term_window_id);
-                        if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
-                            term_window.apply_status_transition(new_status, viewing && is_active_window);
-                        }
-                    });
+                    self.record_pane_status(model, session_id, term_window_id, pane_id, new_status);
                 }
                 // The trailing label humanizes into the TAB auto-title — never the
                 // Claude window's own pill (that stays "Claude"/the user's rename).
@@ -558,6 +720,128 @@ impl PtyManager {
                 false
             }
         }
+    }
+
+    // MARK: - Per-pane status (P9)
+
+    /// Record one pane's status and push the window-level aggregate through.
+    fn record_pane_status(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        status: SessionStatus,
+    ) {
+        self.pane_status
+            .insert(pane_key(session_id, term_window_id, pane_id), status);
+        self.recompute_window_status(model, session_id, term_window_id);
+    }
+
+    /// Forget one pane's recorded status and push the aggregate through — the
+    /// un-record twin of [`record_pane_status`](Self::record_pane_status), for
+    /// a pane that just told us it has nothing to report.
+    ///
+    /// Dropping the entry rather than writing `Idle` keeps
+    /// [`resolved_pane_status`](Self::resolved_pane_status)'s kind-based
+    /// fallback in charge (a Claude leaf falls back to the window status the
+    /// control socket writes), and the recompute is skipped entirely when there
+    /// was nothing recorded — the common case, since every shell title in a
+    /// split pill lands here.
+    fn clear_pane_status(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) {
+        if self
+            .pane_status
+            .remove(&pane_key(session_id, term_window_id, pane_id))
+            .is_some()
+        {
+            self.recompute_window_status(model, session_id, term_window_id);
+        }
+    }
+
+    /// One pane's effective status: what the watcher last parsed off its title,
+    /// else — for the Claude leaf of a NEVER-SPLIT pill — the window's own
+    /// status, which is what a pill-keyed writer sets (P2: it never learns which
+    /// pane it means). A dead pane is Idle whatever it last printed.
+    ///
+    /// **Why the fallback stops at the pill boundary.** In a SPLIT pill
+    /// `term_window.status` is not an independent fact at all: it is the
+    /// aggregate [`recompute_window_status`](Self::recompute_window_status) just
+    /// wrote from this very function. Feeding it back in latches the pill —
+    /// light it once from a shell pane's hand-run `claude` and the Claude leaf
+    /// starts mirroring that same light, so nothing can ever turn it off again.
+    /// A Claude leaf that has announced nothing of its own contributes nothing;
+    /// one that has announced something has a `pane_status` entry and never
+    /// reaches this line.
+    pub(crate) fn resolved_pane_status(
+        &self,
+        session_id: &str,
+        term_window: &TermWindow,
+        pane: &nice_model::Pane,
+    ) -> SessionStatus {
+        if !pane.is_alive {
+            return SessionStatus::Idle;
+        }
+        if let Some(status) = self
+            .pane_status
+            .get(&pane_key(session_id, &term_window.id, &pane.id))
+        {
+            return *status;
+        }
+        match pane.kind {
+            TermWindowKind::Claude if term_window.layout.leaf_count() == 1 => term_window.status,
+            TermWindowKind::Claude | TermWindowKind::Terminal => SessionStatus::Idle,
+        }
+    }
+
+    /// Re-derive a window's status as the OR over its panes (P9) and apply it.
+    ///
+    /// Thinking beats waiting beats idle, so a pill with one pane thinking and
+    /// one idle still reads as thinking — and one pane falling idle can't
+    /// un-light a pill whose other pane is still working. A never-split pill has
+    /// exactly one pane, so this is that pane's status verbatim, which is the
+    /// pre-splits behavior.
+    fn recompute_window_status(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+    ) {
+        let Some(term_window) = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+        else {
+            return;
+        };
+        let aggregate = term_window
+            .layout
+            .leaves()
+            .iter()
+            .map(|pane| self.resolved_pane_status(session_id, term_window, pane))
+            .fold(SessionStatus::Idle, |acc, next| match (acc, next) {
+                (SessionStatus::Thinking, _) | (_, SessionStatus::Thinking) => {
+                    SessionStatus::Thinking
+                }
+                (SessionStatus::Waiting, _) | (_, SessionStatus::Waiting) => SessionStatus::Waiting,
+                _ => SessionStatus::Idle,
+            });
+        // Acknowledge the pulse only when the user is actually looking at this
+        // window — the viewed session's active window (Swift's `viewing &&
+        // isActivePane`). A manually-renamed Claude window still flips status:
+        // the title lock lives in the terminal branch, not here
+        // (`AppStatePaneLifecycleTests.claudePane_manuallySet_...`).
+        let viewing = model.active_session_id() == Some(session_id);
+        model.mutate_session(session_id, |session| {
+            let is_active_window = session.active_window_id.as_deref() == Some(term_window_id);
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                term_window.apply_status_transition(aggregate, viewing && is_active_window);
+            }
+        });
     }
 
     /// Dispatch a decoded [`TerminalEvent`] from a window's session entity to the
@@ -576,29 +860,39 @@ impl PtyManager {
         selection: &mut SidebarSessionSelection,
         session_id: &str,
         term_window_id: &str,
+        pane_id: &str,
         event: &TerminalEvent,
     ) -> RoutedEvent {
         match event {
             TerminalEvent::TitleChanged(title) => {
-                let _ = self.window_title_changed(model, session_id, term_window_id, title);
+                let _ =
+                    self.pane_title_changed(model, session_id, term_window_id, pane_id, title);
                 RoutedEvent::default()
             }
             TerminalEvent::CwdChanged(path) => {
-                // OSC 7 → `TermWindow.cwd` (plain path across the boundary; the app owns
-                // the model type). The `to_string_lossy` is safe for the on-disk
-                // absolute paths OSC 7 reports.
-                let _ = self.window_cwd_changed(model, session_id, term_window_id, &path.to_string_lossy());
+                // OSC 7 → the emitting pane's `cwd` (plain path across the boundary;
+                // the app owns the model type). The `to_string_lossy` is safe for the
+                // on-disk absolute paths OSC 7 reports.
+                let _ = self.pane_cwd_changed(
+                    model,
+                    session_id,
+                    term_window_id,
+                    pane_id,
+                    &path.to_string_lossy(),
+                );
                 // …and, for an app-typed deferred-resume pane, this is also the
                 // readiness signal: the FIRST OSC 7 of such a pane is its rc
                 // file's unconditional startup fire, which is that file's last
                 // statement — so the hooks are installed and a prompt is coming.
                 // `take` makes it once-only by construction; every later OSC 7 is
-                // a plain cwd update. Edge worth knowing (design §6.4): a user
+                // a plain cwd update. Taken from the EMITTING pane's slot, never
+                // the active pane's — the armed pane may be a background leaf.
+                // Edge worth knowing (design §6.4): a user
                 // profile that emits its OWN OSC 7 can make this fire mid-rc, in
                 // which case the bytes simply queue in the tty until readline
                 // starts — they still land on the prompt line, never executed.
                 RoutedEvent {
-                    prefill: self.take_pending_prefill(session_id, term_window_id),
+                    prefill: self.take_pending_prefill(session_id, term_window_id, pane_id),
                     ..RoutedEvent::default()
                 }
             }
@@ -616,16 +910,16 @@ impl PtyManager {
             }
             TerminalEvent::Exited { held: true, .. } => {
                 // `TabPtySession` decided to keep the view mounted (non-clean /
-                // pre-first-byte exit) — flip the model to dead-but-on-screen and
+                // pre-first-byte exit) — flip the PANE to dead-but-on-screen and
                 // clear the overlay. No removal, no dissolve.
-                self.window_held(model, session_id, term_window_id);
+                self.pane_held(model, session_id, term_window_id, pane_id);
                 RoutedEvent::default()
             }
             TerminalEvent::Exited { held: false, .. } => {
-                // Clean exit — the full 5-step `paneExited` cascade. The
-                // resolution tells the live caller to run step-4 spawn on a
-                // surviving session and to actuate the terminus.
-                let r = self.window_exited(model, selection, session_id, term_window_id);
+                // Clean exit — a pane close in a split pill, else the full 5-step
+                // `paneExited` cascade. The resolution tells the live caller to run
+                // step-4 spawn on a surviving session and to actuate the terminus.
+                let r = self.pane_exited(model, selection, session_id, term_window_id, pane_id);
                 RoutedEvent {
                     refocus_session: r.refocus_session,
                     terminus: r.terminus,
@@ -668,6 +962,10 @@ impl PtyManager {
                 }
             }
         });
+        // Re-point this pill's pane-less lookups at the pane the model says is
+        // focused, so half-page scroll and Command Compose reach the terminal
+        // the user is actually looking at.
+        self.sync_active_pane(model, session_id, term_window_id);
     }
 
     /// Move focus to the next window within the active session, wrapping. No-op when
@@ -862,6 +1160,179 @@ impl PtyManager {
         }
     }
 
+    /// One PANE's child exited cleanly.
+    ///
+    /// **The last pane of a window is a window exit**: it delegates to
+    /// [`window_exited`](Self::window_exited) untouched, so pill-close semantics
+    /// (index-neighbor refocus, the dissolve cascade, the terminus) are exactly
+    /// what they were before splits existed.
+    ///
+    /// A pane closing out of a multi-pane window is a much smaller event — the
+    /// pill stays, only the tree shrinks:
+    ///
+    /// 1. the leaf leaves the tree, collapsing its parent split into its sibling;
+    /// 2. if it held focus, focus moves SPATIALLY (`spatial_refocus`) — the pane
+    ///    sharing the longest border, not an index neighbor, because the user is
+    ///    looking at a 2-D layout;
+    /// 3. a Claude leaf exiting cleanly flips the pill to `Terminal` kind and
+    ///    clears its Claude bookkeeping — the pill is now just its shells, which
+    ///    is what keeps "kind == Claude iff a Claude leaf exists" true;
+    /// 4. that pane's pty and per-pane status are dropped, nothing else is.
+    ///
+    /// Returns an empty [`WindowExitResolution`] for a pane close: no session can
+    /// dissolve while the pill still has panes.
+    pub(crate) fn pane_exited(
+        &mut self,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> WindowExitResolution {
+        let leaf_count = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.layout.leaf_count());
+        match leaf_count {
+            // Unknown session/window: fall through to the window path, which
+            // silently drops a stale id exactly as before.
+            None => return self.window_exited(model, selection, session_id, term_window_id),
+            Some(count) if count <= 1 => {
+                return self.window_exited(model, selection, session_id, term_window_id)
+            }
+            Some(_) => {}
+        }
+
+        model.mutate_session(session_id, |session| {
+            let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id)
+            else {
+                return;
+            };
+            // Captured BEFORE the removal — `spatial_refocus` compares against
+            // the closed pane's own rect.
+            let rects_before = term_window.nominal_leaf_rects();
+            let was_focused = term_window.active_pane_id == pane_id;
+            let Some(removed) = term_window.layout.remove(pane_id) else {
+                return;
+            };
+            if was_focused {
+                if let Some(next) = nice_model::spatial_refocus(&rects_before, pane_id) {
+                    term_window.active_pane_id = next;
+                }
+            }
+            if removed.kind == TermWindowKind::Claude {
+                // The Claude-leaf clean-exit kind flip: no Claude leaf, no Claude
+                // pill. Held exits take the other road (`pane_held`), which keeps
+                // the leaf and the kind.
+                term_window.kind = TermWindowKind::Terminal;
+                term_window.is_claude_running = false;
+                term_window.waiting_acknowledged = false;
+            }
+            term_window.is_alive = term_window.any_pane_alive();
+        });
+        self.release_pane_pty(session_id, term_window_id, pane_id);
+        self.sync_active_pane(model, session_id, term_window_id);
+        self.recompute_window_status(model, session_id, term_window_id);
+        WindowExitResolution::default()
+    }
+
+    /// Break the focused shell pane out into its own pill — tmux `break-pane`
+    /// (decision P3). Returns the new window's id, or `None` when it refused.
+    ///
+    /// The pty **moves**; nothing respawns, so whatever was running in the pane
+    /// keeps running across the break. The new pill is inserted right after the
+    /// source one, seeded with the moved pane's cwd, and carries the moved
+    /// `Pane` verbatim — its id and all — so the pty cache re-keys under the new
+    /// window without the handle ever changing hands.
+    ///
+    /// Refuses on: an unknown session/window/pane, a single-leaf pill (breaking
+    /// the only pane out would just rename it), and the CLAUDE pane (a Claude
+    /// leaf becoming a pill through this path would fork the ≤1-Claude
+    /// invariant's bookkeeping; P3 makes it a no-op instead).
+    ///
+    /// **Accepted wart (P2)**: the moved pty's `NICE_TAB_ID` / `NICE_PANE_ID`
+    /// were fixed at fork and still name the SOURCE pill — env cannot change
+    /// post-fork. So socket traffic from that shell (a hand-typed `claude`
+    /// promotion, handoff/dispatch) targets the old pill. This is the same class
+    /// of staleness as moving any live process, and Phase 5's pane addressing is
+    /// where it gets revisited.
+    pub(crate) fn move_pane_to_new_window(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<String> {
+        let session = model.session_for(session_id)?;
+        let source = session.windows.iter().find(|w| w.id == term_window_id)?;
+        let pane = source.layout.pane(pane_id)?;
+        if source.layout.leaf_count() <= 1 || pane.kind == TermWindowKind::Claude {
+            return None;
+        }
+        let new_window_id = self.mint(&format!("{session_id}-p"));
+
+        let mut moved: Option<nice_model::Pane> = None;
+        let mut title = String::new();
+        model.mutate_session(session_id, |session| {
+            let Some(source) = session.windows.iter_mut().find(|w| w.id == term_window_id) else {
+                return;
+            };
+            let rects_before = source.nominal_leaf_rects();
+            let was_focused = source.active_pane_id == pane_id;
+            let Some(pane) = source.layout.remove(pane_id) else {
+                return;
+            };
+            if was_focused {
+                if let Some(next) = nice_model::spatial_refocus(&rects_before, pane_id) {
+                    source.active_pane_id = next;
+                }
+            }
+            source.is_alive = source.any_pane_alive();
+            moved = Some(pane);
+            // The new pill takes the next auto-name slot, exactly as an explicit
+            // `+` would (asymmetry 2: the counter never rewinds).
+            title = format!("Terminal {}", session.next_terminal_index);
+            session.next_terminal_index += 1;
+        });
+        let moved = moved?;
+
+        let mut new_window =
+            TermWindow::new(new_window_id.clone(), title, TermWindowKind::Terminal);
+        new_window.cwd = moved.cwd.clone();
+        new_window.is_alive = moved.is_alive;
+        new_window.active_pane_id = moved.id.clone();
+        new_window.layout = nice_model::PaneLayout::single(moved);
+        model.insert_window(new_window, session_id, Some(term_window_id), true);
+
+        // Re-key the live pane state + its status entry under the new window. No
+        // respawn: the same `Entity` moves — and its whole [`PaneState`] with it,
+        // so the pane keeps its spawn-time shell snapshot (and any armed prefill
+        // slot) across the re-home. The child never notices.
+        let status = self
+            .pane_status
+            .get(&pane_key(session_id, term_window_id, pane_id))
+            .copied();
+        if let Some(state) = self.release_pane_pty(session_id, term_window_id, pane_id) {
+            if let Some(status) = status {
+                self.pane_status
+                    .insert(pane_key(session_id, &new_window_id, pane_id), status);
+            }
+            self.sessions
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(
+                    new_window_id.clone(),
+                    WindowPty {
+                        panes: HashMap::from([(pane_id.to_string(), state)]),
+                        active_pane: pane_id.to_string(),
+                    },
+                );
+        }
+        self.recompute_window_status(model, session_id, term_window_id);
+        Some(new_window_id)
+    }
+
+
     /// A window's process exited but its view stays mounted so the user can read
     /// the scrollback (Swift's `paneHeld`, `SessionsModel.swift:362-377`): clear
     /// the launch overlay, flip `is_alive` false, and idle out any pulsing status
@@ -871,20 +1342,73 @@ impl PtyManager {
     /// ([`terminate_window`](Self::terminate_window) synthesizes the deferred exit).
     /// Silently drops a stale session/window id.
     pub(crate) fn window_held(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
+        let Some(pane_id) = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.effective_pane_id())
+        else {
+            return;
+        };
+        self.pane_held(model, session_id, term_window_id, &pane_id);
+    }
+
+    /// One PANE's process exited but its view stays mounted — the pane-precise
+    /// core of [`window_held`](Self::window_held).
+    ///
+    /// The pane is flagged dead in the tree and its pty released, then the
+    /// window-level fields are recomputed from the surviving leaves:
+    ///
+    /// * `is_alive` — any leaf still alive. A held Claude pane beside a running
+    ///   shell must NOT kill the pill; only the last pane's hold does that.
+    /// * `is_claude_running` — cleared when the CLAUDE leaf is the one that
+    ///   died, so a fresh `claude` in this session routes correctly (R15). A
+    ///   shell pane dying leaves a running Claude alone.
+    /// * `status` — the OR over the surviving panes, so a dead pane's last
+    ///   spinner can't keep the pill lit.
+    ///
+    /// A never-split pill has one leaf, so all three collapse to exactly the
+    /// pre-splits behavior. Silently drops a stale session/window/pane id.
+    pub(crate) fn pane_held(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) {
+        // The pty is deliberately NOT released: a held pane keeps its view (and
+        // its scrollback) mounted, and `terminate_window` synthesizes the real
+        // exit later off the still-cached handle.
         self.clear_window_launch(term_window_id);
+        self.pane_status
+            .remove(&pane_key(session_id, term_window_id, pane_id));
+        let mut last_pane_held = false;
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+            let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id)
+            else {
+                return;
+            };
+            let Some(pane) = term_window.layout.pane_mut(pane_id) else {
+                return;
+            };
+            pane.is_alive = false;
+            let claude_died = pane.kind == TermWindowKind::Claude;
+            last_pane_held = !term_window.any_pane_alive();
+            if last_pane_held {
                 term_window.is_alive = false;
-                // A held-dead window is not thinking or waiting regardless of its
+            }
+            if claude_died || last_pane_held {
+                // A held-dead Claude is not thinking or waiting regardless of its
                 // last OSC title; idle it and clear the ack so a future fresh
                 // waiting window can pulse again.
                 term_window.status = SessionStatus::Idle;
                 term_window.waiting_acknowledged = false;
-                // Clear the promotion flag so a fresh `claude` in this session routes
-                // correctly (R15) — a held pty is a corpse, not a live shell.
+                // A held pty is a corpse, not a live shell.
                 term_window.is_claude_running = false;
             }
         });
+        if !last_pane_held {
+            self.recompute_window_status(model, session_id, term_window_id);
+        }
     }
 
     /// Drop a single window's pty session from the cache (Swift's
@@ -894,8 +1418,45 @@ impl PtyManager {
     /// (SIGHUP→SIGKILL via `nice_term_core::Session::drop`), so no orphan zsh.
     fn release_window_pty(&mut self, session_id: &str, term_window_id: &str) {
         if let Some(windows) = self.sessions.get_mut(session_id) {
-            windows.remove(term_window_id);
+            if let Some(window) = windows.remove(term_window_id) {
+                for pane_id in window.panes.keys() {
+                    self.pane_status
+                        .remove(&pane_key(session_id, term_window_id, pane_id));
+                }
+            }
         }
+    }
+
+    /// Drop ONE pane's pty, and the whole `WindowPty` with it when that was the
+    /// last pane — so [`has_window`](Self::has_window) keeps meaning "this pill
+    /// has a pty" and the pill-close paths see no empty husk. Repairs the
+    /// active-pane mirror when the pane it named is the one going away.
+    ///
+    /// Returns the removed [`PaneState`], so break-pane can re-home the live
+    /// entity (with its shell snapshot + prefill slot) instead of dropping it —
+    /// every other caller ignores the value, which drops the state and tears the
+    /// child down.
+    fn release_pane_pty(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<PaneState> {
+        self.pane_status
+            .remove(&pane_key(session_id, term_window_id, pane_id));
+        let windows = self.sessions.get_mut(session_id)?;
+        let window = windows.get_mut(term_window_id)?;
+        let removed = window.panes.remove(pane_id);
+        if window.panes.is_empty() {
+            windows.remove(term_window_id);
+            return removed;
+        }
+        if window.active_pane == pane_id {
+            if let Some(survivor) = window.panes.keys().next().cloned() {
+                window.active_pane = survivor;
+            }
+        }
+        removed
     }
 
     // MARK: - Dissolve cascade (pure core + gpui terminus; unit-tested)
@@ -922,8 +1483,11 @@ impl PtyManager {
         // Core: the single removal entry point (array remove + parent-pointer
         // sweep, atomically — a future close path can't orphan a /branch child).
         model.remove_session(pi, ti);
-        // pty-session release (Swift's `removePtySession`).
+        // pty-session release (Swift's `removePtySession`), and with it every
+        // per-pane status entry this session owned.
         self.sessions.remove(session_id);
+        let prefix = format!("{session_id}:");
+        self.pane_status.retain(|key, _| !key.starts_with(&prefix));
 
         // Subscriber hooks (later rows):
         //   * file-browser per-session cleanup (R19): record the dissolved session id so
@@ -1220,6 +1784,33 @@ impl PtyManager {
         }
     }
 
+    /// Whether ONE pane's shell has a foreground child — the pane-precise twin
+    /// of [`shell_has_foreground_child`](Self::shell_has_foreground_child).
+    ///
+    /// The busy-close gate needs this per leaf: a build running in the shell
+    /// pane beside Claude must block the pill's close, and that pane is not the
+    /// one a pill-scoped lookup would land on. The synthetic seam stays
+    /// WINDOW-keyed (it marks "this pill is busy"), so a marked window reports
+    /// every pane busy — which is what its callers, all pre-splits close-flow
+    /// tests, mean.
+    pub(crate) fn pane_has_foreground_child(
+        &self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        cx: &App,
+    ) -> bool {
+        if self
+            .synthetic_foreground_child
+            .contains(&synthetic_key(session_id, term_window_id))
+        {
+            return true;
+        }
+        self.pane_handle(session_id, term_window_id, pane_id)
+            .map(|handle| handle.read(cx).has_foreground_child())
+            .unwrap_or(false)
+    }
+
     /// The synthetic-seam / absent-window answer for
     /// [`shell_has_foreground_child`](Self::shell_has_foreground_child), or `None`
     /// when a real handle must be read. Pure (no `cx`), so the seam-first and
@@ -1285,12 +1876,58 @@ impl PtyManager {
         self.sessions.contains_key(session_id)
     }
 
-    /// Whether `(session_id, term_window_id)` currently has a live window session (Swift's
-    /// `session.hasPane`).
+    /// Whether `(session_id, term_window_id)` currently has **any** live pane
+    /// (Swift's `session.hasPane`). A window with one dead pane and one live one
+    /// still has a pty.
     pub(crate) fn has_window(&self, session_id: &str, term_window_id: &str) -> bool {
         self.sessions
             .get(session_id)
             .is_some_and(|windows| windows.contains_key(term_window_id))
+    }
+
+    /// Whether this exact pane has a live pty.
+    pub(crate) fn has_pane(&self, session_id: &str, term_window_id: &str, pane_id: &str) -> bool {
+        self.window_pty(session_id, term_window_id)
+            .is_some_and(|w| w.panes.contains_key(pane_id))
+    }
+
+    fn window_pty(&self, session_id: &str, term_window_id: &str) -> Option<&WindowPty> {
+        self.sessions.get(session_id)?.get(term_window_id)
+    }
+
+    fn window_pty_mut(&mut self, session_id: &str, term_window_id: &str) -> Option<&mut WindowPty> {
+        self.sessions.get_mut(session_id)?.get_mut(term_window_id)
+    }
+
+    /// Point a window's pane-less lookups at `pane_id`. No-op when that pane has
+    /// no pty (a mirror must never name a pane that isn't there).
+    pub(crate) fn set_active_pane(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> bool {
+        match self.window_pty_mut(session_id, term_window_id) {
+            Some(window) if window.panes.contains_key(pane_id) => {
+                window.active_pane = pane_id.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-sync a window's active-pane mirror from the model — the model is the
+    /// source of truth for focus; this cache only mirrors it so the pill-scoped
+    /// `(session, window)` lookups can resolve a pane without a model in hand.
+    fn sync_active_pane(&mut self, model: &WorkspaceModel, session_id: &str, term_window_id: &str) {
+        let Some(pane_id) = model
+            .session_for(session_id)
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.effective_pane_id())
+        else {
+            return;
+        };
+        self.set_active_pane(session_id, term_window_id, &pane_id);
     }
 
     /// The live session entity for `(session_id, term_window_id)`, if one is cached — the
@@ -1303,58 +1940,88 @@ impl PtyManager {
     /// own release — a transient clone dropped after subscribing leaves the manager
     /// the sole owner, so a later [`window_exited`](Self::window_exited) /
     /// [`teardown`](Self::teardown) still tears the child process group down.
+    ///
+    /// Pane-less by design: this answers "the terminal the user is looking at in
+    /// that pill" — the window's ACTIVE pane (half-page scroll, Command Compose).
+    /// A caller that means a specific pane uses [`pane_handle`](Self::pane_handle).
     pub(crate) fn term_window_handle(
         &self,
         session_id: &str,
         term_window_id: &str,
     ) -> Option<Entity<TerminalSessionHandle>> {
-        self.sessions
-            .get(session_id)
-            .and_then(|windows| windows.get(term_window_id))
-            .map(|session| session.handle.clone())
+        self.window_pty(session_id, term_window_id)
+            .and_then(|window| window.effective_handle())
+            .cloned()
     }
 
-    /// What `(session_id, term_window_id)`'s pane actually runs, as captured at
-    /// its spawn — `None` for a window with no live pty (model-only or already
+    /// One specific pane's live session entity — the pane-precise twin of
+    /// [`term_window_handle`](Self::term_window_handle), used by the per-pane
+    /// event subscriptions and by everything that must reach a pane the user is
+    /// NOT looking at (a background pane's foreground-child probe, break-pane's
+    /// handle move).
+    pub(crate) fn pane_handle(
+        &self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<Entity<TerminalSessionHandle>> {
+        self.window_pty(session_id, term_window_id)
+            .and_then(|window| window.panes.get(pane_id))
+            .map(|pane| pane.handle.clone())
+    }
+
+    /// What `(session_id, term_window_id, pane_id)` actually runs, as captured at
+    /// its spawn — `None` for a pane with no live pty (model-only or already
     /// exited). The routing seam for everything that must not speak a dialect the
     /// pane's shell does not: Command Compose reads `.compose` before writing any
-    /// trigger bytes.
-    pub(crate) fn pane_shell(&self, session_id: &str, term_window_id: &str) -> Option<PaneShell> {
-        self.sessions
-            .get(session_id)
-            .and_then(|windows| windows.get(term_window_id))
-            .map(|session| session.shell)
+    /// trigger bytes, resolving the pane from the model
+    /// ([`effective_pane_id`](nice_model::TermWindow::effective_pane_id)) first —
+    /// THAT pane's snapshot decides, never the live profile, never a sibling's.
+    pub(crate) fn pane_shell(
+        &self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<PaneShell> {
+        self.window_pty(session_id, term_window_id)
+            .and_then(|window| window.panes.get(pane_id))
+            .map(|pane| pane.shell)
     }
 
-    /// Arm `(session_id, term_window_id)` with the deferred-resume line Nice must
-    /// type into it on its first OSC 7 — the app-typed half of design §6.4, set
-    /// by [`spawn_claude_window`](Self::spawn_claude_window) right after a
+    /// Arm `(session_id, term_window_id, pane_id)` with the deferred-resume line
+    /// Nice must type into it on its first OSC 7 — the app-typed half of design
+    /// §6.4, set by [`spawn_claude_pane`](Self::spawn_claude_pane) right after a
     /// successful `ResumeDeferred` spawn under an
-    /// [`AppTyped`](PrefillStrategy::AppTyped) profile. No-op for a window with no
+    /// [`AppTyped`](PrefillStrategy::AppTyped) profile. No-op for a pane with no
     /// live pty (the spawn failed — there is nothing to type into).
     pub(crate) fn record_pending_prefill(
         &mut self,
         session_id: &str,
         term_window_id: &str,
+        pane_id: &str,
         line: String,
     ) {
-        if let Some(window) = self
-            .sessions
-            .get_mut(session_id)
-            .and_then(|windows| windows.get_mut(term_window_id))
+        if let Some(pane) = self
+            .window_pty_mut(session_id, term_window_id)
+            .and_then(|window| window.panes.get_mut(pane_id))
         {
-            window.pending_prefill = Some(line);
+            pane.pending_prefill = Some(line);
         }
     }
 
-    /// Take `(session_id, term_window_id)`'s pending prefill line, leaving the slot
-    /// empty — the once-only guarantee behind
+    /// Take `(session_id, term_window_id, pane_id)`'s pending prefill line, leaving
+    /// the slot empty — the once-only guarantee behind
     /// [`RoutedEvent::prefill`](RoutedEvent). `None` for a pane that was never
     /// armed, whose line was already delivered, or that has no live pty.
-    fn take_pending_prefill(&mut self, session_id: &str, term_window_id: &str) -> Option<String> {
-        self.sessions
-            .get_mut(session_id)?
-            .get_mut(term_window_id)?
+    fn take_pending_prefill(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<String> {
+        self.window_pty_mut(session_id, term_window_id)?
+            .panes
+            .get_mut(pane_id)?
             .pending_prefill
             .take()
     }
@@ -1362,20 +2029,20 @@ impl PtyManager {
     /// Test-only read of the pending-prefill slot (production only ever `take`s
     /// it, through [`route_terminal_event`](Self::route_terminal_event)).
     #[cfg(test)]
-    pub(crate) fn pending_prefill(&self, session_id: &str, term_window_id: &str) -> Option<&str> {
-        self.sessions
-            .get(session_id)?
-            .get(term_window_id)?
+    pub(crate) fn pending_prefill(
+        &self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<&str> {
+        self.window_pty(session_id, term_window_id)?
+            .panes
+            .get(pane_id)?
             .pending_prefill
             .as_deref()
     }
 
-    /// Every `(session_id, term_window_id)` with a live window session right now — the
-    /// enumeration the shipped window's subscribe-once sweep
-    /// ([`crate::window_state::WindowState::subscribe_spawned_windows`]) walks to
-    /// wire each freshly-spawned window's entity to [`route_terminal_event`](Self::route_terminal_event).
-    /// Order is unspecified (a `HashMap` walk); the sweep dedupes by key, so
-    /// order does not matter.
+    /// Every `(session_id, term_window_id)` with at least one live pane right now.
     pub(crate) fn live_window_keys(&self) -> Vec<(String, String)> {
         self.sessions
             .iter()
@@ -1383,6 +2050,35 @@ impl PtyManager {
                 windows
                     .keys()
                     .map(move |term_window_id| (session_id.clone(), term_window_id.clone()))
+            })
+            .collect()
+    }
+
+    /// Every `(session_id, term_window_id, pane_id)` with a live pty right now — the
+    /// enumeration the window's subscribe-once sweep
+    /// ([`crate::window_state::WindowState::subscribe_spawned_windows`]) walks to
+    /// wire each freshly-spawned PANE's entity to
+    /// [`route_terminal_event`](Self::route_terminal_event).
+    ///
+    /// Pane-level, not window-level, because a background pane's exit has to
+    /// route too: a window-keyed sweep would subscribe whichever pane spawned
+    /// first and then dedupe every later one away forever.
+    ///
+    /// Order is unspecified (a `HashMap` walk); the sweep keys by the triple, so
+    /// order does not matter.
+    pub(crate) fn live_pane_keys(&self) -> Vec<(String, String, String)> {
+        self.sessions
+            .iter()
+            .flat_map(|(session_id, windows)| {
+                windows.iter().flat_map(move |(term_window_id, window)| {
+                    window.panes.keys().map(move |pane_id| {
+                        (
+                            session_id.clone(),
+                            term_window_id.clone(),
+                            pane_id.clone(),
+                        )
+                    })
+                })
             })
             .collect()
     }
@@ -1457,18 +2153,44 @@ impl PtyManager {
     /// survives the injection. This is the single choke point every pty spawn
     /// passes through, so it covers the Main window, `ensure_active_window_spawned`,
     /// and every future R15/R18 path for free.
+    /// Spawns the window's FIRST pane, whose id is the window's own — the shape
+    /// every creation path builds (`TermWindow::new` seeds a single-leaf tree
+    /// keyed by the window id). Splitting an existing window spawns through
+    /// [`spawn_pane`](Self::spawn_pane) with the new leaf's minted id.
     pub(crate) fn spawn_window(
         &mut self,
         session_id: &str,
         term_window_id: &str,
-        mut spec: SpawnSpec,
+        spec: SpawnSpec,
         cx: &mut App,
     ) -> Result<()> {
         if self.has_window(session_id, term_window_id) {
             return Ok(());
         }
+        self.spawn_pane(session_id, term_window_id, term_window_id, spec, cx)
+    }
+
+    /// Spawn a live terminal session for one PANE of `(session_id,
+    /// term_window_id)` and cache it under `pane_id`. Idempotent per pane.
+    ///
+    /// The window's shell-injection env is merged in spec-wins exactly as
+    /// before, and it is still the WINDOW's env: every pane of a pill carries
+    /// the same `NICE_TAB_ID` / `NICE_PANE_ID` (decision P2 — `NICE_PANE_ID`
+    /// permanently means the pill), so socket traffic from any pane routes to
+    /// the pill, which is where status lives.
+    pub(crate) fn spawn_pane(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        mut spec: SpawnSpec,
+        cx: &mut App,
+    ) -> Result<()> {
+        if self.has_pane(session_id, term_window_id, pane_id) {
+            return Ok(());
+        }
         merge_env_spec_wins(&mut spec.env, self.session_window_env_pairs(session_id, term_window_id));
-        self.spawn_session_raw(session_id, term_window_id, spec, cx)
+        self.spawn_session_raw(session_id, term_window_id, pane_id, spec, cx)
     }
 
     /// Spawn + cache a live session from `spec` **verbatim** — no window
@@ -1483,10 +2205,11 @@ impl PtyManager {
         &mut self,
         session_id: &str,
         term_window_id: &str,
+        pane_id: &str,
         spec: SpawnSpec,
         cx: &mut App,
     ) -> Result<()> {
-        if self.has_window(session_id, term_window_id) {
+        if self.has_pane(session_id, term_window_id, pane_id) {
             return Ok(());
         }
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
@@ -1499,14 +2222,27 @@ impl PtyManager {
             handle.read(cx).set_event_wake_enabled(false);
         }
         // The pane's shell snapshot, taken at spawn from the active profile (the
-        // one whose argv this spec carries) and never revisited.
+        // one whose argv this spec carries) and never revisited — a split pane
+        // spawned mid-run snapshots the profile CURRENT at its own spawn, not
+        // its siblings'.
         let shell = crate::shell::pane_shell(cx);
-        self.sessions.entry(session_id.to_string()).or_default().insert(
-            term_window_id.to_string(),
-            WindowPty {
+        let window = self
+            .sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .entry(term_window_id.to_string())
+            .or_insert_with(|| WindowPty {
+                panes: HashMap::new(),
+                // The first pane spawned is the one a pane-less lookup lands on
+                // until the model syncs focus over it.
+                active_pane: pane_id.to_string(),
+            });
+        window.panes.insert(
+            pane_id.to_string(),
+            PaneState {
                 handle,
                 shell,
-                // Armed (only) by `spawn_claude_window`'s deferred-resume arm,
+                // Armed (only) by `spawn_claude_pane`'s deferred-resume arm,
                 // after this spawn returns.
                 pending_prefill: None,
             },
@@ -1723,7 +2459,7 @@ impl PtyManager {
     ///   the active profile's [`PrefillStrategy`]: zsh takes `NICE_PREFILL_COMMAND`
     ///   in the env and pre-types it from its rc tail's `print -z`; bash has no such
     ///   builtin, so the line is recorded as this pane's
-    ///   [`pending_prefill`](WindowPty::pending_prefill) and Nice types it into the
+    ///   [`pending_prefill`](PaneState::pending_prefill) and Nice types it into the
     ///   pty on the pane's first OSC 7 (see [`pending_prefill_for`]). Either way the
     ///   launch overlay is suppressed (a quiescent prefilled shell isn't "launching").
     /// * Probe resolved a `claude` binary → `zsh -ilc "exec <claude> …"` via
@@ -1740,6 +2476,35 @@ impl PtyManager {
         &mut self,
         session_id: &str,
         term_window_id: &str,
+        cwd: &str,
+        mode: &ClaudeSessionMode,
+        extra_args: &[String],
+        settings_path: Option<&str>,
+        cx: &mut App,
+    ) -> Result<()> {
+        // Every creation path builds a single-leaf window keyed by its own id.
+        self.spawn_claude_pane(
+            session_id,
+            term_window_id,
+            term_window_id,
+            cwd,
+            mode,
+            extra_args,
+            settings_path,
+            cx,
+        )
+    }
+
+    /// Spawn Claude into one specific PANE — the pane-precise core of
+    /// [`spawn_claude_window`](Self::spawn_claude_window). Only the lazy restore
+    /// arm needs it: a hydrated multi-pane pill's Claude leaf keeps the pane id
+    /// it was persisted with.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_claude_pane(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
         cwd: &str,
         mode: &ClaudeSessionMode,
         extra_args: &[String],
@@ -1805,7 +2570,7 @@ impl PtyManager {
             SpawnSpec::shell(cwd).with_argv(crate::shell::spawn_argv(cx, false, None))
         };
 
-        self.spawn_session_raw(session_id, term_window_id, spec, cx)?;
+        self.spawn_session_raw(session_id, term_window_id, pane_id, spec, cx)?;
 
         // App-typed prefill (design §6.4): a shell with no `print -z` got no
         // `NICE_PREFILL_COMMAND` in its env, so the line waits here instead and
@@ -1813,7 +2578,7 @@ impl PtyManager {
         // to the subscription that owns the pty. Recorded AFTER the spawn — an
         // errored spawn returns above and leaves no entry to arm.
         if let Some(line) = pending_prefill_for(mode, prefill, settings_path) {
-            self.record_pending_prefill(session_id, term_window_id, line);
+            self.record_pending_prefill(session_id, term_window_id, pane_id, line);
         }
 
         // Launch-overlay policy: register the user-facing command string; a
@@ -1865,40 +2630,61 @@ impl PtyManager {
         let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return;
         };
-        if !self.session_has_pty(session_id) || self.has_window(session_id, &term_window_id) {
+        if !self.session_has_pty(session_id) {
             return;
         }
-        // L3 restore arm: a claude-kind active window lazy-spawns its deferred-resume
-        // shell (never a running claude). A running-claude or session-less window is
-        // left to its eager/socket spawn path.
-        if term_window.kind == TermWindowKind::Claude {
-            if term_window.is_claude_running {
-                return;
+        // Spawning a window means spawning every leaf of its tree that isn't live
+        // yet — a restored multi-pane pill comes back modelled but unspawned, and
+        // all of its panes have to come up on first activation, not just one.
+        // (Split-created panes spawn eagerly at split time and are already live
+        // here, so this loop skips them.)
+        let leaves: Vec<nice_model::Pane> = term_window.layout.leaves().into_iter().cloned().collect();
+        for pane in leaves {
+            if self.has_pane(session_id, &term_window_id, &pane.id) {
+                continue;
             }
-            let Some(sid) = session.claude_session_id.clone() else {
-                return;
-            };
-            let cwd = model.resolved_spawn_cwd_for_window(session, term_window);
-            let _ = self.spawn_claude_window(
-                session_id,
-                &term_window_id,
-                &cwd,
-                &ClaudeSessionMode::ResumeDeferred(sid),
-                &[],
-                settings_path,
-                cx,
-            );
-            return;
+            let cwd = model.resolved_spawn_cwd_for_pane(session, term_window, &pane);
+            match pane.kind {
+                // L3 restore arm: a claude leaf lazy-spawns its deferred-resume
+                // shell (never a running claude). A running-claude or
+                // session-less window is left to its eager/socket spawn path.
+                TermWindowKind::Claude => {
+                    if term_window.is_claude_running {
+                        continue;
+                    }
+                    let Some(sid) = session.claude_session_id.clone() else {
+                        continue;
+                    };
+                    let _ = self.spawn_claude_pane(
+                        session_id,
+                        &term_window_id,
+                        &pane.id,
+                        &cwd,
+                        &ClaudeSessionMode::ResumeDeferred(sid),
+                        &[],
+                        settings_path,
+                        cx,
+                    );
+                }
+                // R14: the extra-env hook threads NICE_SOCKET/NICE_TAB_ID/NICE_PANE_ID
+                // onto this spec before spawn — the same WINDOW env for every pane (P2).
+                // A deferred terminal is a normal pane, so it spawns injected:
+                // the active profile's argv carries the rc injection for
+                // argv-injected shells (bash `--rcfile`).
+                TermWindowKind::Terminal => {
+                    let spec = SpawnSpec::shell(cwd)
+                        .with_argv(crate::shell::spawn_argv(cx, true, None));
+                    let _ = self.spawn_pane(
+                        session_id,
+                        &term_window_id,
+                        &pane.id,
+                        spec,
+                        cx,
+                    );
+                }
+            }
         }
-        if term_window.kind != TermWindowKind::Terminal {
-            return;
-        }
-        let cwd = model.resolved_spawn_cwd_for_window(session, term_window);
-        // R14: the extra-env hook threads NICE_SOCKET/NICE_TAB_ID/NICE_PANE_ID
-        // onto this spec before spawn. A deferred terminal is a normal pane, so
-        // it spawns injected.
-        let spec = SpawnSpec::shell(cwd).with_argv(crate::shell::spawn_argv(cx, true, None));
-        let _ = self.spawn_window(session_id, &term_window_id, spec, cx);
+        self.sync_active_pane(model, session_id, &term_window_id);
     }
 
     /// The **full** Swift `setActivePane` behavior (`SessionsModel.swift:534-546`)
@@ -1939,6 +2725,7 @@ impl PtyManager {
         self.synthetic_held.clear();
         self.synthetic_armed.clear();
         self.synthetic_foreground_child.clear();
+        self.pane_status.clear();
     }
 }
 
@@ -1952,6 +2739,20 @@ impl Default for PtyManager {
 /// Swift's `SessionsModel.syntheticPaneKey`.
 fn synthetic_key(session_id: &str, term_window_id: &str) -> String {
     format!("{session_id}:{term_window_id}")
+}
+
+/// Whether `pane_id` is the pane whose title and cwd stand for the whole pill
+/// (P9): the focused one, or — when focus has gone stale — the sole pane of a
+/// never-split pill.
+fn pane_speaks_for_the_pill(term_window: &TermWindow, pane_id: &str) -> bool {
+    term_window.effective_pane_id() == pane_id
+}
+
+/// The `<session>:<window>:<pane>` key the per-pane maps index by — the pane
+/// twin of [`synthetic_key`]. Pane ids are unique per window, so the triple is
+/// unique app-wide.
+fn pane_key(session_id: &str, term_window_id: &str, pane_id: &str) -> String {
+    format!("{session_id}:{term_window_id}:{pane_id}")
 }
 
 /// Clip a window title to `max` **characters** (not bytes), trimming any trailing
@@ -2086,7 +2887,7 @@ pub(crate) enum ClaudeSessionMode {
     ///   it, from `NICE_PREFILL_COMMAND` in the window env via the `.zshrc` stub's
     ///   `print -z "$NICE_PREFILL_COMMAND"` tail.
     /// * [`AppTyped`](PrefillStrategy::AppTyped) (bash, `bash --rcfile … -i`): Nice
-    ///   types it, from the pane's [`pending_prefill`](WindowPty::pending_prefill)
+    ///   types it, from the pane's [`pending_prefill`](PaneState::pending_prefill)
     ///   slot on the pane's first OSC 7 — no prefill env var is set at all.
     ///
     /// Either way this is the only mode that carries the profile's rc-injection

@@ -39,7 +39,8 @@
 //! 256 computed cube/ramp, 24-bit truecolor (see [`crate::color`]) — plus text
 //! attributes (inverse-video with exact per-channel inversion, bold, italic,
 //! dim, underline, strikethrough), wide glyphs / emoji, selection rendering from
-//! the core's selection state, the ⌘-hover link underline (view state riding
+//! the core's selection state, the ⌘-hover link underline and the copy-mode
+//! search tints (view state riding
 //! [`SnapshotKey`] exactly like selection), and procedural box-drawing + block elements
 //! (U+2500–259F, see [`crate::boxdraw`]). Procedural cells whose geometry is
 //! provably x-uniform (`─ ━ ═ █ ▄ ░` …) batch into per-run band quads (fix
@@ -92,6 +93,7 @@ use nice_theme::Srgba;
 use crate::boxdraw::{self, apple_approx_coverage, Prim, Segment};
 use crate::color::{resolve_color, smart_cursor_colors};
 use crate::input::TermInputHandler;
+use crate::search::VIEWPORT_MATCH_MARGIN;
 use crate::session_handle::TerminalSessionHandle;
 use crate::theme::TerminalTheme;
 use crate::view::TerminalView;
@@ -598,6 +600,15 @@ fn bg_spans(row: &[PaintCell]) -> Vec<(usize, usize, u32)> {
 ///   underline painted. Hover only changes when a ⌘-held pointer crosses a
 ///   match boundary, so paying a full re-copy for it is cheap — and far cheaper
 ///   than a partial-invalidation scheme that gets it subtly wrong.
+/// * `search_matches` / `active_match` — Phase 3's copy-mode search highlights
+///   (P8), the third hand-plumbed channel of exactly the same kind: the tinted
+///   backgrounds are baked into cells, and the match set is Nice-side state the
+///   grid (hence alacritty's damage) knows nothing about. The set is recomputed
+///   from scratch every frame, so a rotating grid can never leave a stale
+///   highlight behind — and because `Rc<[Match]>` compares by **value**, a fresh
+///   per-frame allocation with equal contents still compares equal and keeps the
+///   whole row cache warm. (Do NOT "optimize" that to a pointer compare: every
+///   frame would then full-invalidate while a search is live.)
 #[derive(Clone, PartialEq)]
 struct SnapshotKey {
     term_ptr: usize,
@@ -607,6 +618,10 @@ struct SnapshotKey {
     display_offset: usize,
     selection: Option<SelectionRange>,
     hovered_hyperlink: Option<Match>,
+    /// The viewport-bounded search match set (`None` ⇒ no live search).
+    search_matches: Option<Rc<[Match]>>,
+    /// The focused match (`n`/`N`/confirm), painted with the emphasis tint.
+    active_match: Option<Match>,
 }
 
 /// The frame's row-invalidation verdict, distilled from `Term::damage()` plus
@@ -662,7 +677,8 @@ struct RowPlan {
 ///   consumer; one `TerminalView` per session handle is the standing wiring);
 /// * **whole grid** — `TermDamage::Full`, the core's forced-full flag (in-place
 ///   ED(2)), or ANY [`SnapshotKey`] change (respawn / theme / resize / scroll
-///   offset / selection / ⌘-hovered hyperlink — see the key's field docs);
+///   offset / selection / ⌘-hovered hyperlink / search matches — see the key's
+///   field docs);
 /// * **plans only** — the solid-cursor glyph-skip cell moving (cursor motion,
 ///   focus flip solid↔hollow, IME composition start/end) re-plans exactly the
 ///   old + new cursor rows via [`GridCache::reconcile`]'s `glyph_skip`
@@ -927,6 +943,21 @@ impl TerminalElement {
             },
         };
 
+        // Copy-mode search highlights (P8). Read BEFORE the grid lock below:
+        // `viewport_matches` takes the `Term`'s `FairMutex` itself and that mutex
+        // is NOT reentrant, so computing this inside the lock scope would
+        // deadlock the render thread. `search_active()` is pure Nice-side state
+        // (no lock), so a pane with no live search pays nothing at all.
+        //
+        // The set is rebuilt every frame by design: the grid rotates under a
+        // streaming pane, so any cached match set would go stale — and the
+        // viewport-bounded rescan is cheaper than the invalidation bookkeeping
+        // that would avoid it.
+        let search_matches: Option<Rc<[Match]>> = handle
+            .search_active()
+            .then(|| Rc::from(handle.viewport_matches(VIEWPORT_MATCH_MARGIN)));
+        let active_match = handle.active_match();
+
         let cursor = match handle.term() {
             Some(term_arc) => {
                 let mut grid_cache = cache.borrow_mut();
@@ -973,6 +1004,8 @@ impl TerminalElement {
                     display_offset,
                     selection,
                     hovered_hyperlink: hovered_hyperlink.clone(),
+                    search_matches: search_matches.clone(),
+                    active_match: active_match.clone(),
                 };
                 // The solid-cursor glyph-skip cell (a PLAN input — see
                 // `GridCache`): only a solid, non-composing caret suppresses
@@ -992,6 +1025,17 @@ impl TerminalElement {
                     .map(|c| c.to_u32())
                     .unwrap_or(DEFAULT_SELECTION);
                 let hovered = hovered_hyperlink.as_ref();
+                // P8's derived tints — no new theme keys in v1: plain matches
+                // wear a half-strength selection tint, the focused match wears
+                // the caret accent at the same strength (a hue difference the
+                // eye picks out instantly, while both stay light enough for the
+                // cell's own foreground to read over them).
+                let search = search_matches.as_ref().map(|matches| SearchPaint {
+                    matches,
+                    active: active_match.as_ref(),
+                    tint: mix_half(selection_color, default_bg),
+                    active_tint: mix_half(rgba_to_u32(accent_rgba), default_bg),
+                });
                 grid_cache.reconcile(key, damage, glyph_skip, |vr, out| {
                     fill_row(
                         &term,
@@ -1000,6 +1044,7 @@ impl TerminalElement {
                         selection,
                         selection_color,
                         hovered,
+                        search,
                         display_offset as i32,
                         cols,
                         vr,
@@ -1709,25 +1754,52 @@ fn is_default_color(c: AnsiColor) -> bool {
     )
 }
 
+/// A 50/50 per-channel blend of two packed RGB colours, fully opaque — the tint
+/// primitive shared by SGR-dim ([`dim_rgb`]) and P8's derived search tints.
+fn mix_half(a: u32, b: u32) -> u32 {
+    let mix = |shift: u32| {
+        let x = (a >> shift) & 0xff;
+        let y = (b >> shift) & 0xff;
+        (x + y) / 2
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
 /// Dim / faint (SGR 2): blend the foreground 50 % toward its background, fully
 /// opaque. Ported from the fork's `NSColor.dimmedColor(towards:)` — the opaque
 /// blend keeps adjacent box-drawing cells tiling without seams.
 fn dim_rgb(fg: u32, bg: u32) -> u32 {
-    let mix = |shift: u32| {
-        let f = (fg >> shift) & 0xff;
-        let b = (bg >> shift) & 0xff;
-        (f + b) / 2
-    };
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+    mix_half(fg, bg)
+}
+
+/// A gpui [`Rgba`]'s packed RGB (alpha dropped — cell backgrounds are opaque;
+/// the window's translucency is applied once, to the whole grid).
+fn rgba_to_u32(c: Rgba) -> u32 {
+    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b)
+}
+
+/// The copy-mode search highlights [`fill_row`] resolves per cell (P8): the
+/// viewport-bounded match set, the focused match, and the two derived tints.
+/// `None` at the call site whenever no search is live.
+#[derive(Clone, Copy)]
+struct SearchPaint<'a> {
+    matches: &'a [Match],
+    active: Option<&'a Match>,
+    /// Background tint for a plain match.
+    tint: u32,
+    /// Background tint for the focused (`n`/`N`) match.
+    active_tint: u32,
 }
 
 /// Copy ONE visible viewport row's cells out of a locked `Term` into owned
 /// paint data — the per-row body of the pre-r5b full-grid `snapshot`, split
 /// out so [`GridCache::reconcile`] runs it for damaged rows only. Byte-for-byte
 /// the same resolution pipeline (inverse-video, dim, hidden, selection), plus
-/// the ⌘-hover underline — the two pieces of view state the grid itself does
-/// not carry (`selection`, `hovered`) are resolved per cell right here, so a
-/// cached row is exactly what its [`SnapshotKey`] says it is.
+/// the ⌘-hover underline and the copy-mode search tints — the pieces of view
+/// state the grid itself does not carry (`selection`, `hovered`, `search`) are
+/// resolved per cell right here, so a cached row is exactly what its
+/// [`SnapshotKey`] says it is.
 /// Generic over the `Term`'s listener so the caller never has to name
 /// `nice-term-core`'s private proxy type.
 #[allow(clippy::too_many_arguments)]
@@ -1738,6 +1810,7 @@ fn fill_row<T: EventListener>(
     selection: Option<SelectionRange>,
     selection_color: u32,
     hovered: Option<&Match>,
+    search: Option<SearchPaint<'_>>,
     display_offset: i32,
     cols: usize,
     vr: usize,
@@ -1781,6 +1854,21 @@ fn fill_row<T: EventListener>(
         // Hidden (SGR 8): paint the glyph in its own background (invisible).
         if flags.contains(Flags::HIDDEN) {
             fg = bg_resolved;
+        }
+
+        // Copy-mode search (P8): a cell inside a viewport match takes the dim
+        // match tint, the focused match takes the accent emphasis. Containment
+        // is per-cell over the row-major point order, exactly like the hover
+        // range, so a match that soft-wraps tints the tail of one row and the
+        // head of the next. Applied BEFORE selection on purpose — a live
+        // `v`-selection is the stronger, user-driven signal and wins any cell
+        // the two share.
+        if let Some(sp) = search {
+            if sp.active.is_some_and(|m| m.contains(&point)) {
+                bg_resolved = sp.active_tint;
+            } else if sp.matches.iter().any(|m| m.contains(&point)) {
+                bg_resolved = sp.tint;
+            }
         }
 
         // Selection: the highlighted cells' background is replaced by the
@@ -2343,6 +2431,7 @@ mod tests {
             None,
             DEFAULT_SELECTION,
             hovered,
+            None,
             0,
             cols,
             vr,
@@ -2432,6 +2521,189 @@ mod tests {
         assert!(hovered != moved, "hovering a DIFFERENT match must invalidate");
     }
 
+    // ---- Copy-mode search highlights (Phase 3, P8) ---------------------------
+
+    /// One match covering `line`'s columns `cols`.
+    fn m(line: i32, cols: std::ops::RangeInclusive<usize>) -> Match {
+        GridPoint::new(Line(line), Column(*cols.start()))
+            ..=GridPoint::new(Line(line), Column(*cols.end()))
+    }
+
+    /// Viewport row `vr` resolved with a search highlight set (and optionally a
+    /// selection), using distinguishable stand-in tints.
+    fn searched_row(
+        term: &Term<VoidListener>,
+        cols: usize,
+        vr: usize,
+        matches: &[Match],
+        active: Option<&Match>,
+        selection: Option<SelectionRange>,
+    ) -> Vec<PaintCell> {
+        let theme = TerminalTheme::nice_default_dark();
+        let mut out = Vec::new();
+        fill_row(
+            term,
+            &theme,
+            theme.background.to_u32(),
+            selection,
+            DEFAULT_SELECTION,
+            None,
+            Some(SearchPaint {
+                matches,
+                active,
+                tint: MATCH_TINT,
+                active_tint: ACTIVE_TINT,
+            }),
+            0,
+            cols,
+            vr,
+            &mut out,
+        );
+        out
+    }
+
+    const MATCH_TINT: u32 = 0x101010;
+    const ACTIVE_TINT: u32 = 0x202020;
+
+    #[test]
+    fn matches_tint_exactly_their_cells_and_the_active_one_wins() {
+        // Per-cell containment, resolved in `fill_row` like selection/hover: the
+        // cells a match covers (and only those) take the match tint, and the
+        // focused match's cells take the emphasis tint even though it is also in
+        // the plain match set (P8 paints it once, emphasised).
+        let term = hover_term(16, 2, "one two three");
+        let plain = m(0, 0..=2); // "one"
+        let active = m(0, 4..=6); // "two"
+
+        let row = searched_row(
+            &term,
+            16,
+            0,
+            &[plain, active.clone()],
+            Some(&active),
+            None,
+        );
+        for (col, cell) in row.iter().enumerate() {
+            let want = match col {
+                0..=2 => Some(MATCH_TINT),
+                4..=6 => Some(ACTIVE_TINT),
+                _ => None,
+            };
+            assert_eq!(cell.bg, want, "col {col} ({:?}) background", cell.ch);
+        }
+
+        // No search at all ⇒ the same row is untinted (the `None` call site).
+        assert!(
+            hovered_row(&term, 16, 0, None).iter().all(|c| c.bg.is_none()),
+            "with no live search the row carries no match tint"
+        );
+    }
+
+    #[test]
+    fn a_selection_wins_the_cells_it_shares_with_a_match() {
+        // Precedence, pinned: search tints are applied first and the live
+        // `v`-selection overwrites them — the user's own selection is the
+        // stronger signal, and after a search-and-select the yanked text must
+        // read as selected, not as "still a match".
+        let term = hover_term(16, 2, "one two three");
+        let hit = m(0, 0..=2);
+        let selection = SelectionRange::new(
+            GridPoint::new(Line(0), Column(0)),
+            GridPoint::new(Line(0), Column(1)),
+            false,
+        );
+
+        let row = searched_row(
+            &term,
+            16,
+            0,
+            std::slice::from_ref(&hit),
+            Some(&hit),
+            Some(selection),
+        );
+        assert_eq!(
+            (row[0].bg, row[1].bg, row[2].bg),
+            (
+                Some(DEFAULT_SELECTION),
+                Some(DEFAULT_SELECTION),
+                Some(ACTIVE_TINT)
+            ),
+            "the selected cells wear the selection colour; the rest of the match keeps its tint"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_match_tints_both_of_its_rows() {
+        // `Match` is a `RangeInclusive<Point>` over the row-major point order,
+        // so a match that soft-wraps covers the tail of one row and the head of
+        // the next — and stops dead at its end column.
+        let term = hover_term(10, 3, "x needle-wrapped");
+        let hit = GridPoint::new(Line(0), Column(2))..=GridPoint::new(Line(1), Column(5));
+
+        let first = searched_row(&term, 10, 0, std::slice::from_ref(&hit), None, None);
+        assert!(
+            first[2..].iter().all(|c| c.bg == Some(MATCH_TINT)) && first[1].bg.is_none(),
+            "the first row is tinted from the match start to its end"
+        );
+        let second = searched_row(&term, 10, 1, std::slice::from_ref(&hit), None, None);
+        for (col, cell) in second.iter().enumerate() {
+            assert_eq!(
+                cell.bg,
+                (col <= 5).then_some(MATCH_TINT),
+                "wrapped row col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_match_tints_are_derived_and_distinct() {
+        // P8 ships no new theme keys: both tints are blends toward the pane
+        // background — half-strength selection for a match, half-strength accent
+        // for the focused one. They must differ from each other AND from the
+        // full selection colour, or the three states are indistinguishable.
+        let bg = 0x101014;
+        let selection = 0x3a3a3a;
+        let accent = 0x4c8dff;
+        let tint = mix_half(selection, bg);
+        let active = mix_half(accent, bg);
+        assert_ne!(tint, active, "match vs active match must be tellable apart");
+        assert_ne!(tint, selection, "a match must not read as a full selection");
+        assert_ne!(tint, bg, "a match must be visible against the background");
+        assert_ne!(active, bg, "the active match must be visible too");
+    }
+
+    #[test]
+    fn an_equal_match_set_keeps_the_cache_warm_but_a_changed_one_invalidates() {
+        // The frame path allocates a FRESH `Rc<[Match]>` every frame (P8: the set
+        // is recomputed, never cached), so the key must compare it by VALUE —
+        // otherwise every frame of a live search would full-invalidate the row
+        // cache. The flip side is equally load-bearing: a genuinely different set
+        // (or a moved active match) MUST invalidate, since alacritty's damage
+        // knows nothing about our highlights.
+        let base = test_key(3, 4);
+        let mut searched = base.clone();
+        searched.search_matches = Some(Rc::from(vec![m(0, 0..=2)]));
+        assert!(base != searched, "a first match set must invalidate");
+
+        let mut same_value = base.clone();
+        same_value.search_matches = Some(Rc::from(vec![m(0, 0..=2)]));
+        assert!(
+            searched == same_value,
+            "a fresh Rc with equal contents must compare EQUAL (value, not pointer)"
+        );
+
+        let mut moved = searched.clone();
+        moved.search_matches = Some(Rc::from(vec![m(1, 0..=2)]));
+        assert!(searched != moved, "a moved match must invalidate");
+
+        let mut focused = searched.clone();
+        focused.active_match = Some(m(0, 0..=2));
+        assert!(
+            searched != focused,
+            "focusing a match (n/N) must invalidate — only its tint changes"
+        );
+    }
+
     // ---- Damage-gated row cache (fix round r5b) -------------------------------
     //
     // These pin `GridCache`'s invalidation contract with NO gpui and NO `Term`:
@@ -2459,6 +2731,8 @@ mod tests {
             display_offset: 0,
             selection: None,
             hovered_hyperlink: None,
+            search_matches: None,
+            active_match: None,
         }
     }
 
@@ -2567,6 +2841,15 @@ mod tests {
         k.hovered_hyperlink =
             Some(GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(3)));
         variants.push(("⌘-hover change (not in alacritty damage)", k));
+        let mut k = test_key(3, 4);
+        k.search_matches = Some(Rc::from(vec![
+            GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(2)),
+        ]));
+        variants.push(("search matches (not in alacritty damage)", k));
+        let mut k = test_key(3, 4);
+        k.active_match =
+            Some(GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(2)));
+        variants.push(("active match (n/N re-tints it)", k));
         let mut k = test_key(3, 4);
         k.display_offset = 2;
         variants.push(("display-offset change (scroll re-maps rows)", k));

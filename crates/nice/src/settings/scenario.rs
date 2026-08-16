@@ -986,7 +986,8 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     let mut mounted = false;
     for _ in 0..40 {
         if window_host
-            .update(cx, |h, _| h.scenario_terminal_for(&main_window))
+            // Pane-keyed cache since Phase 2 — resolve the pill's focused pane.
+            .update(cx, |h, hcx| h.scenario_terminal_for_window(&main_window, hcx))
             .is_some()
         {
             mounted = true;

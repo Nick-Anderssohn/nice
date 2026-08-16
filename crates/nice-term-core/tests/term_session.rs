@@ -12,8 +12,10 @@
 //!
 //! Cleanliness sweep hook: the **command** panes here
 //! (`marker_from_command_pane_lands_in_grid`, `command_pane_pwd_echoes_session_cwd`,
-//! `scrollback_knob_caps_history_with_bounded_memory`, and
-//! `damage_wake_fires_after_lock_released`) carry the token `NICE_TEST_SENTINEL`
+//! `scrollback_knob_caps_history_with_bounded_memory`,
+//! `damage_wake_fires_after_lock_released`, and
+//! `copy_mode_keeps_a_block_cursor_after_the_app_asked_for_a_beam`) carry the
+//! token `NICE_TEST_SENTINEL`
 //! in the child's argv (via the `sh -c '<script>' NICE_TEST_SENTINEL` [`wrap`]
 //! — the token becomes `$0`, so it shows in `ps -Aww -o args=` but never in the
 //! command's output). After the run,
@@ -30,6 +32,7 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::vte::ansi::CursorShape;
 use nice_term_core::{
     shell_single_quote, DamageCallback, SpawnSpec, TermSession, DEFAULT_SCROLLBACK_LINES,
 };
@@ -330,6 +333,47 @@ fn damage_wake_fires_after_lock_released() {
     );
 
     assert!(wakes.load(Ordering::Relaxed) > 0, "damage wake never fired");
+
+    reap(session);
+}
+
+#[test]
+fn copy_mode_keeps_a_block_cursor_after_the_app_asked_for_a_beam() {
+    // P9: in copy mode (`TermMode::VI`) the vi cursor IS the cursor, and
+    // alacritty otherwise lets it inherit whatever DECSCUSR shape the running
+    // app last set — so a TUI that switched to a beam (or hid its caret) would
+    // leave copy mode with no readable keyboard cursor. The session's `Config`
+    // pins `vi_mode_cursor_style` to a block; this proves the pin survives an
+    // app that asked for something else.
+    let spec = SpawnSpec::command(wrap("printf '\\033[5 q'; echo BEAMSET"), "/private/tmp")
+        .with_env(test_env());
+    let session =
+        TermSession::spawn(&spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn beam pane");
+
+    // Wait for the DECSCUSR to be parsed — the marker prints after it, so a
+    // visible marker means the style request already landed in the `Term`.
+    assert!(
+        poll_until(|| session.grid_contains("BEAMSET")),
+        "the beam-setting command never ran; last grid:\n{}",
+        session.visible_snapshot().text()
+    );
+
+    let mut term = session.term().lock();
+    assert_eq!(
+        term.cursor_style().shape,
+        CursorShape::Beam,
+        "the app's DECSCUSR must still drive the LIVE caret"
+    );
+    term.toggle_vi_mode();
+    let vi_style = term.cursor_style();
+    drop(term);
+
+    assert_eq!(
+        vi_style.shape,
+        CursorShape::Block,
+        "copy mode must show a block cursor regardless of the app's request"
+    );
+    assert!(!vi_style.blinking, "the copy-mode cursor must not blink");
 
     reap(session);
 }

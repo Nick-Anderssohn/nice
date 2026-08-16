@@ -5,7 +5,7 @@
 //!
 //! ## Layout
 //! One [`setting_row`](crate::settings::root::setting_row) per rebindable
-//! [`ShortcutAction`] (all 22, `ShortcutAction::ALL` order). Each row's control is a
+//! [`ShortcutAction`] (all 34, `ShortcutAction::ALL` order). Each row's control is a
 //! **recorder field**:
 //! * **Resting** — the bound combo rendered as key-pills (⌘⌥ symbols + the key), or
 //!   `"Not bound"` when the action is unbound; clicking it enters capture mode. A
@@ -1036,7 +1036,11 @@ mod tests {
     }
 
     /// One chord per group, spelled out — the guard is not just "whatever the
-    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS, ⌃⌘Z future).
+    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS). The
+    /// future-phase group has no example left: it held ⌃⌘Z until Phase 2 spent
+    /// it on Zoom Pane and ⌃⌘/ until Phase 3 spent it on Search Scrollback,
+    /// which is exactly why a reserved entry has to disappear when its phase
+    /// claims it (see `phase_three_freed_the_search_chord` below).
     #[test]
     fn reserved_groups_are_each_covered() {
         let refuse = |token: &str, modifiers, key| {
@@ -1064,10 +1068,68 @@ mod tests {
             refuse("cmd-ctrl-space", Modifiers::CONTROL_COMMAND, "space"),
             "Reserved: the macOS emoji picker"
         );
+    }
+
+    /// Phase 3's promotion, at the recorder: ⌃⌘/ was the last `FuturePhase`
+    /// entry and is now Search Scrollback's default, so capturing it reports an
+    /// ordinary conflict the user can Replace instead of a flat refusal.
+    #[test]
+    fn phase_three_freed_the_search_chord() {
         assert_eq!(
-            refuse("cmd-ctrl-z", Modifiers::CONTROL_COMMAND, "z"),
-            "Reserved for a future Nice feature"
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                Modifiers::CONTROL_COMMAND,
+                "/",
+                false,
+                &default_bindings_vec(),
+            ),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-/"),
+                other: ShortcutAction::SearchScrollback,
+            }
         );
+    }
+
+    /// The chords Phase 2 took off the reserved table are recordable now. ⌃⌘V
+    /// and ⌃⌘S commit outright — D2 released them rather than spending them —
+    /// while the chords that became pane verbs report an ordinary Conflict with
+    /// the action holding them, which the user can Replace. Before Phase 2 all
+    /// twelve were flat refusals with no way through.
+    #[test]
+    fn phase_two_freed_chords_are_recordable() {
+        let capture = |modifiers, key: &str| {
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                modifiers,
+                key,
+                false,
+                &default_bindings_vec(),
+            )
+        };
+        for key in ["v", "s"] {
+            assert_eq!(
+                capture(Modifiers::CONTROL_COMMAND, key),
+                CaptureOutcome::Commit(combo(&format!("cmd-ctrl-{key}"))),
+                "⌃⌘{key} is free to record"
+            );
+        }
+        assert_eq!(
+            capture(Modifiers::CONTROL_COMMAND, "z"),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-z"),
+                other: ShortcutAction::ZoomPane,
+            },
+            "⌃⌘Z is held by an action now, not refused by the guard"
+        );
+        assert_eq!(
+            capture(Modifiers::CONTROL_ALT_COMMAND, "h"),
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-alt-h"),
+                other: ShortcutAction::ResizePaneLeft,
+            },
+        );
+        // ⌃⌘/ was the last chord still held for a later phase; Phase 3 spent it
+        // on Search Scrollback (`phase_three_freed_the_search_chord` above).
     }
 
     /// The guard runs BEFORE the conflict check. No SHIPPED default sits on a

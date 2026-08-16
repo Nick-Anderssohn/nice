@@ -42,6 +42,10 @@ keys — `h`/`l` step the window pills, `j`/`k` step the sidebar sessions. Hold 
 for a moment without pressing anything and each window pill shows the digit that
 jumps to it.
 
+Adding modifiers climbs a ladder: the modifier set picks the verb, `hjkl` picks
+the direction. `⌃⌘` navigates containers, `⌃⌘⇧` moves focus between split panes,
+`⌃⌥⌘` resizes them, `⌃⌥⌘⇧` swaps them.
+
 | Shortcut | Action |
 |---|---|
 | `⌃⌘L` / `⌃⌘H` | Next / previous window within a session |
@@ -49,6 +53,14 @@ jumps to it.
 | `⌃⌘1`–`⌃⌘9` | Jump to a window by its position |
 | `⌃⌘O` | Back to the last window you were in |
 | `⌃⌘↑` / `⌃⌘↓` | Half-page through terminal scrollback |
+| `⌃⌘-` / `⌃⌘\` | Split the window down / to the right |
+| `⌃⌘⇧HJKL` | Move focus to the pane in that direction |
+| `⌃⌥⌘HJKL` | Resize the current split in that direction |
+| `⌃⌥⌘⇧HJKL` | Swap the focused pane with its neighbor in that direction |
+| `⌃⌘Z` | Zoom the focused pane to fill the window (toggle) |
+| `⌃⌘B` | Break the focused pane out into a window of its own |
+| `⌃⌘C` | Copy mode — vi keys over the pane's scrollback (toggle) |
+| `⌃⌘/` | Search the pane's scrollback (opens copy mode with a query) |
 | `⌘T` | New terminal window |
 | `⌘B` | Toggle sidebar |
 | `⌘⇧B` | Toggle sidebar mode (sessions ↔ file browser) |
@@ -64,6 +76,34 @@ terminal-level and fall through to fullscreen apps like vim. `⌃⌘1`–`⌃⌘
 single row there: record any digit and the modifiers you chose apply to all
 nine. `⌃⌘↑`/`⌃⌘↓` deliberately do nothing on the alternate screen, so vim and
 less keep their own half-page keys.
+
+### Copy mode
+
+`⌃⌘C` puts one pane into copy mode: a keyboard cursor you drive with vi keys,
+over that pane's whole scrollback. The pane keeps running — copy mode is a
+reader, not a pause — and nothing you type while in it reaches the program.
+`⌃⌘/` is the same mode with a search field already open, searching back through
+history. Everything is per-pane: the pane beside it still types normally.
+
+| Key | In copy mode |
+|---|---|
+| `h` `j` `k` `l` (or the arrows) | Move the cursor left / down / up / right |
+| `w` `b` `e` | Word forward / back / to word end (`W` `B` `E` for WORDs) |
+| `0` / `^` / `$` | Start of line / first non-blank / end of line |
+| `H` / `M` / `L` | Top / middle / bottom of the screen |
+| `{` / `}` / `%` | Paragraph up / down / matching bracket |
+| `g` / `G` | Top of the scrollback / back down to the newest output |
+| `⌃U` / `⌃D` | Half page up / down |
+| `⌃B` / `⌃F` | Full page up / down |
+| `v` / `V` / `⌃V` | Start (or clear) a character / line / block selection |
+| `y` or `↩` | Copy the selection and leave copy mode |
+| `⌘C` | Copy the selection and stay in copy mode |
+| `/` / `?` | Search forward / back through the scrollback |
+| `n` / `N` | Next match / previous match |
+| `Esc` or `q` | Leave copy mode and jump back to the live output |
+
+The `⇧`-scrollback keys keep working in copy mode too. Leaving always returns
+the pane to the bottom of its live output.
 
 ## Requirements
 

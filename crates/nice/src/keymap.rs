@@ -65,9 +65,15 @@ use nice_model::shortcuts::{
     RESERVED_NEW_WINDOW, RESERVED_OPEN_SETTINGS, RESERVED_QUIT, RESERVED_TOGGLE_FULL_SCREEN,
     WINDOW_INDEX_KEYS,
 };
-use nice_model::SidebarMode;
+use nice_model::{
+    directional_neighbor, PaneDirection, PaneRect, SidebarMode, SplitOrient, TermWindowKind,
+};
+use nice_term_core::SpawnSpec;
 use nice_term_view::FontSettings;
 
+use crate::app_shell::{
+    min_ratio_for, split_available_px, PANE_DIVIDER_PX, PANE_MIN_HEIGHT, PANE_MIN_WIDTH,
+};
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
@@ -101,6 +107,20 @@ gpui::actions!(
         LastActiveWindow,
         ScrollHalfPageUp,
         ScrollHalfPageDown,
+        SplitDown,
+        SplitRight,
+        ZoomPane,
+        BreakPane,
+        ResizePaneLeft,
+        ResizePaneDown,
+        ResizePaneUp,
+        ResizePaneRight,
+        SwapPaneLeft,
+        SwapPaneDown,
+        SwapPaneUp,
+        SwapPaneRight,
+        CopyMode,
+        SearchScrollback,
     ]
 );
 
@@ -431,22 +451,39 @@ fn register_window_scoped_actions(cx: &mut App) {
     //
     // D3, as revised by the 2026-08-11 hjkl ladder: the four `FocusPane*`
     // actions are the ladder's ⌃⌘⇧ rung — directional PANE focus (tmux
-    // `select-pane -L/-D/-U/-R` over the future split tree). All four are
-    // registered but INERT until Phase 2 lands splits: there are no panes to
-    // move between, and the bare-⌃⌘ rung (`h`/`l` → prev/next pill, `j`/`k` →
-    // prev/next sidebar session) owns container navigation, so `h`/`l` no longer
-    // alias the pill strip. Registered rather than omitted so the chords are
-    // consumed by the keymap instead of leaking into the pty, and so Phase 2 only
-    // has to fill these bodies in — no binding moves, nothing migrates.
-    cx.on_action(|_: &FocusPaneLeft, _cx: &mut App| {});
-    cx.on_action(|_: &FocusPaneRight, _cx: &mut App| {});
-    cx.on_action(|_: &FocusPaneUp, _cx: &mut App| {});
-    cx.on_action(|_: &FocusPaneDown, _cx: &mut App| {});
+    // `select-pane -L/-D/-U/-R`). Phase 1 shipped them registered-but-inert
+    // (there were no panes to move between yet) precisely so Phase 2 would only
+    // have to fill the bodies in: no binding moved, nothing migrated.
+    cx.on_action(|_: &FocusPaneLeft, cx: &mut App| focus_pane(cx, PaneDirection::Left));
+    cx.on_action(|_: &FocusPaneRight, cx: &mut App| focus_pane(cx, PaneDirection::Right));
+    cx.on_action(|_: &FocusPaneUp, cx: &mut App| focus_pane(cx, PaneDirection::Up));
+    cx.on_action(|_: &FocusPaneDown, cx: &mut App| focus_pane(cx, PaneDirection::Down));
+    // -- Phase 2 (tmux port): the pane verbs ----------------------------------
+    //
+    // Every one of these mutates the MODEL only; the render reacts (spawning a
+    // freshly split pane's pty is the single exception, done here so the shell
+    // is up before the first paint). That is the established action pattern —
+    // `NextWindow` / `PrevWindow` right above work the same way.
+    cx.on_action(|_: &SplitDown, cx: &mut App| split_focused_pane(cx, SplitOrient::Stacked));
+    cx.on_action(|_: &SplitRight, cx: &mut App| split_focused_pane(cx, SplitOrient::Beside));
+    cx.on_action(|_: &ZoomPane, cx: &mut App| toggle_zoom(cx));
+    cx.on_action(|_: &BreakPane, cx: &mut App| break_focused_pane(cx));
+    cx.on_action(|_: &ResizePaneLeft, cx: &mut App| resize_pane(cx, PaneDirection::Left));
+    cx.on_action(|_: &ResizePaneDown, cx: &mut App| resize_pane(cx, PaneDirection::Down));
+    cx.on_action(|_: &ResizePaneUp, cx: &mut App| resize_pane(cx, PaneDirection::Up));
+    cx.on_action(|_: &ResizePaneRight, cx: &mut App| resize_pane(cx, PaneDirection::Right));
+    cx.on_action(|_: &SwapPaneLeft, cx: &mut App| swap_pane(cx, PaneDirection::Left));
+    cx.on_action(|_: &SwapPaneDown, cx: &mut App| swap_pane(cx, PaneDirection::Down));
+    cx.on_action(|_: &SwapPaneUp, cx: &mut App| swap_pane(cx, PaneDirection::Up));
+    cx.on_action(|_: &SwapPaneRight, cx: &mut App| swap_pane(cx, PaneDirection::Right));
     cx.on_action(|_: &LastActiveWindow, cx: &mut App| {
         with_active_state(cx, |s, _cx| last_active_window(&mut s.workspace));
     });
     cx.on_action(|_: &ScrollHalfPageUp, cx: &mut App| scroll_active_window_half_page(cx, true));
     cx.on_action(|_: &ScrollHalfPageDown, cx: &mut App| scroll_active_window_half_page(cx, false));
+    // -- Phase 3 (tmux port): copy mode + scrollback search -------------------
+    cx.on_action(|_: &CopyMode, cx: &mut App| toggle_copy_mode(cx));
+    cx.on_action(|_: &SearchScrollback, cx: &mut App| open_scrollback_search(cx));
     cx.on_action(|action: &SelectWindowIndex, cx: &mut App| {
         let index = action.index;
         with_active_state(cx, |s, _cx| {
@@ -498,13 +535,380 @@ fn last_active_window(model: &mut nice_model::WorkspaceModel) {
     });
 }
 
-/// Half-page scrollback (⌃⌘↑ / ⌃⌘↓) on the ACTIVE window of the active session.
+// ===========================================================================
+// Phase 2 (tmux port) — the pane verbs
+// ===========================================================================
+
+/// How far one `⌃⌥⌘hjkl` press walks a divider, in px (P7). Converted to a ratio
+/// delta against the px that divider's ratio actually divides, so a step moves
+/// the same visible distance whatever the split's size or nesting depth.
+const RESIZE_STEP_PX: f32 = 40.0;
+
+/// The active session's active window — the pill every pane verb operates on.
+/// `None` when no session is active or the active session has no active window,
+/// in which case every verb below is a no-op.
+fn active_session_window(state: &WindowState) -> Option<(String, String)> {
+    let session_id = state.workspace.active_session_id().map(str::to_owned)?;
+    let term_window_id = state
+        .workspace
+        .session_for(&session_id)
+        .and_then(|s| s.active_window_id.clone())?;
+    Some((session_id, term_window_id))
+}
+
+/// Run `f` over the active pill's [`TermWindow`](nice_model::TermWindow) —
+/// read-only, so the verbs can decide whether to mutate before they touch
+/// `mutate_session` (whose did-mutate signal queues a session save; a refused
+/// verb must not queue one).
+fn with_active_window<R>(
+    state: &WindowState,
+    session_id: &str,
+    term_window_id: &str,
+    f: impl FnOnce(&nice_model::TermWindow) -> R,
+) -> Option<R> {
+    state
+        .workspace
+        .session_for(session_id)
+        .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+        .map(f)
+}
+
+/// The pane area's last painted size as a rect at the origin, or `None` before
+/// the window's first paint. Only extents matter — the pane tree's geometry is
+/// laid out relative to its own bounds.
+fn pane_content_rect(state: &WindowState) -> Option<PaneRect> {
+    let (w, h) = state.pane_content_size()?;
+    (w > 0.0 && h > 0.0).then(|| PaneRect::new(0.0, 0.0, w, h))
+}
+
+/// Directional pane focus — the ladder's `⌃⌘⇧hjkl` rung (tmux `select-pane
+/// -L/-D/-U/-R`).
+///
+/// P5: the edge is a **no-op**. Focus does not wrap, and it does not fall
+/// through to pill navigation — bare `⌃⌘h`/`⌃⌘l` is how the user leaves a pill,
+/// so falling through would make one chord mean two things depending on where
+/// the caret happens to sit.
+///
+/// P4: a real move un-zooms first, then applies. A refused move changes
+/// nothing at all, zoom included.
+///
+/// Adjacency is computed on
+/// [`nominal_leaf_rects`](nice_model::TermWindow::nominal_leaf_rects) rather
+/// than the painted bounds: the ranking is scale-invariant, so a stand-in extent
+/// gives the same answer, and the verb keeps working before the first paint.
+fn focus_pane(cx: &mut App, direction: PaneDirection) {
+    with_active_state(cx, |s, _cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let target = with_active_window(s, &session_id, &term_window_id, |w| {
+            directional_neighbor(&w.nominal_leaf_rects(), &w.effective_pane_id(), direction)
+        })
+        .flatten();
+        let Some(target) = target else {
+            return;
+        };
+        s.workspace.mutate_session(&session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                term_window.active_pane_id = target;
+                term_window.zoomed = false;
+            }
+        });
+        s.save_to_store();
+    });
+}
+
+/// Split the focused pane (`⌃⌘-` stacked / `⌃⌘\` beside, D2's divider
+/// mnemonics), putting the new shell down/right of it and moving focus there —
+/// tmux's `split-window` behavior.
+///
+/// **P6 refusal.** A split that would leave either half under
+/// [`PANE_MIN_WIDTH`]/[`PANE_MIN_HEIGHT`] is refused outright rather than
+/// clamped: there is no ratio at which two panes fit, so the honest answer is to
+/// do nothing. With no painted size yet (the window has never rendered) there is
+/// no px context to refuse against, so the split proceeds at an even ratio.
+///
+/// **D1.** The new pane always runs a plain shell in the focused pane's cwd.
+/// Nice never spawns Claude into a split pane, so the ≤1-running-Claude-per-
+/// session invariant is untouched — Claude stays in the pane it started in.
+///
+/// The pty is spawned right here rather than left to the next render's
+/// `ensure_active_window_spawned`, so the shell is already coming up when the
+/// pane first paints. Only when the pane being split is itself live, though: a
+/// pill that has not spawned at all restores lazily on activation, and splitting
+/// it must not jump that queue.
+fn split_focused_pane(cx: &mut App, orient: SplitOrient) {
+    with_active_state(cx, |s, cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let content = pane_content_rect(s);
+        // Everything the split needs, read before anything is written.
+        let Some(Some((focused_id, cwd, source_is_live))) =
+            with_active_window(s, &session_id, &term_window_id, |window| {
+                let focused_id = window.effective_pane_id();
+                let pane = window.layout.pane(&focused_id)?;
+                if let Some(content) = content {
+                    if !split_fits(&window.layout, &focused_id, orient, content) {
+                        return None;
+                    }
+                }
+                let cwd = s
+                    .workspace
+                    .resolved_spawn_cwd_for_pane(
+                        s.workspace.session_for(&session_id)?,
+                        window,
+                        pane,
+                    );
+                let live = s.ptys.has_pane(&session_id, &term_window_id, &focused_id);
+                Some((focused_id, cwd, live))
+            })
+        else {
+            return;
+        };
+
+        let new_pane_id = s
+            .ptys
+            .mint_pane_id(&format!("{term_window_id}-pane"));
+        let mut split = false;
+        {
+            let (new_pane_id, cwd) = (new_pane_id.clone(), cwd.clone());
+            s.workspace.mutate_session(&session_id, |session| {
+                let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id)
+                else {
+                    return;
+                };
+                let pane = nice_model::Pane::new(new_pane_id.clone(), TermWindowKind::Terminal)
+                    .with_cwd(Some(cwd));
+                if term_window.layout.split(&focused_id, orient, pane) {
+                    // Focus follows the new pane (tmux), and P4 un-zooms: a
+                    // zoomed pill that just grew a pane must show it.
+                    term_window.active_pane_id = new_pane_id;
+                    term_window.zoomed = false;
+                    split = true;
+                }
+            });
+        }
+        if !split {
+            return;
+        }
+        if source_is_live {
+            // A split pane is a normal injected terminal pane: the active
+            // profile's argv carries the rc injection (bash `--rcfile`), and the
+            // spawn snapshots the CURRENT profile as the pane's `PaneShell` — a
+            // pane split off mid-run after a shell change runs the new shell
+            // beside its old-shell sibling.
+            let spec =
+                SpawnSpec::shell(cwd).with_argv(crate::shell::spawn_argv(cx, true, None));
+            if let Err(e) = s.ptys.spawn_pane(
+                &session_id,
+                &term_window_id,
+                &new_pane_id,
+                spec,
+                cx,
+            ) {
+                eprintln!("nice: split pane failed to spawn: {e}");
+            }
+            // Wire the new pty's events immediately; the render's own sweep
+            // would get there too, but a pane that exits between the split and
+            // the first paint must still route.
+            s.subscribe_spawned_windows(cx);
+        }
+        s.save_to_store();
+    });
+}
+
+/// Whether bisecting `pane_id` leaves both halves at or above the P6 minimum,
+/// measured against the painted layout. The divider's own px come out of the
+/// splittable extent first — it is real screen the two halves don't get.
+fn split_fits(
+    layout: &nice_model::PaneLayout,
+    pane_id: &str,
+    orient: SplitOrient,
+    content: PaneRect,
+) -> bool {
+    let Some((_, rect)) = layout
+        .leaf_rects(content, PANE_DIVIDER_PX)
+        .into_iter()
+        .find(|(id, _)| id == pane_id)
+    else {
+        return true;
+    };
+    let (extent, min) = match orient {
+        SplitOrient::Beside => (rect.width, PANE_MIN_WIDTH),
+        SplitOrient::Stacked => (rect.height, PANE_MIN_HEIGHT),
+    };
+    (extent - PANE_DIVIDER_PX) / 2.0 >= min
+}
+
+/// Toggle "paint only the focused pane, full size" (`⌃⌘z`) — tmux `resize-pane
+/// -Z`. P4: a transient render flag, never persisted; every pty keeps running
+/// underneath. A single-pane pill has nothing to zoom, so the chord is a no-op
+/// there rather than a state change nothing can show.
+fn toggle_zoom(cx: &mut App) {
+    with_active_state(cx, |s, _cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let multi = with_active_window(s, &session_id, &term_window_id, |w| {
+            w.layout.leaf_count() > 1
+        })
+        .unwrap_or(false);
+        if !multi {
+            return;
+        }
+        // No `save_to_store` after this one: `zoomed` is `#[serde(skip)]`, so
+        // there is nothing for a save to record.
+        s.workspace.mutate_session(&session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                term_window.zoomed = !term_window.zoomed;
+            }
+        });
+    });
+}
+
+/// Break the focused shell pane out into a pill of its own (`⌃⌘b`) — tmux
+/// `break-pane` (P3). The pty MOVES; whatever was running keeps running.
+///
+/// [`PtyManager::move_pane_to_new_window`] owns the refusals (single-leaf pill,
+/// the Claude pane) and the re-keying; this only has to move focus to the new
+/// pill, which is where tmux leaves it.
+///
+/// [`PtyManager::move_pane_to_new_window`]: crate::pty_manager::PtyManager::move_pane_to_new_window
+fn break_focused_pane(cx: &mut App) {
+    with_active_state(cx, |s, _cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let Some(pane_id) =
+            with_active_window(s, &session_id, &term_window_id, |w| w.effective_pane_id())
+        else {
+            return;
+        };
+        let Some(new_window_id) = s.ptys.move_pane_to_new_window(
+            &mut s.workspace,
+            &session_id,
+            &term_window_id,
+            &pane_id,
+        ) else {
+            return;
+        };
+        s.workspace.mutate_session(&session_id, |session| {
+            // P4 on the source pill: it just lost a pane, so a zoom that was
+            // hiding the rest of it would now be hiding the wrong thing.
+            if let Some(source) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                source.zoomed = false;
+            }
+            session.switch_active_window(&new_window_id);
+        });
+        s.save_to_store();
+    });
+}
+
+/// Walk the nearest enclosing split's divider one step (`⌃⌥⌘hjkl`) — tmux
+/// `resize-pane -L/-D/-U/-R` (P7).
+///
+/// The px step becomes a ratio delta against exactly the px that divider
+/// divides ([`split_available_px`]), so the divider travels
+/// [`RESIZE_STEP_PX`] on screen whatever the split's size or depth, and it
+/// clamps against the same P6 band a mouse drag does. `⌃⌥⌘h`/`⌃⌥⌘l` reach the
+/// nearest side-by-side ancestor, `⌃⌥⌘j`/`⌃⌥⌘k` the nearest stacked one; no
+/// matching ancestor is a no-op.
+///
+/// Without a painted size there is no px to convert against, so the verb does
+/// nothing rather than guess at a ratio step (the plan's "resize no-ops" rule).
+fn resize_pane(cx: &mut App, direction: PaneDirection) {
+    with_active_state(cx, |s, _cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let Some(content) = pane_content_rect(s) else {
+            return;
+        };
+        // Resize on a CLONE first: a divider already pinned at the clamp must
+        // not queue a session save for a layout that did not move.
+        let Some(Some(layout)) = with_active_window(s, &session_id, &term_window_id, |window| {
+            let focused = window.effective_pane_id();
+            let path = window.layout.resize_target_path(&focused, direction)?;
+            let available = split_available_px(&window.layout, &path, content)?;
+            if available <= 0.0 {
+                return None;
+            }
+            let mut layout = window.layout.clone();
+            layout
+                .resize(
+                    &focused,
+                    direction,
+                    RESIZE_STEP_PX / available,
+                    min_ratio_for(direction.orient(), available),
+                )
+                .then_some(layout)
+        }) else {
+            return;
+        };
+        s.workspace.mutate_session(&session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                term_window.layout = layout;
+            }
+        });
+        s.save_to_store();
+    });
+}
+
+/// Trade places with the directional neighbor (`⌃⌥⌘⇧hjkl`) — tmux `swap-pane`
+/// (P8). Payloads swap; structure and ratios stay exactly where they were, so
+/// nothing reflows and the two panes simply exchange rects.
+///
+/// Focus follows the CONTENT, which falls out of the swap itself: the pane id
+/// travels with its payload, so `active_pane_id` still names the same terminal —
+/// now painting where its neighbor used to be. No edge neighbor is a no-op, the
+/// same rule directional focus follows.
+fn swap_pane(cx: &mut App, direction: PaneDirection) {
+    with_active_state(cx, |s, _cx| {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
+            return;
+        };
+        let Some(Some((focused, target))) =
+            with_active_window(s, &session_id, &term_window_id, |w| {
+                let focused = w.effective_pane_id();
+                directional_neighbor(&w.nominal_leaf_rects(), &focused, direction)
+                    .map(|target| (focused, target))
+            })
+        else {
+            return;
+        };
+        let mut swapped = false;
+        s.workspace.mutate_session(&session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
+                if term_window.layout.swap(&focused, &target) {
+                    term_window.active_pane_id = focused;
+                    term_window.zoomed = false;
+                    swapped = true;
+                }
+            }
+        });
+        if swapped {
+            s.save_to_store();
+        }
+    });
+}
+
+/// Half-page scrollback (⌃⌘↑ / ⌃⌘↓) on the FOCUSED pane of the active session's
+/// active window.
 ///
 /// No keymap action reaches a terminal view today (Phase 0's Shift+nav scrollback
 /// lives in the view's own key listener, not the keymap), so this rides the seam
-/// that does exist: [`PtyManager::term_window_handle`] resolves the window's
+/// that does exist: [`PtyManager::pane_handle`] resolves the focused pane's
 /// [`TerminalSessionHandle`], and the scroll + `notify` follow
 /// `perform_scrollback`'s repaint discipline (`nice-term-view`'s `view.rs`).
+///
+/// **The pane comes from the MODEL**, via
+/// [`effective_pane_id`](nice_model::TermWindow::effective_pane_id) — the same
+/// resolution the render's `active_window_target` uses — not from the pty map's
+/// active-pane mirror. The mirror is only re-synced on window activation, so
+/// after a `⌃⌘⇧hjkl` move, a click into another pane, or a split (all of which
+/// move focus without re-activating the pill) it still names the pane the user
+/// LEFT, and the scroll would land on a terminal that isn't on screen.
 ///
 /// **Alt-screen gate.** On the alternate screen (vim, less, any full-screen TUI)
 /// this does nothing at all. The chord is a keymap binding, so it never encoded to
@@ -514,21 +918,19 @@ fn last_active_window(model: &mut nice_model::WorkspaceModel) {
 /// Held (not yet spawned) sessions work automatically: the handle's scroll methods
 /// no-op pre-spawn.
 ///
-/// [`PtyManager::term_window_handle`]: crate::pty_manager::PtyManager::term_window_handle
+/// [`PtyManager::pane_handle`]: crate::pty_manager::PtyManager::pane_handle
 /// [`TerminalSessionHandle`]: nice_term_view::TerminalSessionHandle
 fn scroll_active_window_half_page(cx: &mut App, toward_history: bool) {
     with_active_state(cx, |s, cx| {
-        let Some(session_id) = s.workspace.active_session_id().map(str::to_owned) else {
+        let Some((session_id, term_window_id)) = active_session_window(s) else {
             return;
         };
-        let Some(term_window_id) = s
-            .workspace
-            .session_for(&session_id)
-            .and_then(|sess| sess.active_window_id.clone())
+        let Some(pane_id) =
+            with_active_window(s, &session_id, &term_window_id, |w| w.effective_pane_id())
         else {
             return;
         };
-        let Some(handle) = s.ptys.term_window_handle(&session_id, &term_window_id) else {
+        let Some(handle) = s.ptys.pane_handle(&session_id, &term_window_id, &pane_id) else {
             return;
         };
         if handle.read(cx).is_alt_screen() {
@@ -542,6 +944,71 @@ fn scroll_active_window_half_page(cx: &mut App, toward_history: bool) {
             }
             hcx.notify();
         });
+    });
+}
+
+// ===========================================================================
+// Phase 3 (tmux port) — copy mode + scrollback search
+// ===========================================================================
+
+/// The focused pane of the active session's active window — the pane every
+/// Phase 3 verb operates on (copy mode and search are per-PANE). The resolution
+/// chain is [`scroll_active_window_half_page`]'s: model-resolved
+/// [`effective_pane_id`](nice_model::TermWindow::effective_pane_id), never the
+/// pty map's active-pane mirror, which goes stale the moment focus moves without
+/// re-activating the pill.
+fn focused_pane_key(state: &WindowState) -> Option<(String, String, String)> {
+    let (session_id, term_window_id) = active_session_window(state)?;
+    let pane_id = with_active_window(state, &session_id, &term_window_id, |w| {
+        w.effective_pane_id()
+    })?;
+    Some((session_id, term_window_id, pane_id))
+}
+
+/// `⌃⌘C` — toggle the focused pane's copy mode (D2). Entry seeds the vi cursor
+/// at the terminal cursor; exit clears the selection and the search and returns
+/// the viewport to the bottom (P6). Both halves are the handle's, so this is the
+/// resolution plus one call.
+///
+/// **No alt-screen gate**, unlike the half-page template it otherwise copies:
+/// P10 allows copy mode on the alternate screen, where motions and search work
+/// over the visible grid — selecting what vim or less is showing is a real use.
+///
+/// An open search bar closes with the mode: the mode going false is one of the
+/// three stale conditions the host checks on its next render
+/// ([`search_bar_is_stale`](crate::search_bar::search_bar_is_stale)), which is
+/// what makes this action safe to fire while the bar holds key focus.
+fn toggle_copy_mode(cx: &mut App) {
+    with_active_state(cx, |s, cx| {
+        let Some((session_id, term_window_id, pane_id)) = focused_pane_key(s) else {
+            return;
+        };
+        let Some(handle) = s.ptys.pane_handle(&session_id, &term_window_id, &pane_id) else {
+            return;
+        };
+        handle.update(cx, |h, hcx| {
+            h.toggle_copy_mode();
+            hcx.notify();
+        });
+    });
+}
+
+/// `⌃⌘/` — open the focused pane's scrollback search field, searching BACKWARD
+/// (P7: history-ward is the flagship "find the thing that scrolled past"
+/// direction; in-mode `/` and `?` keep vim's meanings and arrive as a routed
+/// [`SearchRequested`](nice_term_view::TerminalEvent) instead).
+///
+/// [`WindowState::open_search_bar`] does the work — enter copy mode, start a
+/// fresh search (or refocus the identical bar that a click into the pane left
+/// open), open the bar and defer its focus. The deferral is not optional here: a
+/// keymap handler is an App-level closure with no `&mut Window`, so focusing
+/// inline would silently not focus.
+fn open_scrollback_search(cx: &mut App) {
+    with_active_state(cx, |s, cx| {
+        let Some((session_id, term_window_id, pane_id)) = focused_pane_key(s) else {
+            return;
+        };
+        s.open_search_bar(&session_id, &term_window_id, &pane_id, true, cx);
     });
 }
 
@@ -685,6 +1152,20 @@ fn shortcut_binding(
         ShortcutAction::LastActiveWindow => Box::new(LastActiveWindow),
         ShortcutAction::ScrollHalfPageUp => Box::new(ScrollHalfPageUp),
         ShortcutAction::ScrollHalfPageDown => Box::new(ScrollHalfPageDown),
+        ShortcutAction::SplitDown => Box::new(SplitDown),
+        ShortcutAction::SplitRight => Box::new(SplitRight),
+        ShortcutAction::ZoomPane => Box::new(ZoomPane),
+        ShortcutAction::BreakPane => Box::new(BreakPane),
+        ShortcutAction::ResizePaneLeft => Box::new(ResizePaneLeft),
+        ShortcutAction::ResizePaneDown => Box::new(ResizePaneDown),
+        ShortcutAction::ResizePaneUp => Box::new(ResizePaneUp),
+        ShortcutAction::ResizePaneRight => Box::new(ResizePaneRight),
+        ShortcutAction::SwapPaneLeft => Box::new(SwapPaneLeft),
+        ShortcutAction::SwapPaneDown => Box::new(SwapPaneDown),
+        ShortcutAction::SwapPaneUp => Box::new(SwapPaneUp),
+        ShortcutAction::SwapPaneRight => Box::new(SwapPaneRight),
+        ShortcutAction::CopyMode => Box::new(CopyMode),
+        ShortcutAction::SearchScrollback => Box::new(SearchScrollback),
         // Handled above — it is the one action that is not one binding.
         ShortcutAction::WindowByIndex => unreachable!("WindowByIndex expands via window_index_bindings"),
     };
@@ -1292,25 +1773,11 @@ mod tests {
             assert!(unbound_entirely("cmd-alt-right"), "⌘⌥→ is freed");
             assert!(unbound_entirely("cmd-alt-left"), "⌘⌥← is freed");
 
-            // The ⌃⌘⇧ rung: directional pane focus (bound, inert until Phase 2).
+            // The ⌃⌘⇧ rung: directional pane focus.
             assert!(bound(&FocusPaneLeft, "cmd-ctrl-shift-h"));
             assert!(bound(&FocusPaneDown, "cmd-ctrl-shift-j"));
             assert!(bound(&FocusPaneUp, "cmd-ctrl-shift-k"));
             assert!(bound(&FocusPaneRight, "cmd-ctrl-shift-l"));
-
-            // The two rungs above it are RESERVED, never bound (Phase 2 claims them).
-            for chord in [
-                "cmd-ctrl-alt-h",
-                "cmd-ctrl-alt-j",
-                "cmd-ctrl-alt-k",
-                "cmd-ctrl-alt-l",
-                "cmd-ctrl-alt-shift-h",
-                "cmd-ctrl-alt-shift-j",
-                "cmd-ctrl-alt-shift-k",
-                "cmd-ctrl-alt-shift-l",
-            ] {
-                assert!(unbound_entirely(chord), "{chord} is reserved, not bound");
-            }
 
             assert!(bound(&LastActiveWindow, "cmd-ctrl-o"));
             // Half-page scroll lives on the ARROWS. It shipped on ⌃⌘U/⌃⌘D, but
@@ -1333,5 +1800,485 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Phase 2's board reaches the live keymap: the pane verbs are bound where
+    /// the ladder says, and the chords D2 released drive nothing at all.
+    ///
+    /// This is the board only. Whether macOS DELIVERS these chords — the
+    /// ⌃⌘D-class risk, which sits squarely on the ⌃⌥⌘ rungs — no in-process test
+    /// can see: injected keystrokes enter downstream of the OS intercept. The
+    /// hand feel-check is the gate for that.
+    #[gpui::test]
+    fn phase_two_pane_chords_are_live_in_the_keymap(cx: &mut gpui::TestAppContext) {
+        use gpui::Keystroke;
+
+        cx.update(|cx| {
+            cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("phase2")));
+            rebuild_keymap(cx);
+
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let bound = |action: &dyn Action, chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .bindings_for_action(action)
+                    .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
+            };
+            let unbound_entirely = |chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .all_bindings_for_input(std::slice::from_ref(&ks))
+                    .is_empty()
+            };
+
+            // D2's divider mnemonics, on the bare ⌃⌘ rung with the other
+            // directionless pane verbs.
+            assert!(bound(&SplitDown, "cmd-ctrl--"), "⌃⌘- splits down");
+            assert!(bound(&SplitRight, "cmd-ctrl-\\"), "⌃⌘\\ splits right");
+            assert!(bound(&ZoomPane, "cmd-ctrl-z"));
+            assert!(bound(&BreakPane, "cmd-ctrl-b"));
+
+            // The ladder's top two rungs, no longer reserved: ⌃⌥⌘ resizes,
+            // ⌃⌥⌘⇧ swaps, hjkl in both.
+            assert!(bound(&ResizePaneLeft, "cmd-ctrl-alt-h"));
+            assert!(bound(&ResizePaneDown, "cmd-ctrl-alt-j"));
+            assert!(bound(&ResizePaneUp, "cmd-ctrl-alt-k"));
+            assert!(bound(&ResizePaneRight, "cmd-ctrl-alt-l"));
+            assert!(bound(&SwapPaneLeft, "cmd-ctrl-alt-shift-h"));
+            assert!(bound(&SwapPaneDown, "cmd-ctrl-alt-shift-j"));
+            assert!(bound(&SwapPaneUp, "cmd-ctrl-alt-shift-k"));
+            assert!(bound(&SwapPaneRight, "cmd-ctrl-alt-shift-l"));
+
+            // ⌃⌘V and ⌃⌘S were released, not re-spent — nothing at all is bound
+            // to them (the state ⌃⌘U reached in Phase 1).
+            assert!(unbound_entirely("cmd-ctrl-v"), "⌃⌘V is freed");
+            assert!(unbound_entirely("cmd-ctrl-s"), "⌃⌘S is freed");
+
+            // The plain-⌘ neighbors of the new chords are untouched: ⌘- still
+            // shrinks the font and ⌘B still toggles the sidebar. The modifier
+            // set is what separates them.
+            assert!(bound(&DecreaseFontSize, "cmd--"));
+            assert!(bound(&ToggleSidebar, "cmd-b"));
+        });
+    }
+
+    /// Phase 3's two chords reach the live keymap: ⌃⌘C enters copy mode and
+    /// ⌃⌘/ opens the scrollback search — the two remaining directionless pane
+    /// verbs on the bare ⌃⌘ rung.
+    ///
+    /// Board only, same caveat as the Phase 2 test above: whether macOS delivers
+    /// them is the hand feel-check's gate. ⌃⌘C's neighbour risk is ⌘C, which is
+    /// why the plain-⌘ copy chord is asserted untouched here.
+    #[gpui::test]
+    fn phase_three_copy_mode_chords_are_live_in_the_keymap(cx: &mut gpui::TestAppContext) {
+        use gpui::Keystroke;
+
+        cx.update(|cx| {
+            cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("phase3")));
+            rebuild_keymap(cx);
+
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let bound = |action: &dyn Action, chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .bindings_for_action(action)
+                    .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
+            };
+
+            assert!(bound(&CopyMode, "cmd-ctrl-c"), "⌃⌘C enters copy mode");
+            assert!(
+                bound(&SearchScrollback, "cmd-ctrl-/"),
+                "⌃⌘/ opens the scrollback search"
+            );
+
+            // ⌃⌘/ was the reserved table's last `FuturePhase` entry; a chord may
+            // never be both reserved and a default, so it is gone from there.
+            assert_eq!(
+                nice_model::shortcuts::reserved_combo(
+                    &OwnedCombo::from_token("cmd-ctrl-/").expect("token parses")
+                ),
+                None,
+                "⌃⌘/ was promoted out of the reserved table"
+            );
+
+            // ⌘C (terminal copy) is a different modifier set and stays free of
+            // the keymap entirely — the slipped-Ctrl cost D2 accepts is entering
+            // copy mode, never losing a copy.
+            let plain_copy = Keystroke::parse("cmd-c").expect("test chord parses");
+            assert!(
+                keymap
+                    .all_bindings_for_input(std::slice::from_ref(&plain_copy))
+                    .is_empty(),
+                "⌘C stays the terminal's copy, unbound in the keymap"
+            );
+        });
+    }
+
+    // MARK: - Phase 2 pane verbs (handler behavior)
+
+    mod pane_verbs {
+        use super::super::*;
+        use crate::window_registry::WindowRegistry;
+        use crate::window_state::WindowState;
+        use gpui::{Entity, TestAppContext};
+        use nice_model::{
+            Pane, PaneLayout, Session, Side, TermWindow, TermWindowKind, WorkspaceModel,
+        };
+
+        const SESSION: &str = "t1";
+        const PILL: &str = "t1-claude";
+
+        /// A registered window holding one project / one session / one
+        /// never-split Claude pill, active and focused — the shape every pill
+        /// starts in. No ptys are stood up, so the verbs exercise their model
+        /// half (which is all but the split's eager spawn).
+        fn window_with_one_pill(cx: &mut TestAppContext) -> Entity<WindowState> {
+            let mut model = WorkspaceModel::new("/home/u");
+            model.ensure_project("p", "P", "/home/u/proj");
+            let mut session = Session::new(SESSION, "New session", "/home/u/proj");
+            session.windows = vec![TermWindow::new(PILL, "Claude", TermWindowKind::Claude)];
+            session.active_window_id = Some(PILL.to_string());
+            let pi = model.projects.iter().position(|p| p.id == "p").unwrap();
+            model.projects[pi].sessions.push(session);
+            model.select_session(SESSION);
+
+            let state = cx.new(|_cx| WindowState::with_model(model));
+            let id = cx.add_window(|_w, _cx| gpui::Empty).window_id();
+            cx.update(|app| {
+                app.set_global(WindowRegistry::default());
+                WindowRegistry::register(app, id, state.clone());
+            });
+            state
+        }
+
+        /// Split the pill into `Beside{ claude, shell }` by hand (no pty), with
+        /// focus back on the Claude pane — the "Claude beside a shell" layout D1
+        /// exists for, and the fixture most of these tests start from.
+        fn split_by_hand(cx: &mut TestAppContext, state: &Entity<WindowState>, shell_id: &str) {
+            let shell_id = shell_id.to_string();
+            state.update(cx, |s, _cx| {
+                s.workspace.mutate_session(SESSION, |session| {
+                    let window = &mut session.windows[0];
+                    assert!(window.layout.split(
+                        PILL,
+                        SplitOrient::Beside,
+                        Pane::new(&shell_id, TermWindowKind::Terminal),
+                    ));
+                    window.active_pane_id = PILL.to_string();
+                });
+            });
+        }
+
+        /// The active pill, for assertions.
+        fn pill(cx: &mut TestAppContext, state: &Entity<WindowState>) -> TermWindow {
+            state.update(cx, |s, _cx| {
+                s.workspace
+                    .session_for(SESSION)
+                    .unwrap()
+                    .windows
+                    .iter()
+                    .find(|w| w.id == PILL)
+                    .cloned()
+                    .expect("the pill is still there")
+            })
+        }
+
+        fn focused(cx: &mut TestAppContext, state: &Entity<WindowState>) -> String {
+            pill(cx, state).active_pane_id
+        }
+
+        #[gpui::test]
+        fn focus_walks_the_tree_and_stops_at_the_edge(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+
+            cx.update(|app| focus_pane(app, PaneDirection::Right));
+            assert_eq!(focused(cx, &state), "shell", "⌃⌘⇧L stepped right");
+
+            // P5: no wrap and no fall-through to pill nav — the right edge is
+            // simply where the walk stops.
+            cx.update(|app| focus_pane(app, PaneDirection::Right));
+            assert_eq!(focused(cx, &state), "shell", "the edge is a no-op");
+            // Nothing is stacked, so the vertical directions have no neighbor.
+            cx.update(|app| focus_pane(app, PaneDirection::Up));
+            assert_eq!(focused(cx, &state), "shell");
+
+            cx.update(|app| focus_pane(app, PaneDirection::Left));
+            assert_eq!(focused(cx, &state), PILL, "and back left again");
+        }
+
+        #[gpui::test]
+        fn a_focus_move_unzooms_but_a_refused_one_does_not(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+            let set_zoom = |cx: &mut TestAppContext| {
+                state.update(cx, |s, _cx| {
+                    s.workspace.mutate_session(SESSION, |session| {
+                        session.windows[0].zoomed = true;
+                    });
+                });
+            };
+
+            // P4: a real move un-zooms first, then applies.
+            set_zoom(cx);
+            cx.update(|app| focus_pane(app, PaneDirection::Right));
+            assert_eq!(focused(cx, &state), "shell");
+            assert!(!pill(cx, &state).zoomed, "the move un-zoomed");
+
+            // A refused move changes NOTHING — including the zoom. "No-op" would
+            // be a lie if the chord still tore the zoom down.
+            set_zoom(cx);
+            cx.update(|app| focus_pane(app, PaneDirection::Right));
+            assert!(pill(cx, &state).zoomed, "an edge no-op leaves zoom alone");
+        }
+
+        #[gpui::test]
+        fn split_adds_a_shell_pane_and_focus_follows_it(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            state.update(cx, |s, _cx| s.set_pane_content_size(Some((1000.0, 600.0))));
+
+            cx.update(|app| split_focused_pane(app, SplitOrient::Beside));
+            let pill = pill(cx, &state);
+            assert_eq!(pill.layout.leaf_count(), 2);
+            let new_id = pill.active_pane_id.clone();
+            assert_ne!(new_id, PILL, "focus follows the NEW pane (tmux)");
+
+            let new_pane = pill.layout.pane(&new_id).expect("the new leaf");
+            assert_eq!(
+                new_pane.kind,
+                TermWindowKind::Terminal,
+                "D1: a split pane is always a plain shell, never a second Claude"
+            );
+            assert_eq!(
+                new_pane.cwd.as_deref(),
+                Some("/home/u/proj"),
+                "the shell is seeded in the focused pane's cwd"
+            );
+            assert_eq!(
+                pill.kind,
+                TermWindowKind::Claude,
+                "the pill is still a Claude pill — one Claude leaf, D1 intact"
+            );
+            assert!(pill.layout_is_valid());
+
+            // Splitting again bisects the pane that now has focus, so the second
+            // split lands in the right half, not next to the first.
+            cx.update(|app| split_focused_pane(app, SplitOrient::Stacked));
+            let pill = self::pill(cx, &state);
+            assert_eq!(pill.layout.leaf_count(), 3);
+            assert!(pill
+                .layout
+                .path_to_pane(&pill.active_pane_id)
+                .is_some_and(|p| p.first() == Some(&Side::Second)));
+        }
+
+        #[gpui::test]
+        fn split_is_refused_under_the_minimum_pane_size(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            // P6: (200 - 6) / 2 = 97 px wide halves, under PANE_MIN_WIDTH.
+            state.update(cx, |s, _cx| s.set_pane_content_size(Some((200.0, 600.0))));
+            cx.update(|app| split_focused_pane(app, SplitOrient::Beside));
+            assert_eq!(
+                pill(cx, &state).layout.leaf_count(),
+                1,
+                "a split with no room for both halves does nothing at all"
+            );
+
+            // The same pane area is tall enough to stack, so the OTHER verb is
+            // still allowed — the refusal is per axis, not per pane.
+            cx.update(|app| split_focused_pane(app, SplitOrient::Stacked));
+            assert_eq!(pill(cx, &state).layout.leaf_count(), 2);
+        }
+
+        #[gpui::test]
+        fn split_without_a_painted_size_proceeds(cx: &mut TestAppContext) {
+            // Never painted ⇒ no px context to refuse against, so the split goes
+            // ahead at an even ratio rather than guessing.
+            let state = window_with_one_pill(cx);
+            cx.update(|app| split_focused_pane(app, SplitOrient::Beside));
+            assert_eq!(pill(cx, &state).layout.leaf_count(), 2);
+        }
+
+        #[gpui::test]
+        fn zoom_toggles_only_on_a_split_pill(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            cx.update(|app| toggle_zoom(app));
+            assert!(
+                !pill(cx, &state).zoomed,
+                "a single-pane pill has nothing to zoom"
+            );
+
+            split_by_hand(cx, &state, "shell");
+            cx.update(|app| toggle_zoom(app));
+            assert!(pill(cx, &state).zoomed);
+            cx.update(|app| toggle_zoom(app));
+            assert!(!pill(cx, &state).zoomed, "and toggles back off");
+        }
+
+        #[gpui::test]
+        fn resize_walks_the_divider_by_a_px_step(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+            state.update(cx, |s, _cx| s.set_pane_content_size(Some((1000.0, 600.0))));
+
+            cx.update(|app| resize_pane(app, PaneDirection::Right));
+            let ratio = match &pill(cx, &state).layout {
+                PaneLayout::Split { ratio, .. } => *ratio,
+                _ => panic!("still a split"),
+            };
+            // 40 px of a 994 px splittable extent, on top of the even 0.5.
+            assert!(
+                (ratio - (0.5 + 40.0 / 994.0)).abs() < 1e-4,
+                "the step is px-denominated, got {ratio}"
+            );
+
+            // The perpendicular direction has no matching ancestor (P7).
+            cx.update(|app| resize_pane(app, PaneDirection::Down));
+            let after = match &pill(cx, &state).layout {
+                PaneLayout::Split { ratio, .. } => *ratio,
+                _ => panic!("still a split"),
+            };
+            assert_eq!(after, ratio, "no Stacked ancestor ⇒ nothing moved");
+        }
+
+        #[gpui::test]
+        fn resize_without_a_painted_size_is_a_noop(cx: &mut TestAppContext) {
+            // No px context ⇒ no scale to convert the step in, so the verb
+            // declines rather than inventing a ratio delta.
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+            cx.update(|app| resize_pane(app, PaneDirection::Right));
+            match &pill(cx, &state).layout {
+                PaneLayout::Split { ratio, .. } => assert_eq!(*ratio, 0.5),
+                _ => panic!("still a split"),
+            }
+        }
+
+        #[gpui::test]
+        fn swap_trades_places_and_focus_follows_the_content(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+            state.update(cx, |s, _cx| {
+                s.workspace.mutate_session(SESSION, |session| {
+                    session.windows[0].layout.set_ratio_at(&[], 0.7);
+                });
+            });
+
+            cx.update(|app| swap_pane(app, PaneDirection::Right));
+            let pill = pill(cx, &state);
+            assert_eq!(
+                pill.layout.leaves().iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+                vec!["shell", PILL],
+                "the payloads traded slots"
+            );
+            match &pill.layout {
+                PaneLayout::Split { ratio, .. } => {
+                    assert_eq!(*ratio, 0.7, "P8: structure and ratios don't move")
+                }
+                _ => panic!("still a split"),
+            }
+            assert_eq!(
+                pill.active_pane_id, PILL,
+                "focus followed the content, which now paints on the right"
+            );
+            assert!(pill.layout_is_valid());
+
+            // Swapping at the edge does nothing (same rule as directional focus).
+            cx.update(|app| swap_pane(app, PaneDirection::Right));
+            assert_eq!(
+                self::pill(cx, &state)
+                    .layout
+                    .leaves()
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shell", PILL]
+            );
+        }
+
+        #[gpui::test]
+        fn break_pane_moves_a_shell_out_and_refuses_the_claude_pane(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            split_by_hand(cx, &state, "shell");
+
+            // Focused on the Claude pane: P3 refuses (a Claude leaf may not
+            // become a pill through this path).
+            cx.update(|app| break_focused_pane(app));
+            let windows = |cx: &mut TestAppContext| {
+                state.update(cx, |s, _cx| {
+                    s.workspace.session_for(SESSION).unwrap().windows.len()
+                })
+            };
+            assert_eq!(windows(cx), 1, "break-pane on the Claude pane is a no-op");
+
+            // Focused on the shell pane: it leaves as its own pill, and focus
+            // goes with it (tmux `break-pane`).
+            cx.update(|app| focus_pane(app, PaneDirection::Right));
+            cx.update(|app| break_focused_pane(app));
+            assert_eq!(windows(cx), 2, "the shell became a pill of its own");
+
+            let (active, source) = state.update(cx, |s, _cx| {
+                let session = s.workspace.session_for(SESSION).unwrap();
+                (
+                    session.active_window_id.clone(),
+                    session
+                        .windows
+                        .iter()
+                        .find(|w| w.id == PILL)
+                        .unwrap()
+                        .clone(),
+                )
+            });
+            assert_ne!(active.as_deref(), Some(PILL), "focus followed the new pill");
+            assert_eq!(source.layout.leaf_count(), 1, "the source pill collapsed");
+            assert!(source.layout_is_valid());
+        }
+
+        /// A pill that was never split behaves exactly as before: every pane
+        /// verb that needs a second pane declines, and nothing about the pill
+        /// changes. This is the promise the whole phase rests on.
+        #[gpui::test]
+        fn a_never_split_pill_is_untouched_by_every_pane_verb(cx: &mut TestAppContext) {
+            let state = window_with_one_pill(cx);
+            let before = pill(cx, &state);
+            cx.update(|app| {
+                for direction in [
+                    PaneDirection::Left,
+                    PaneDirection::Down,
+                    PaneDirection::Up,
+                    PaneDirection::Right,
+                ] {
+                    focus_pane(app, direction);
+                    resize_pane(app, direction);
+                    swap_pane(app, direction);
+                }
+                toggle_zoom(app);
+                break_focused_pane(app);
+            });
+            assert_eq!(pill(cx, &state), before);
+        }
+    }
+
+    /// P6's split refusal, measured against the painted layout: a pane splits
+    /// only while both halves clear the minimum, and the divider's own px come
+    /// out of the splittable extent first.
+    #[test]
+    fn split_fits_refuses_halves_under_the_minimum() {
+        use nice_model::{Pane, PaneLayout};
+
+        let layout = PaneLayout::single(Pane::new("a", nice_model::TermWindowKind::Terminal));
+        let content = |w: f32, h: f32| PaneRect::new(0.0, 0.0, w, h);
+
+        // Exactly at the limit: 2 * 120 + 6 px of divider.
+        assert!(split_fits(&layout, "a", SplitOrient::Beside, content(246.0, 600.0)));
+        assert!(!split_fits(&layout, "a", SplitOrient::Beside, content(245.0, 600.0)));
+        // The stacked axis has its own (shorter) minimum: 2 * 80 + 6.
+        assert!(split_fits(&layout, "a", SplitOrient::Stacked, content(1000.0, 166.0)));
+        assert!(!split_fits(&layout, "a", SplitOrient::Stacked, content(1000.0, 165.0)));
+        // A pane that is not in the tree cannot be measured, so it is not
+        // refused here — the split itself declines it.
+        assert!(split_fits(&layout, "zzz", SplitOrient::Beside, content(10.0, 10.0)));
     }
 }

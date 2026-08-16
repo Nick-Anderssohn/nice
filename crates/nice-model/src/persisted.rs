@@ -24,16 +24,62 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::pane_layout::{Pane, PaneLayout, SplitOrient};
 use crate::term_window::{TermWindow, TermWindowKind};
 use crate::project::Project;
 use crate::session::Session;
 use crate::workspace_model::WorkspaceModel;
 
+/// One persisted pane — a leaf of a window's split tree (tmux-port Phase 2).
+///
+/// Pane ids are internal (P2): they never appear on the frozen surfaces
+/// (`NICE_TAB_ID`/`NICE_PANE_ID`, the control-socket `"tabId"`/`"paneId"`
+/// keys), so nothing outside Nice depends on the value round-tripping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedPane {
+    pub id: String,
+    pub kind: TermWindowKind,
+    /// Per-pane last-observed cwd (OSC 7) — what restore respawns this pane's
+    /// shell in. Falls back to the window's, then the session's cwd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// A window's persisted split tree. Externally tagged, so a split reads
+/// `{"split": {...}}` and a leaf `{"leaf": {...}}` — self-describing in a
+/// hand-inspected `sessions.json`, and impossible to confuse with each other
+/// the way an untagged enum could be.
+///
+/// These key spellings are NEW in Phase 2 (nothing about them was frozen
+/// before), and freeze at ship like the rest of `sessions.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PersistedPaneLayout {
+    Leaf(PersistedPane),
+    #[serde(rename_all = "camelCase")]
+    Split {
+        orient: SplitOrient,
+        /// `first`'s share; re-clamped on hydrate, so a hand-edited or
+        /// corrupted value can never reach the render layer.
+        ratio: f32,
+        first: Box<PersistedPaneLayout>,
+        second: Box<PersistedPaneLayout>,
+    },
+}
+
 /// One persisted window (toolbar pill). Mirrors Swift `PersistedTermWindow`.
 ///
 /// `cwd` and `titleManuallySet` are optional so v3 session files written before
-/// those fields existed still decode; hydration fills the model defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// those fields existed still decode; hydration fills the model defaults. The
+/// Phase-2 `layout`/`activeLeafId` pair follows the same rule (and the
+/// `sidebarMode`/`sidebarWidth` precedent in `session_store.rs`): optional,
+/// omitted when absent, no `CURRENT_VERSION` bump — the store is tolerant by
+/// SHAPE, not by version.
+///
+/// **No `Eq`** — the tree carries `f32` ratios. `PartialEq` (what every
+/// round-trip test asserts with) stays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedTermWindow {
     pub id: String,
@@ -47,11 +93,23 @@ pub struct PersistedTermWindow {
     /// `?? false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title_manually_set: Option<bool>,
+    /// The window's split tree. Written **only when the window has more than
+    /// one pane**: a never-split window hydrates to the identical single-leaf
+    /// tree either way, so omitting it keeps `sessions.json` byte-identical for
+    /// every user who never splits — and a Phase-1 Nice reading the file simply
+    /// ignores the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<PersistedPaneLayout>,
+    /// Which leaf of `layout` was focused. Written alongside `layout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_leaf_id: Option<String>,
 }
 
 /// One persisted session (session / sidebar row). Mirrors Swift `PersistedSession`
 /// **minus `branch`** (M5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **No `Eq`** — see [`PersistedTermWindow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedSession {
     pub id: String,
@@ -89,7 +147,9 @@ pub struct PersistedSession {
 /// `name`/`path` persist verbatim: re-deriving them from each session's cwd on
 /// restore would split a multi-worktree project (no common cwd prefix between
 /// worktrees) into one project per worktree dir.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **No `Eq`** — see [`PersistedTermWindow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedProject {
     pub id: String,
@@ -100,11 +160,76 @@ pub struct PersistedProject {
     pub sessions: Vec<PersistedSession>,
 }
 
+impl PersistedPane {
+    /// Snapshot one leaf.
+    pub fn from_model(pane: &Pane) -> Self {
+        PersistedPane {
+            id: pane.id.clone(),
+            kind: pane.kind,
+            cwd: pane.cwd.clone(),
+        }
+    }
+
+    /// Hydrate one leaf.
+    pub fn hydrate(&self) -> Pane {
+        Pane::new(self.id.clone(), self.kind).with_cwd(self.cwd.clone())
+    }
+}
+
+impl PersistedPaneLayout {
+    /// Snapshot a model split tree.
+    pub fn from_model(layout: &PaneLayout) -> Self {
+        match layout {
+            PaneLayout::Leaf(pane) => PersistedPaneLayout::Leaf(PersistedPane::from_model(pane)),
+            PaneLayout::Split {
+                orient,
+                ratio,
+                first,
+                second,
+            } => PersistedPaneLayout::Split {
+                orient: *orient,
+                ratio: *ratio,
+                first: Box::new(PersistedPaneLayout::from_model(first)),
+                second: Box::new(PersistedPaneLayout::from_model(second)),
+            },
+        }
+    }
+
+    /// Hydrate a model split tree. Ratios are re-clamped into the model's legal
+    /// band by [`PaneLayout::normalize_ratios`] at the top of the recursion's
+    /// caller, so a corrupted number never reaches geometry.
+    pub fn hydrate(&self) -> PaneLayout {
+        let mut layout = self.hydrate_raw();
+        layout.normalize_ratios();
+        layout
+    }
+
+    fn hydrate_raw(&self) -> PaneLayout {
+        match self {
+            PersistedPaneLayout::Leaf(pane) => PaneLayout::Leaf(pane.hydrate()),
+            PersistedPaneLayout::Split {
+                orient,
+                ratio,
+                first,
+                second,
+            } => PaneLayout::Split {
+                orient: *orient,
+                ratio: *ratio,
+                first: Box::new(first.hydrate_raw()),
+                second: Box::new(second.hydrate_raw()),
+            },
+        }
+    }
+}
+
 impl PersistedTermWindow {
     /// Snapshot a model [`TermWindow`] for persistence. Runtime-only fields
-    /// (`is_alive`/`status`/`waiting_acknowledged`/`is_claude_running`) are
-    /// dropped; `title_manually_set` is written `true`-or-omitted.
+    /// (`is_alive`/`status`/`waiting_acknowledged`/`is_claude_running`/`zoomed`)
+    /// are dropped; `title_manually_set` is written `true`-or-omitted, and the
+    /// pane tree is written only once the window actually has more than one
+    /// pane (see [`PersistedTermWindow::layout`]).
     pub fn from_model(window: &TermWindow) -> Self {
+        let split = window.layout.leaf_count() > 1;
         PersistedTermWindow {
             id: window.id.clone(),
             title: window.title.clone(),
@@ -115,6 +240,8 @@ impl PersistedTermWindow {
             } else {
                 None
             },
+            layout: split.then(|| PersistedPaneLayout::from_model(&window.layout)),
+            active_leaf_id: split.then(|| window.active_pane_id.clone()),
         }
     }
 
@@ -122,10 +249,37 @@ impl PersistedTermWindow {
     /// exact model defaults `is_alive = true`, `status = Idle`,
     /// `waiting_acknowledged = false`, `is_claude_running = false`; only `cwd`
     /// and the `?? false` title lock are carried over.
+    ///
+    /// The pane tree restores under a validate-or-fall-back rule, because the
+    /// loader must never error (a session file that fails to load loses the
+    /// user's work): an absent `layout` — every pre-Phase-2 file — hydrates as
+    /// the single-leaf window Nice has always restored, and a `layout` that
+    /// violates [`TermWindow::layout_is_valid`] (dangling focus, duplicate pane
+    /// ids, a Claude-leaf count that disagrees with the window's kind) is
+    /// discarded for that same single-leaf shape.
     pub fn hydrate(&self) -> TermWindow {
         let mut window = TermWindow::new(self.id.clone(), self.title.clone(), self.kind);
         window.cwd = self.cwd.clone();
         window.title_manually_set = self.title_manually_set.unwrap_or(false);
+        // Restate the single-leaf tree now that `cwd` is filled in, so the sole
+        // pane carries the window's cwd.
+        window.reset_layout_to_single_leaf();
+
+        if let Some(persisted) = &self.layout {
+            let layout = persisted.hydrate();
+            let active = self
+                .active_leaf_id
+                .clone()
+                .or_else(|| layout.leaves().first().map(|p| p.id.clone()));
+            if let Some(active) = active {
+                let single_leaf = std::mem::replace(&mut window.layout, layout);
+                let single_active = std::mem::replace(&mut window.active_pane_id, active);
+                if !window.layout_is_valid() {
+                    window.layout = single_leaf;
+                    window.active_pane_id = single_active;
+                }
+            }
+        }
         window
     }
 }
@@ -257,6 +411,8 @@ mod tests {
                     kind: TermWindowKind::Claude,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
                 PersistedTermWindow {
                     id: "p2".into(),
@@ -264,6 +420,8 @@ mod tests {
                     kind: TermWindowKind::Terminal,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
             ],
             title_manually_set: None,
@@ -317,6 +475,8 @@ mod tests {
                 kind: TermWindowKind::Terminal,
                 cwd: Some("/usr".into()),
                 title_manually_set: None,
+                layout: None,
+                active_leaf_id: None,
             },
             PersistedTermWindow {
                 id: "p2".into(),
@@ -324,6 +484,8 @@ mod tests {
                 kind: TermWindowKind::Terminal,
                 cwd: Some("/var/log".into()),
                 title_manually_set: None,
+                layout: None,
+                active_leaf_id: None,
             },
         ];
         let json = serde_json::to_string(&windows).unwrap();
@@ -419,6 +581,8 @@ mod tests {
             kind: TermWindowKind::Claude,
             cwd: Some("/tmp".into()),
             title_manually_set: None,
+            layout: None,
+            active_leaf_id: None,
         };
         let window = persisted.hydrate();
         assert!(window.is_alive);
@@ -444,6 +608,8 @@ mod tests {
                     kind: TermWindowKind::Terminal,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
                 PersistedTermWindow {
                     id: "claude".into(),
@@ -451,6 +617,8 @@ mod tests {
                     kind: TermWindowKind::Claude,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
             ],
             title_manually_set: None,
@@ -479,6 +647,8 @@ mod tests {
                 kind: TermWindowKind::Terminal,
                 cwd: None,
                 title_manually_set: None,
+                layout: None,
+                active_leaf_id: None,
             }],
             title_manually_set: None,
             parent_session_id: None,
@@ -505,6 +675,8 @@ mod tests {
                     kind: TermWindowKind::Terminal,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
                 PersistedTermWindow {
                     id: "b".into(),
@@ -512,6 +684,8 @@ mod tests {
                     kind: TermWindowKind::Terminal,
                     cwd: None,
                     title_manually_set: None,
+                    layout: None,
+                    active_leaf_id: None,
                 },
             ],
             title_manually_set: None,
@@ -541,6 +715,176 @@ mod tests {
         assert_eq!(hydrated.active_window_id.as_deref(), Some("c"));
         assert!(hydrated.title_manually_set);
         assert_eq!(hydrated.windows.len(), 2);
+    }
+
+    // MARK: - pane layout (tmux-port Phase 2)
+
+    /// A Claude pill split beside a shell pane — the D1 layout this phase
+    /// exists for.
+    fn split_window() -> TermWindow {
+        let mut window = claude_window("p1");
+        window.cwd = Some("/work".into());
+        window.reset_layout_to_single_leaf();
+        window.layout.split(
+            "p1",
+            SplitOrient::Beside,
+            Pane::new("pane-2", TermWindowKind::Terminal).with_cwd(Some("/var/log".into())),
+        );
+        window.layout.set_ratio_at(&[], 0.65);
+        window.active_pane_id = "pane-2".into();
+        window
+    }
+
+    #[test]
+    fn single_pane_window_omits_the_layout_keys() {
+        let window = terminal_window("p1");
+        let persisted = PersistedTermWindow::from_model(&window);
+        assert_eq!(persisted.layout, None);
+        assert_eq!(persisted.active_leaf_id, None);
+
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            !json.contains("layout") && !json.contains("activeLeafId"),
+            "a never-split pill writes byte-identical JSON to pre-Phase-2 Nice: {json}"
+        );
+    }
+
+    #[test]
+    fn split_window_round_trips_its_tree_through_json() {
+        let window = split_window();
+        let persisted = PersistedTermWindow::from_model(&window);
+        assert_eq!(persisted.active_leaf_id.as_deref(), Some("pane-2"));
+
+        let json = serde_json::to_string(&persisted).unwrap();
+        let decoded: PersistedTermWindow = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, persisted);
+
+        let hydrated = decoded.hydrate();
+        assert_eq!(hydrated.layout, window.layout);
+        assert_eq!(hydrated.active_pane_id, "pane-2");
+        assert!(hydrated.layout_is_valid());
+        assert_eq!(
+            hydrated.layout.pane("pane-2").unwrap().cwd.as_deref(),
+            Some("/var/log"),
+            "each pane restores in its own cwd"
+        );
+    }
+
+    #[test]
+    fn absent_layout_hydrates_as_a_single_leaf_window() {
+        // Every pre-Phase-2 `sessions.json` looks exactly like this.
+        let json = r#"{"id": "p1", "title": "zsh", "kind": "terminal", "cwd": "/usr"}"#;
+        let persisted: PersistedTermWindow = serde_json::from_str(json).unwrap();
+        assert_eq!(persisted.layout, None);
+
+        let window = persisted.hydrate();
+        assert_eq!(window.layout.leaf_count(), 1);
+        assert_eq!(window.active_pane_id, "p1");
+        assert_eq!(
+            window.layout.single_leaf().unwrap().cwd.as_deref(),
+            Some("/usr"),
+            "the sole pane inherits the window's cwd"
+        );
+        assert!(window.layout_is_valid());
+    }
+
+    #[test]
+    fn mangled_layouts_fall_back_to_a_single_leaf_instead_of_erroring() {
+        let base = split_window();
+        let good = PersistedTermWindow::from_model(&base);
+
+        // 1. Focus names a pane that isn't in the tree.
+        let mut dangling = good.clone();
+        dangling.active_leaf_id = Some("ghost".into());
+        assert_eq!(dangling.hydrate().layout.leaf_count(), 1);
+
+        // 2. The Claude-leaf count disagrees with the pill's kind — here a
+        //    terminal-kind window carrying a Claude leaf.
+        let mut wrong_kind = good.clone();
+        wrong_kind.kind = TermWindowKind::Terminal;
+        let hydrated = wrong_kind.hydrate();
+        assert_eq!(hydrated.layout.leaf_count(), 1);
+        assert!(hydrated.layout_is_valid());
+
+        // 3. Duplicate pane ids.
+        let mut duplicated = good.clone();
+        duplicated.layout = Some(PersistedPaneLayout::Split {
+            orient: SplitOrient::Beside,
+            ratio: 0.5,
+            first: Box::new(PersistedPaneLayout::Leaf(PersistedPane {
+                id: "dup".into(),
+                kind: TermWindowKind::Claude,
+                cwd: None,
+            })),
+            second: Box::new(PersistedPaneLayout::Leaf(PersistedPane {
+                id: "dup".into(),
+                kind: TermWindowKind::Terminal,
+                cwd: None,
+            })),
+        });
+        duplicated.active_leaf_id = Some("dup".into());
+        assert_eq!(duplicated.hydrate().layout.leaf_count(), 1);
+
+        // The good record still restores its tree — the fallback is targeted,
+        // not a blanket refusal.
+        assert_eq!(good.hydrate().layout.leaf_count(), 2);
+    }
+
+    #[test]
+    fn hydrate_clamps_a_corrupted_ratio() {
+        let mut persisted = PersistedTermWindow::from_model(&split_window());
+        if let Some(PersistedPaneLayout::Split { ratio, .. }) = persisted.layout.as_mut() {
+            *ratio = 42.0;
+        }
+        match &persisted.hydrate().layout {
+            PaneLayout::Split { ratio, .. } => assert_eq!(*ratio, crate::pane_layout::RATIO_MAX),
+            _ => panic!("expected the split to survive, just clamped"),
+        }
+    }
+
+    #[test]
+    fn layout_survives_a_full_session_snapshot_hydrate_cycle() {
+        let mut session = Session::new("t1", "Ship it", "/work");
+        session.claude_session_id = Some("sid-9".into());
+        session.windows = vec![split_window(), terminal_window("term")];
+        session.active_window_id = Some("p1".into());
+
+        let json = serde_json::to_string(&PersistedSession::from_model(&session)).unwrap();
+        let restored: PersistedSession = serde_json::from_str(&json).unwrap();
+        let hydrated = restored.hydrate();
+
+        assert_eq!(hydrated.windows[0].layout, session.windows[0].layout);
+        assert_eq!(hydrated.windows[0].active_pane_id, "pane-2");
+        assert_eq!(
+            hydrated.windows[1].layout.leaf_count(),
+            1,
+            "the unsplit sibling is untouched"
+        );
+    }
+
+    #[test]
+    fn a_phase_one_reader_ignores_the_layout_keys() {
+        // The forward-compat rule already pinned at
+        // `decodes_with_unknown_fields_forward_compat`, stated for the keys
+        // this phase adds: an older Nice decodes the file and restores
+        // single-pane pills.
+        let json = serde_json::to_string(&PersistedTermWindow::from_model(&split_window())).unwrap();
+        assert!(json.contains("activeLeafId") && json.contains("\"split\""));
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PhaseOneTermWindow {
+            id: String,
+            title: String,
+            kind: TermWindowKind,
+            #[serde(default)]
+            cwd: Option<String>,
+        }
+        let old: PhaseOneTermWindow = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.id, "p1");
+        assert_eq!(old.title, "Claude");
+        assert_eq!(old.kind, TermWindowKind::Claude);
+        assert_eq!(old.cwd.as_deref(), Some("/work"));
     }
 
     // MARK: - snapshot_projects drop rules

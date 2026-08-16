@@ -9,7 +9,10 @@ use crate::session::Session;
 /// section. The Terminals project + cwd bucketing that populate these are
 /// provided by [`crate::WorkspaceModel`] (`add_session_to_projects`); this is the pure
 /// value type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// **No `Eq`/`Hash`** — it contains [`Session`]s, whose windows carry `f32`
+/// split ratios since tmux-port Phase 2; see [`crate::TermWindow`]'s note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,

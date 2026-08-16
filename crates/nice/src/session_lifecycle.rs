@@ -219,12 +219,21 @@ fn spawn_and_subscribe(
         // shipped one is `WindowState::subscribe_spawned_windows`. Actuating
         // something here (app-typed prefill, say) would pass this scenario while
         // the real app never did it.
+        //
+        // `spawn_window` spawns the window's first pane, whose id is the window's
+        // own — this scenario helper never splits, so that is its only pane.
         if let Some(handle) = s.ptys.term_window_handle(&session_id, &term_window_id) {
             let (t, p) = (session_id.clone(), term_window_id.clone());
+            let pane = term_window_id.clone();
             cx.subscribe(&handle, move |s2, _handle, event: &TerminalEvent, cx2| {
-                let _ =
-                    s2.ptys
-                        .route_terminal_event(&mut s2.workspace, &mut s2.selection, &t, &p, event);
+                let _ = s2.ptys.route_terminal_event(
+                    &mut s2.workspace,
+                    &mut s2.selection,
+                    &t,
+                    &p,
+                    &pane,
+                    event,
+                );
                 cx2.notify();
             })
             .detach();

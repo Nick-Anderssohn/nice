@@ -32,7 +32,9 @@
 
 use std::ops::Range;
 
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vi_mode::ViMotion;
 use gpui::{App, Bounds, Entity, InputHandler, Pixels, Point, UTF16Selection, Window};
 
 use nice_term_input::{
@@ -148,6 +150,287 @@ pub fn scrollback_key_action(
         "end" => Some(ScrollbackAction::Bottom),
         _ => None,
     }
+}
+
+// ---- Copy mode (Phase 3) ---------------------------------------------------
+//
+// Copy mode IS `TermMode::VI` (P1); this section is its *pure* half — the key
+// table and the three gate predicates. Everything here is a total function over
+// plain values so it can be unit-tested without a `TerminalView` (which needs a
+// spawned session plus a gpui window); the wiring that consumes it lives in
+// `view.rs`.
+
+/// What a keystroke does while the pane is in copy mode — the result of
+/// [`copy_mode_key_action`], performed by the view against the session handle's
+/// copy-mode API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyModeAction {
+    /// Move the vi cursor: `hjkl` + arrows, `w`/`b`/`e` (semantic) and
+    /// `W`/`B`/`E` (whitespace), `0`/`$`/`^`, `H`/`M`/`L`, `%`, `{`/`}` (D3).
+    Motion(ViMotion),
+    /// `g` (and Shift+Home) — jump to the oldest line still in scrollback.
+    Top,
+    /// `G` (and Shift+End) — jump back to the newest output.
+    Bottom,
+    /// Page the viewport, dragging the vi cursor with it: `⌃u`/`⌃d` are the half
+    /// pages, `⌃b`/`⌃f` and Shift+PageUp/PageDown the full ones.
+    Page {
+        /// Toward history (up) rather than toward the live bottom.
+        toward_history: bool,
+        /// Half a screen rather than a whole one.
+        half: bool,
+    },
+    /// `v` / `V` / `⌃v` — toggle a selection of this kind at the vi cursor (P5:
+    /// none ⇒ start, same kind ⇒ clear, different kind ⇒ rebuild).
+    ToggleSelection(SelectionType),
+    /// `y` and Enter — copy the selection to the clipboard and LEAVE copy mode
+    /// (tmux's copy-and-cancel). With nothing selected this is a no-op that
+    /// stays in the mode (P4).
+    Yank,
+    /// ⌘C — copy the selection and STAY, exactly like today's ⌘C (P4).
+    YankStay,
+    /// ⌘V — consumed and dropped: pasting into scrollback is meaningless (P4).
+    SwallowPaste,
+    /// `/` (forward) and `?` (backward) — ask the app for the search field (P2:
+    /// the field lives in the app crate, so the view emits
+    /// [`TerminalEvent::SearchRequested`] instead of opening it).
+    ///
+    /// [`TerminalEvent::SearchRequested`]: crate::TerminalEvent::SearchRequested
+    OpenSearch {
+        /// Search history-ward (`?`) rather than toward the live bottom (`/`).
+        backward: bool,
+    },
+    /// `n` — the next match in the confirmed search direction.
+    NextMatch,
+    /// `N` — the next match *against* the confirmed direction (P7).
+    PrevMatch,
+    /// Esc and `q` — leave copy mode (P6: selection, search and viewport reset).
+    Exit,
+    /// Consumed, doing nothing. The leak-proof default: while VI is on, EVERY
+    /// key is swallowed (P4), so an unbound key can never reach the encoder and
+    /// type into the shell behind the user's back.
+    Swallow,
+}
+
+/// The copy-mode key table (D3) — the whole of it, in one pure match.
+///
+/// **Total by design.** It never declines: the default arm is
+/// [`CopyModeAction::Swallow`], which is P4's guarantee that nothing leaks to
+/// the pty while VI is on. (The plan sketched an `Option` return; an
+/// always-`Some` option would only invite an `unwrap_or` at the call site,
+/// which is the leak this table exists to prevent.)
+///
+/// Modifier rungs, in order:
+///
+/// * ⌘ — only ⌘C (copy-and-stay) and ⌘V (swallowed) mean anything.
+/// * ⌃ — the paging chords and `⌃v` block selection.
+/// * ⌥ or a mixed rung — swallowed; Nice's own ⌃⌘ chords never arrive here at
+///   all (gpui matches actions BEFORE view key listeners).
+/// * bare / Shift — the motions and verbs.
+///
+/// Shift is folded two different ways by gpui's macOS backend, and both are
+/// handled: a shifted **letter** arrives as the lowercase key plus `shift`
+/// (`W` ⇒ `"w"` + shift), while shifted **punctuation** arrives as the shifted
+/// character with the flag cleared (`$` ⇒ `"$"`, no shift) — so the punctuation
+/// rows ignore `shift` entirely, and `/` accepts either spelling of `?`.
+///
+/// The Shift+PageUp/PageDown/Home/End rows mirror [`scrollback_key_action`] on
+/// purpose (I4): those keys normally act inside `dispatch_key`, which the
+/// copy-mode gate never reaches, so without them today's scrollback keys would
+/// go dead exactly while the user is navigating scrollback.
+pub fn copy_mode_key_action(key: &str, m: gpui::Modifiers) -> CopyModeAction {
+    use CopyModeAction as A;
+    use SelectionType as S;
+    use ViMotion as V;
+
+    // ⌘ rung: the two editing chords, everything else dropped.
+    if m.platform {
+        return if m.control || m.alt {
+            A::Swallow
+        } else {
+            match key {
+                "c" => A::YankStay,
+                "v" => A::SwallowPaste,
+                _ => A::Swallow,
+            }
+        };
+    }
+
+    // ⌃ rung: paging + block selection.
+    if m.control {
+        return if m.alt {
+            A::Swallow
+        } else {
+            match key {
+                "u" => A::Page { toward_history: true, half: true },
+                "d" => A::Page { toward_history: false, half: true },
+                "b" => A::Page { toward_history: true, half: false },
+                "f" => A::Page { toward_history: false, half: false },
+                "v" => A::ToggleSelection(S::Block),
+                _ => A::Swallow,
+            }
+        };
+    }
+
+    // ⌥ is an input modifier (Meta / dead keys), never a copy-mode rung.
+    if m.alt {
+        return A::Swallow;
+    }
+
+    // Shift-folded punctuation: the flag is already spent on the character.
+    match key {
+        "$" => return A::Motion(V::Last),
+        "^" => return A::Motion(V::FirstOccupied),
+        "%" => return A::Motion(V::Bracket),
+        "{" => return A::Motion(V::ParagraphUp),
+        "}" => return A::Motion(V::ParagraphDown),
+        "?" => return A::OpenSearch { backward: true },
+        // A layout that keeps the flag instead of folding it still gets `?`.
+        "/" => return A::OpenSearch { backward: m.shift },
+        _ => {}
+    }
+
+    if m.shift {
+        return match key {
+            "h" => A::Motion(V::High),
+            "m" => A::Motion(V::Middle),
+            "l" => A::Motion(V::Low),
+            "w" => A::Motion(V::WordRight),
+            "b" => A::Motion(V::WordLeft),
+            "e" => A::Motion(V::WordRightEnd),
+            "g" => A::Bottom,
+            "n" => A::PrevMatch,
+            "v" => A::ToggleSelection(S::Lines),
+            // I4: today's keyboard scrollback, kept alive inside the mode.
+            "pageup" => A::Page { toward_history: true, half: false },
+            "pagedown" => A::Page { toward_history: false, half: false },
+            "home" => A::Top,
+            "end" => A::Bottom,
+            _ => A::Swallow,
+        };
+    }
+
+    match key {
+        "h" | "left" => A::Motion(V::Left),
+        "j" | "down" => A::Motion(V::Down),
+        "k" | "up" => A::Motion(V::Up),
+        "l" | "right" => A::Motion(V::Right),
+        "0" => A::Motion(V::First),
+        // vim's distinction, which alacritty models the same way: lowercase is
+        // the semantic word, uppercase the whitespace-separated WORD.
+        "w" => A::Motion(V::SemanticRight),
+        "b" => A::Motion(V::SemanticLeft),
+        "e" => A::Motion(V::SemanticRightEnd),
+        "g" => A::Top,
+        "n" => A::NextMatch,
+        "v" => A::ToggleSelection(S::Simple),
+        "y" | "enter" => A::Yank,
+        "escape" | "q" => A::Exit,
+        _ => A::Swallow,
+    }
+}
+
+/// Which gate in `TerminalView::on_key_down` owns a key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGate {
+    /// Copy mode: the key runs through [`copy_mode_key_action`] and is consumed.
+    CopyMode,
+    /// A held (dead-child) pane: only ⌘C, keyboard scrollback and the dismiss
+    /// Enter survive; everything else is consumed inert.
+    Held,
+    /// The ordinary path — IME gates, ⌘V/⌘C, then the encoder.
+    Encode,
+}
+
+/// Which gate claims a key press, i.e. the ORDER of the two early gates (P10).
+///
+/// Copy mode wins over the held gate: keyboard-selecting what a finished process
+/// printed is a held pane's whole remaining purpose, so copy mode has to work on
+/// a dead pane's output. The held gate's own dismiss-Enter applies once VI is
+/// off — in the mode, Enter means yank-and-exit.
+pub fn key_gate(copy_mode: bool, held: bool) -> KeyGate {
+    if copy_mode {
+        KeyGate::CopyMode
+    } else if held {
+        KeyGate::Held
+    } else {
+        KeyGate::Encode
+    }
+}
+
+/// The three platform IME callbacks the `TermInputHandler` drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImeCallback {
+    /// `setMarkedText:` — a composition started or changed.
+    SetMarked,
+    /// `insertText:` — a composition (or a plain printable) committed.
+    Commit,
+    /// `unmarkText` — the pending composition is accepted as typed.
+    Unmark,
+}
+
+/// What an IME callback is allowed to do (see [`ime_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImeGate {
+    /// Run the [`ImeState`] transition at all.
+    ///
+    /// [`ImeState`]: nice_term_input::ImeState
+    pub run_transition: bool,
+    /// Snap a scrolled-up viewport back to the live bottom.
+    pub snap_to_bottom: bool,
+    /// Write the callback's text to the pty.
+    pub write_pty: bool,
+}
+
+/// What an IME callback may do, given whether the pane is in copy mode (P4's
+/// third gate).
+///
+/// Dead keys and in-flight compositions reach the platform input handler WITHOUT
+/// passing any key listener, so the `on_key_down` table alone cannot keep the
+/// pty silent. In copy mode these callbacks drop the pty write and the
+/// snap-to-bottom — but `Commit` and `Unmark` still run their state transition
+/// with the output discarded. That distinction is load-bearing: a bare early
+/// return would leave marked state `Some`, gpui would keep routing every key
+/// through the input context, and after the mode exits the composing gate would
+/// eat every keystroke — a keyboard-dead pane. Running the transition means a
+/// composition in flight when `⌃⌘c` fires clears itself at commit time.
+///
+/// `SetMarked` is the one safe plain skip: Nice never learns of the composition,
+/// so `is_composing` never arms in the first place.
+pub fn ime_gate(callback: ImeCallback, copy_mode: bool) -> ImeGate {
+    match (callback, copy_mode) {
+        (ImeCallback::SetMarked, false) => ImeGate {
+            run_transition: true,
+            snap_to_bottom: true,
+            write_pty: false, // marking never writes; the commit does
+        },
+        (ImeCallback::SetMarked, true) => ImeGate {
+            run_transition: false,
+            snap_to_bottom: false,
+            write_pty: false,
+        },
+        (ImeCallback::Commit, copy) => ImeGate {
+            run_transition: true,
+            snap_to_bottom: !copy,
+            write_pty: !copy,
+        },
+        (ImeCallback::Unmark, copy) => ImeGate {
+            run_transition: true,
+            snap_to_bottom: false, // unmark never snapped
+            write_pty: !copy,
+        },
+    }
+}
+
+/// Whether a mouse event belongs to the **app** (a VT report to the pty) rather
+/// than to Nice's local handling — the predicate at all four mouse gates (P10).
+///
+/// Copy mode acts exactly like the existing Shift override: a mouse-mode TUI
+/// owns the mouse normally, but while VI is on the wheel scrolls the viewport,
+/// a click moves the vi cursor and a drag selects, with nothing reaching the
+/// running app. tmux captures the mouse in copy mode the same way.
+pub fn mouse_reports_to_app(mode: TermMode, shift: bool, copy_mode: bool) -> bool {
+    crate::mouse::reporting_active(mode) && !shift && !copy_mode
 }
 
 /// Map a gpui [`Keystroke::key`] name to a functional [`NamedKey`], or `None` if
@@ -630,6 +913,243 @@ mod tests {
             scrollback_key_action("pageup", shift, TermMode::DISAMBIGUATE_ESC_CODES),
             Some(ScrollbackAction::PageUp)
         );
+    }
+
+    // MARK: - copy_mode_key_action (Phase 3 copy mode, D3)
+
+    /// A bare key, the way gpui's macOS backend reports one.
+    fn bare(key: &str) -> CopyModeAction {
+        copy_mode_key_action(key, mods(false, false, false, false))
+    }
+
+    /// A shifted LETTER: gpui keeps the flag and lowercases the key.
+    fn shifted(key: &str) -> CopyModeAction {
+        copy_mode_key_action(key, mods(true, false, false, false))
+    }
+
+    fn ctrl(key: &str) -> CopyModeAction {
+        copy_mode_key_action(key, mods(false, false, true, false))
+    }
+
+    fn cmd(key: &str) -> CopyModeAction {
+        copy_mode_key_action(key, mods(false, false, false, true))
+    }
+
+    #[test]
+    fn copy_mode_motions_cover_the_d3_set() {
+        use CopyModeAction::Motion;
+        // hjkl and the arrows are the same motion.
+        assert_eq!(bare("h"), Motion(ViMotion::Left));
+        assert_eq!(bare("left"), Motion(ViMotion::Left));
+        assert_eq!(bare("j"), Motion(ViMotion::Down));
+        assert_eq!(bare("down"), Motion(ViMotion::Down));
+        assert_eq!(bare("k"), Motion(ViMotion::Up));
+        assert_eq!(bare("up"), Motion(ViMotion::Up));
+        assert_eq!(bare("l"), Motion(ViMotion::Right));
+        assert_eq!(bare("right"), Motion(ViMotion::Right));
+
+        // Line ends. `$` and `^` arrive shift-folded into the character.
+        assert_eq!(bare("0"), Motion(ViMotion::First));
+        assert_eq!(bare("$"), Motion(ViMotion::Last));
+        assert_eq!(bare("^"), Motion(ViMotion::FirstOccupied));
+
+        // vim's word-vs-WORD split, which alacritty models as semantic-vs-word.
+        assert_eq!(bare("w"), Motion(ViMotion::SemanticRight));
+        assert_eq!(bare("b"), Motion(ViMotion::SemanticLeft));
+        assert_eq!(bare("e"), Motion(ViMotion::SemanticRightEnd));
+        assert_eq!(shifted("w"), Motion(ViMotion::WordRight));
+        assert_eq!(shifted("b"), Motion(ViMotion::WordLeft));
+        assert_eq!(shifted("e"), Motion(ViMotion::WordRightEnd));
+
+        // Screen thirds.
+        assert_eq!(shifted("h"), Motion(ViMotion::High));
+        assert_eq!(shifted("m"), Motion(ViMotion::Middle));
+        assert_eq!(shifted("l"), Motion(ViMotion::Low));
+
+        // Brackets and paragraphs (all shift-folded punctuation).
+        assert_eq!(bare("%"), Motion(ViMotion::Bracket));
+        assert_eq!(bare("{"), Motion(ViMotion::ParagraphUp));
+        assert_eq!(bare("}"), Motion(ViMotion::ParagraphDown));
+    }
+
+    #[test]
+    fn copy_mode_jumps_and_paging() {
+        assert_eq!(bare("g"), CopyModeAction::Top);
+        assert_eq!(shifted("g"), CopyModeAction::Bottom);
+        assert_eq!(
+            ctrl("u"),
+            CopyModeAction::Page { toward_history: true, half: true }
+        );
+        assert_eq!(
+            ctrl("d"),
+            CopyModeAction::Page { toward_history: false, half: true }
+        );
+        assert_eq!(
+            ctrl("b"),
+            CopyModeAction::Page { toward_history: true, half: false }
+        );
+        assert_eq!(
+            ctrl("f"),
+            CopyModeAction::Page { toward_history: false, half: false }
+        );
+    }
+
+    #[test]
+    fn copy_mode_keeps_todays_scrollback_keys_alive() {
+        // I4: these normally act inside `dispatch_key`, which the copy-mode gate
+        // never reaches — without these rows they would go dead exactly while
+        // the user is navigating scrollback.
+        assert_eq!(
+            shifted("pageup"),
+            CopyModeAction::Page { toward_history: true, half: false }
+        );
+        assert_eq!(
+            shifted("pagedown"),
+            CopyModeAction::Page { toward_history: false, half: false }
+        );
+        assert_eq!(shifted("home"), CopyModeAction::Top);
+        assert_eq!(shifted("end"), CopyModeAction::Bottom);
+        // macOS sets `function` on navigation keys itself — must not disqualify.
+        let mut shift_fn = mods(true, false, false, false);
+        shift_fn.function = true;
+        assert_eq!(
+            copy_mode_key_action("pageup", shift_fn),
+            CopyModeAction::Page { toward_history: true, half: false }
+        );
+        // The plain variants are swallowed like every other unbound key: in copy
+        // mode nothing reaches the pty.
+        assert_eq!(bare("pageup"), CopyModeAction::Swallow);
+        assert_eq!(bare("home"), CopyModeAction::Swallow);
+    }
+
+    #[test]
+    fn copy_mode_selection_verbs_and_yank() {
+        assert_eq!(bare("v"), CopyModeAction::ToggleSelection(SelectionType::Simple));
+        assert_eq!(shifted("v"), CopyModeAction::ToggleSelection(SelectionType::Lines));
+        assert_eq!(ctrl("v"), CopyModeAction::ToggleSelection(SelectionType::Block));
+        // `y` and Enter copy-and-exit; ⌘C copies and stays; ⌘V is swallowed (P4).
+        assert_eq!(bare("y"), CopyModeAction::Yank);
+        assert_eq!(bare("enter"), CopyModeAction::Yank);
+        assert_eq!(cmd("c"), CopyModeAction::YankStay);
+        assert_eq!(cmd("v"), CopyModeAction::SwallowPaste);
+    }
+
+    #[test]
+    fn copy_mode_search_verbs() {
+        assert_eq!(bare("/"), CopyModeAction::OpenSearch { backward: false });
+        // `?` arrives shift-folded on macOS; a layout that keeps the flag is
+        // accepted too.
+        assert_eq!(bare("?"), CopyModeAction::OpenSearch { backward: true });
+        assert_eq!(shifted("/"), CopyModeAction::OpenSearch { backward: true });
+        assert_eq!(bare("n"), CopyModeAction::NextMatch);
+        assert_eq!(shifted("n"), CopyModeAction::PrevMatch);
+    }
+
+    #[test]
+    fn copy_mode_exit_keys() {
+        assert_eq!(bare("escape"), CopyModeAction::Exit);
+        assert_eq!(bare("q"), CopyModeAction::Exit);
+    }
+
+    #[test]
+    fn copy_mode_default_arm_swallows_everything_else() {
+        // The P4 guarantee: no unbound key can reach the encoder while VI is on.
+        for key in [
+            "a", "c", "i", "p", "r", "s", "t", "x", "z", "1", "space", "tab", "backspace",
+            "delete", "f5", "insert", ";", ",", ".",
+        ] {
+            assert_eq!(bare(key), CopyModeAction::Swallow, "bare {key}");
+        }
+        // Bound letters on the WRONG rung are swallowed, not misread.
+        assert_eq!(cmd("h"), CopyModeAction::Swallow);
+        assert_eq!(ctrl("h"), CopyModeAction::Swallow);
+        assert_eq!(cmd("y"), CopyModeAction::Swallow);
+        assert_eq!(ctrl("n"), CopyModeAction::Swallow);
+        // ⌥ is an input modifier (Meta / dead keys), never a copy-mode rung.
+        assert_eq!(
+            copy_mode_key_action("h", mods(false, true, false, false)),
+            CopyModeAction::Swallow
+        );
+        // Mixed rungs (⌃⌘, ⌥⌘, ⌃⌥) belong to the app's chords, which are matched
+        // as gpui actions long before this table sees them.
+        assert_eq!(
+            copy_mode_key_action("c", mods(false, false, true, true)),
+            CopyModeAction::Swallow
+        );
+        assert_eq!(
+            copy_mode_key_action("v", mods(false, true, false, true)),
+            CopyModeAction::Swallow
+        );
+        assert_eq!(
+            copy_mode_key_action("u", mods(false, true, true, false)),
+            CopyModeAction::Swallow
+        );
+    }
+
+    // MARK: - the three gate predicates (P4 / P10)
+
+    #[test]
+    fn copy_mode_gate_runs_before_the_held_gate() {
+        // P10: copy mode must work on a dead pane's output, so it wins over the
+        // held gate — the held gate's dismiss-Enter applies once VI is off.
+        assert_eq!(key_gate(true, true), KeyGate::CopyMode);
+        assert_eq!(key_gate(true, false), KeyGate::CopyMode);
+        assert_eq!(key_gate(false, true), KeyGate::Held);
+        assert_eq!(key_gate(false, false), KeyGate::Encode);
+    }
+
+    #[test]
+    fn ime_gate_keeps_the_pty_silent_but_still_transitions() {
+        // Marking is a plain skip: Nice never learns of the composition.
+        let marked = ime_gate(ImeCallback::SetMarked, true);
+        assert!(!marked.run_transition);
+        assert!(!marked.snap_to_bottom);
+        assert!(!marked.write_pty);
+
+        // Commit and unmark still run their transition with the output
+        // discarded — a bare early return would strand marked state `Some` and
+        // leave the pane keyboard-dead after the mode exits (B1/F3).
+        let commit = ime_gate(ImeCallback::Commit, true);
+        assert!(commit.run_transition);
+        assert!(!commit.snap_to_bottom);
+        assert!(!commit.write_pty);
+
+        let unmark = ime_gate(ImeCallback::Unmark, true);
+        assert!(unmark.run_transition);
+        assert!(!unmark.write_pty);
+    }
+
+    #[test]
+    fn ime_gate_is_todays_behaviour_outside_copy_mode() {
+        let marked = ime_gate(ImeCallback::SetMarked, false);
+        assert!(marked.run_transition);
+        assert!(marked.snap_to_bottom);
+        assert!(!marked.write_pty); // marking never writes; the commit does
+
+        let commit = ime_gate(ImeCallback::Commit, false);
+        assert!(commit.run_transition);
+        assert!(commit.snap_to_bottom);
+        assert!(commit.write_pty);
+
+        let unmark = ime_gate(ImeCallback::Unmark, false);
+        assert!(unmark.run_transition);
+        assert!(!unmark.snap_to_bottom); // unmark never snapped
+        assert!(unmark.write_pty);
+    }
+
+    #[test]
+    fn mouse_reports_suspend_in_copy_mode_like_shift() {
+        let reporting = TermMode::MOUSE_REPORT_CLICK;
+        // Normal: the app owns the mouse.
+        assert!(mouse_reports_to_app(reporting, false, false));
+        // Shift is the existing local override; copy mode is the new one, and
+        // either alone suspends reporting.
+        assert!(!mouse_reports_to_app(reporting, true, false));
+        assert!(!mouse_reports_to_app(reporting, false, true));
+        assert!(!mouse_reports_to_app(reporting, true, true));
+        // A pane that never asked for mouse reports is unaffected either way.
+        assert!(!mouse_reports_to_app(TermMode::NONE, false, false));
+        assert!(!mouse_reports_to_app(TermMode::NONE, false, true));
     }
 
     #[test]

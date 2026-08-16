@@ -962,13 +962,15 @@ mod tests {
     /// key (`ShortcutAction::id`); an unknown id has no counterpart. Coverage is
     /// "every action EXCEPT the Rust-only ones" — prod Swift never had those
     /// rawValues, so pairing them would be false (`commandCompose`'s import outcome
-    /// is the store's seeding exception instead; the tmux Phase 1 actions simply
-    /// have nothing on the prod side to import).
+    /// is the store's seeding exception instead; the tmux Phase 1 and 2 actions
+    /// simply have nothing on the prod side to import).
     #[test]
     fn prod_action_map_pairs_every_action_by_verified_id() {
         // Actions with no Swift-prod `rawValue` counterpart: `CommandCompose` (the
-        // first Rust-only action) plus the eight tmux Phase 1 additions.
-        const RUST_ONLY: [ShortcutAction; 9] = [
+        // first Rust-only action), the eight tmux Phase 1 additions, Phase
+        // 2's twelve pane verbs (prod had no splits at all), and Phase 3's two
+        // copy-mode verbs (prod had no copy mode either).
+        const RUST_ONLY: [ShortcutAction; 23] = [
             ShortcutAction::CommandCompose,
             ShortcutAction::FocusPaneLeft,
             ShortcutAction::FocusPaneDown,
@@ -978,6 +980,20 @@ mod tests {
             ShortcutAction::ScrollHalfPageUp,
             ShortcutAction::ScrollHalfPageDown,
             ShortcutAction::WindowByIndex,
+            ShortcutAction::SplitDown,
+            ShortcutAction::SplitRight,
+            ShortcutAction::ZoomPane,
+            ShortcutAction::BreakPane,
+            ShortcutAction::ResizePaneLeft,
+            ShortcutAction::ResizePaneDown,
+            ShortcutAction::ResizePaneUp,
+            ShortcutAction::ResizePaneRight,
+            ShortcutAction::SwapPaneLeft,
+            ShortcutAction::SwapPaneDown,
+            ShortcutAction::SwapPaneUp,
+            ShortcutAction::SwapPaneRight,
+            ShortcutAction::CopyMode,
+            ShortcutAction::SearchScrollback,
         ];
 
         for (prod_id, action) in PROD_ACTION_MAP {
