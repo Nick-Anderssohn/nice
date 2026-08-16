@@ -1,8 +1,8 @@
 # Phase 3 — copy mode + scrollback search
 
 Roadmap: `docs/tmux-port-roadmap.md` § "Phase 3 — copy mode + scrollback
-search (M)". Status: **IMPLEMENTED** (five slices on `phase-3-copy-mode`;
-Nick's post-merge feel-check pending) — decisions resolved with Nick
+search (M)". Status: **SHIPPED** (merged to `tmux-phase-3`
+as `bcfc19e`; Nick's feel-check PASSED 2026-08-16) — decisions resolved with Nick
 2026-08-13; two single-Fable plan review rounds same day (round 1: 2
 blocking + 5 important + 8 nit; round 2 verified every round-1 fold OK and
 added 1 blocking + 3 important + 4 nit — all folded in below; reports kept
@@ -634,3 +634,28 @@ under the worktree lock). Chord DELIVERY is only provable by hand:
    P8 re-plan cost).
 10. Settings ▸ Shortcuts: both new rows render, record, and reset;
     recording `⌃⌘/` is accepted now.
+
+## As shipped
+
+Everything above landed as written. The cycle recorded ZERO plan/code
+drift — no decision was amended, no backport was needed — so unlike
+Phase 2 there is no divergence list. Nick's hand feel-check (2026-08-16)
+passed the full Validation list 1-10, including the hand-only gates:
+chord delivery of `⌃⌘c`/`⌃⌘/`, IME/dead keys swallowed in mode, mouse
+captured locally over a mouse-reporting Claude pane, and copy mode in a
+streaming Claude pane.
+
+One behavior was tightened during the cycle's final review round rather
+than after: `⌃⌘/` on a bar left open-but-unfocused REFOCUSES it with its
+query intact (P7's wording shipped as written; the first implementation
+wiped the query and was fixed in-cycle, gated by a scenario leg).
+
+Two nits are PARKED deliberately (final-review suggestions, recorded
+here so nobody re-litigates them unprompted):
+
+- `confirm_search`/`search_step` (session_handle.rs) lack the
+  `TermMode::VI` gate their sibling vi-cursor methods have — a narrow
+  race where Enter in a dying search bar can scroll a normal-mode pane.
+- The `copy-mode` scenario's `search_bar_key` helper duplicates
+  `WindowHostView::on_search_key`'s outcome application instead of
+  sharing one function — the copy can drift and pass vacuously.
