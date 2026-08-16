@@ -517,21 +517,20 @@ gate: the `copy-mode` self-test scenario.
 ### Phase 4 — detach, adopt, tear-off (M-L)
 - App-global session registry; "detached sessions" sidebar section;
   close-window-keeps-sessions option; adopt-into-window.
-- **Stable control-socket paths** (slots here because this phase is about
-  sessions outliving their windows). Today each window's socket is
-  `$TMPDIR/nice-<pid>-<nonce>.sock`, so an app relaunch mints new paths and
-  strands the fork-time `NICE_SOCKET` in every long-lived session — since
-  Claude Code 2.1.139 daemon-hosts sessions across client restarts, this
-  actually bites (2026-08-13: handoff from a pre-restart session failed
-  with "no reply from control socket"). Fix: key each window's socket path
-  by its PERSISTED window id (`PersistedWindow.id`, restart-stable) instead
-  of the app pid, keeping the per-window architecture (R14) and window
-  targeting intact; on bind, take the path over with a connect-probe
-  (live listener answers ⇒ another instance owns it; refused ⇒ stale file
-  ⇒ unlink + rebind — the self-heal rebind path already exists). Update
-  the `$TMPDIR` stale-sock sweep pattern to match. Known gap: a session
-  whose window is never restored still holds a dead path — revisit with
-  adopt-into-window, which re-homes sessions across windows anyway.
+- **Stable control-socket paths — CARVED OUT, shipped separately (2026-08-16,
+  see `docs/plans/stable-control-socket.md`).** Was slotted here because this
+  phase is about sessions outliving their windows, but the fix was urgent
+  enough (live daemon-hosted sessions were stranding on every Nice restart)
+  to land ahead of the rest of Phase 4 rather than wait on it. Each window's
+  socket is now `$TMPDIR/nice-w-<12hex>.sock`, keyed on the persisted window
+  id instead of the app pid+nonce, so the path recurs across a relaunch;
+  bind arbitrates ownership with a connect probe (live owner ⇒ legacy
+  pid+nonce fallback for that run, never steals; refused/stale ⇒
+  unlink+rebind), and the `$TMPDIR` sweep gained a matching connect-probe
+  branch for the new name shape ahead of its legacy pid-liveness branch.
+  Known gap carried forward: a session whose window is never restored still
+  holds a dead path — revisit with adopt-into-window below, which re-homes
+  sessions across windows anyway.
 - Revive cross-window pane move / tear-off on the surviving seams
   (`extract_pane`/`insert_pane`, `zed-external-drag-out` already proves the
   NSDraggingSource path).

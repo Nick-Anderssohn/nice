@@ -4800,7 +4800,7 @@ mod tests {
         use std::path::Path;
 
         let mut state = WindowState::new("/home/u");
-        let socket = NiceControlSocket::new();
+        let mut socket = NiceControlSocket::new();
         // Bind + start so the socket file exists on disk (a no-op handler is fine —
         // this test never connects a client; it asserts the unlink-on-teardown).
         socket.start(|_msg| {}).expect("control socket should bind");

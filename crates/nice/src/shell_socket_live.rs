@@ -36,6 +36,15 @@
 //! 7. **teardown unlink** — [`WindowState::teardown`](crate::window_state::WindowState::teardown)
 //!    stops the socket and unlinks its file.
 //!
+//! ## Build requirement
+//!
+//! Run it from a build with `--features selftest`. Assertions 3 and 4 read the
+//! messages the routing point recorded, and that recording
+//! ([`WindowState::record_socket_message`](crate::window_state::WindowState))
+//! is compiled out of a feature-less build — including every shipped bundle.
+//! Without the feature the scenario reports that directly instead of failing
+//! those two as if routing had regressed.
+//!
 //! ## Hermeticity
 //!
 //! Fully sandboxed (tranche-3 rule): a fake `$HOME` with a marker `.zshrc`, a stub
@@ -207,6 +216,21 @@ async fn run_shell_socket(
     state: Entity<WindowState>,
     fixture: Fixture,
 ) -> CadenceReport {
+    // Assertions 3 and 4 read the routing point's recorded messages, and
+    // `WindowState::record_socket_message` compiles to a NO-OP without the
+    // `selftest` feature — so a feature-less build (notably the shipped
+    // `Nice Dev.app`: `scripts/rust-bundle.sh` passes no `--features`) fails
+    // exactly those two while every transport assertion passes. That reads as a
+    // routing regression and has already cost one false-failed validation round;
+    // say what is actually wrong instead.
+    if !cfg!(any(test, feature = "selftest")) {
+        return CadenceReport::error(
+            "shell-socket: the routing point's message recording is compiled out of this \
+             build, so the handshake / session_update assertions cannot pass — rebuild with \
+             `--features selftest` (a shipped bundle never has it)",
+        );
+    }
+
     let _ = cx.update(|app| app.activate(true));
     settle(cx, 300).await;
 

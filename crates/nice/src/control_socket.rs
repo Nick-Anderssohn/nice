@@ -53,6 +53,22 @@
 //!   with capped exponential backoff (0.5 s base, 5 s cap, reset on success), so
 //!   `NICE_SOCKET` in already-spawned shells stays correct across restarts.
 //!
+//! ## Path ownership
+//!
+//! A window's path is keyed on its persisted window id
+//! ([`mint_window_socket_path`]) so it RECURS across app restarts — that is what
+//! keeps a daemon-hosted Claude session's frozen `NICE_SOCKET` working after
+//! Nice quits and reopens. A recurring path means the bind can no longer blindly
+//! unlink what it finds, so an existing file is probed with a `connect(2)` first:
+//! nothing answers ⇒ stale residue, unlink and take it; a live listener answers
+//! ⇒ we never steal it (the initial `start` falls back to a legacy pid+nonce
+//! path for that run, the self-heal loop just keeps retrying).
+//!
+//! That probe only tells the truth if the listener fd stays inside this process,
+//! so it is marked close-on-exec ([`set_cloexec`]) — a pty child that inherited
+//! it would answer the next launch's probe on behalf of the app that already
+//! quit.
+//!
 //! ## Reply capability
 //!
 //! [`Reply`] owns the accepted [`UnixStream`] and is **consumed on use**
@@ -109,6 +125,10 @@ const ACCEPT_POLL_MIN: Duration = Duration::from_millis(10);
 /// REQUEST read timeout, unrelated to the ~2 s reply deadline the foreground
 /// owns.
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Rate limit for the accept loop's "our path is held by a live foreign owner"
+/// warning. The rebind itself retries on the ≤5 s backoff; the log must not.
+const CONTESTED_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 // ===========================================================================
 // The FROZEN message enum + reply object
@@ -290,7 +310,10 @@ type Handler = Arc<dyn Fn(SocketMessage) + Send + Sync + 'static>;
 /// Shared, thread-reachable listener state.
 struct SocketShared {
     /// Bound socket path — exported via `NICE_SOCKET` into every pty; reused
-    /// across rebinds so already-spawned shells stay correct.
+    /// across rebinds so already-spawned shells stay correct. Immutable once the
+    /// accept-loop thread exists: the only mutation is the D2 legacy fallback,
+    /// which rebuilds the whole `SocketShared` inside the synchronous
+    /// [`start`](NiceControlSocket::start), before any thread can read it.
     path: String,
     /// Set by [`NiceControlSocket::stop`] (and `Drop`) to suppress healing and
     /// unblock the accept loop.
@@ -330,9 +353,32 @@ impl NiceControlSocket {
         health_check_interval: Duration,
         initial_restart_delay: Duration,
     ) -> Self {
+        Self::with_path_and_intervals(
+            mint_socket_path(),
+            health_check_interval,
+            initial_restart_delay,
+        )
+    }
+
+    /// Allocate a socket at a caller-chosen `path` with production healing
+    /// intervals. The window-keyed production entry point: `app::arm_window_control_socket`
+    /// passes [`mint_window_socket_path`]`(window_id)` so the path is stable
+    /// across app restarts and a long-lived session's frozen `NICE_SOCKET` keeps
+    /// working. Still two-phase — nothing binds until [`start`](Self::start).
+    pub(crate) fn with_path(path: String) -> Self {
+        Self::with_path_and_intervals(path, Duration::from_secs(30), Duration::from_millis(500))
+    }
+
+    /// [`with_path`](Self::with_path) with explicit healing intervals — the
+    /// scenario/test combination (a window-keyed path AND a fast health cadence).
+    pub(crate) fn with_path_and_intervals(
+        path: String,
+        health_check_interval: Duration,
+        initial_restart_delay: Duration,
+    ) -> Self {
         NiceControlSocket {
             shared: Arc::new(SocketShared {
-                path: mint_socket_path(),
+                path,
                 stop: AtomicBool::new(false),
                 force_rebind: AtomicBool::new(false),
                 health_check_interval,
@@ -343,7 +389,9 @@ impl NiceControlSocket {
     }
 
     /// The bound (or to-be-bound) socket path — injected into pty env as
-    /// `NICE_SOCKET` at window construction, before the listener arms.
+    /// `NICE_SOCKET` at window construction, before any pty forks. Read it
+    /// **after** [`start`](Self::start): that call resolves the final path (the
+    /// D2 fallback can move it off a contested one).
     pub(crate) fn path(&self) -> &str {
         &self.shared.path
     }
@@ -354,7 +402,18 @@ impl NiceControlSocket {
     /// direct `command claude`, preserving "user always gets claude"). On the
     /// happy path the listener is accepting by the time this returns, so a client
     /// may connect immediately.
-    pub(crate) fn start<F>(&self, handler: F) -> io::Result<()>
+    ///
+    /// **The path can change here (D2).** With a window-keyed path, another live
+    /// listener may already own it (a same-user squatter, or the negligible
+    /// truncated-id collision). We never steal a live socket: this run falls back
+    /// once to a legacy `nice-<pid>-<8hex>` path and logs. Callers must therefore
+    /// read [`path`](Self::path) **after** `start` returns — that is the path
+    /// shells must get as `NICE_SOCKET`.
+    ///
+    /// Takes `&mut self` for that swap; the fallback rebuilds `SocketShared`
+    /// before the accept thread spawns, so no reader can observe it and no lock
+    /// is needed.
+    pub(crate) fn start<F>(&mut self, handler: F) -> io::Result<()>
     where
         F: Fn(SocketMessage) + Send + Sync + 'static,
     {
@@ -365,7 +424,26 @@ impl NiceControlSocket {
         // Synchronous initial bind so the caller sees success/failure now and a
         // client can connect on return (matches Swift `start` throwing on bind
         // failure before the source resumes).
-        let listener = bind_and_listen(&self.shared.path)?;
+        let listener = match bind_and_listen(&self.shared.path) {
+            Ok(l) => l,
+            Err(e) if path_contested(&e) => {
+                // D2: a live owner holds our stable path. Fall back to a legacy
+                // pid+nonce path for this run — this window stays fully
+                // functional, just not restart-stable (the pre-fix behavior).
+                let fallback = mint_socket_path();
+                eprintln!(
+                    "nice: control socket path {} is held by a live listener ({e}); using \
+                     {fallback} for this run (this window is not restart-stable)",
+                    self.shared.path
+                );
+                self.replace_path(fallback);
+                // Single-shot: if the fallback bind fails too, report it. Never
+                // loop — under a `NICE_SOCKET_PATH` override the "fallback" path
+                // is the SAME path, so a retry would spin forever.
+                bind_and_listen(&self.shared.path)?
+            }
+            Err(e) => return Err(e),
+        };
         let handler: Handler = Arc::new(handler);
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
@@ -383,6 +461,20 @@ impl NiceControlSocket {
                 Err(io::Error::new(io::ErrorKind::Other, e))
             }
         }
+    }
+
+    /// Rebuild [`SocketShared`] at a new `path` (the D2 fallback). Only legal
+    /// from the synchronous part of [`start`](Self::start), before the accept
+    /// thread spawns: the sole `Arc::clone` happens after the bind succeeds, so
+    /// nothing else can be reading the old state.
+    fn replace_path(&mut self, path: String) {
+        self.shared = Arc::new(SocketShared {
+            path,
+            stop: AtomicBool::new(self.shared.stop.load(Ordering::Acquire)),
+            force_rebind: AtomicBool::new(false),
+            health_check_interval: self.shared.health_check_interval,
+            initial_restart_delay: self.shared.initial_restart_delay,
+        });
     }
 
     /// Stop accepting, suppress healing, and unlink the socket file. Idempotent
@@ -432,6 +524,9 @@ fn accept_loop(
     // resets to 0 on a successful bind.
     let mut restart_attempt: u32 = 0;
     let mut last_health = Instant::now();
+    // Rate limiter for the "someone else owns our path" rebind log, so a
+    // persistent foreign owner is visible without a ≤5 s spam loop.
+    let mut last_contested_log: Option<Instant> = None;
     let poll_ms = accept_poll.as_millis().min(i32::MAX as u128) as i32;
 
     loop {
@@ -458,7 +553,20 @@ fn accept_loop(
                     restart_attempt = 0;
                     last_health = Instant::now();
                 }
-                Err(_) => continue, // retry with more backoff
+                Err(e) => {
+                    // Includes the "live foreign owner" verdict: keep retrying at
+                    // the same path (never switch — `NICE_SOCKET` is already
+                    // stamped in this window's shells), so we reclaim it the
+                    // moment the peer frees it.
+                    if path_contested(&e)
+                        && last_contested_log
+                            .is_none_or(|t| t.elapsed() >= CONTESTED_LOG_INTERVAL)
+                    {
+                        last_contested_log = Some(Instant::now());
+                        eprintln!("nice: control socket cannot rebind — {e}; retrying");
+                    }
+                    continue; // retry with more backoff
+                }
             }
         }
 
@@ -733,12 +841,105 @@ fn normalize_opt(obj: &serde_json::Map<String, serde_json::Value>, key: &str) ->
 // Bind / listen helpers
 // ===========================================================================
 
-/// `socket(AF_UNIX, SOCK_STREAM)` → `unlink(path)` → `bind` → `chmod 0600` →
-/// `listen(8)`. Ports Swift `bindAndListenLocked`
-/// (`NiceControlSocket.swift:244-311`). Returns a **non-blocking**
-/// [`UnixListener`]; the accept loop parks in `poll()` and accepts only when a
-/// connection is pending.
+/// Error payload for "a live listener already owns this path" — the probe
+/// verdict that must never be stolen (D2/D4). Carried inside an [`io::Error`]
+/// so every existing `io::Result` path (notably the accept loop's
+/// `Err(_) => continue` retry) handles it unchanged; [`path_contested`]
+/// recognizes it where the behavior must differ.
+#[derive(Debug)]
+struct OwnedElsewhere {
+    path: String,
+}
+
+impl std::fmt::Display for OwnedElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "control socket {} is owned by a live listener", self.path)
+    }
+}
+
+impl std::error::Error for OwnedElsewhere {}
+
+fn owned_elsewhere(path: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        OwnedElsewhere {
+            path: path.to_string(),
+        },
+    )
+}
+
+/// True when the bind failed because someone else holds the path: our probe saw
+/// a live owner, or `bind` reported `EADDRINUSE` even after the retry. The
+/// initial `start()` answers this with the D2 legacy fallback; the accept loop
+/// answers it by retrying forever at the same (stable) path — the peer may quit
+/// and free it, at which point the already-stamped `NICE_SOCKET` becomes right
+/// again.
+fn path_contested(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<OwnedElsewhere>())
+        || e.raw_os_error() == Some(libc::EADDRINUSE)
+}
+
+/// Probe an existing socket file for a live owner (D5): a plain blocking
+/// `connect(2)`, no bytes written. On macOS AF_UNIX this returns immediately
+/// (`ECONNREFUSED` for an orphaned file — and for a full backlog, which the
+/// health-check rebind absorbs), so no deadline machinery is needed. The
+/// zero-byte connection is safe by the server's own contract: `read_framed_line`
+/// returns `None` on EOF and the handler closes silently.
+///
+/// **Only a SUCCESSFUL connect proves a live owner** (D5's error taxonomy).
+/// Every failure — refused, `ENOENT` (unlinked under us), not-a-socket, junk
+/// residue — counts as stale, because this bind must end with a working socket
+/// for THIS window.
+fn is_live_owner(path: &str) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// Bind with the D6 TOCTOU backstop: a live peer can re-create the file between
+/// our probe and our `bind`, surfacing as `EADDRINUSE`. Re-run probe+bind once;
+/// a second failure is reported to the caller (initial `start()` → D2 fallback;
+/// accept loop → retry with backoff).
 fn bind_and_listen(path: &str) -> io::Result<UnixListener> {
+    match bind_and_listen_once(path) {
+        Err(ref e) if e.raw_os_error() == Some(libc::EADDRINUSE) => bind_and_listen_once(path),
+        other => other,
+    }
+}
+
+/// Mark `fd` close-on-exec.
+///
+/// The listener fd MUST NOT survive into a pty child. Every shell and every
+/// `claude` Nice forks would otherwise inherit an open reference to the bound
+/// socket, and those children routinely outlive the app (daemon-hosted Claude
+/// sessions, `nohup`'d servers, disowned shells). A held reference keeps
+/// `connect(2)` on the path succeeding after the app exits, so the next launch's
+/// probe ([`is_live_owner`]) reports a live owner and takes the D2 legacy
+/// fallback — against Nice's own orphans. The window then loses exactly the
+/// restart stability the window-keyed path exists to provide, and the frozen
+/// `NICE_SOCKET` of a pre-restart session connects to a socket nobody accepts
+/// (hangs to timeout instead of failing fast).
+///
+/// Only the raw `libc::socket` above needs this: `UnixStream::connect` and
+/// `UnixListener::accept` in std already set `FD_CLOEXEC` themselves (macOS has
+/// no `SOCK_CLOEXEC`/`accept4`, so std does the same `fcntl` dance), pinned by
+/// `socket_fds_are_close_on_exec`.
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a valid open fd owned by the caller; `F_SETFD` takes an
+    // int, no pointers involved.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `probe(path)` → `socket(AF_UNIX, SOCK_STREAM)` → `cloexec` →
+/// `unlink(path)` → `bind` → `chmod 0600` → `listen(8)`. Ports Swift `bindAndListenLocked`
+/// (`NiceControlSocket.swift:244-311`), except the unlink is no longer
+/// unconditional: with restart-stable paths a blind unlink would steal a live
+/// peer's socket, so an existing file is probed first and only cleared when
+/// nothing answers. Returns a **non-blocking** [`UnixListener`]; the accept loop
+/// parks in `poll()` and accepts only when a connection is pending.
+fn bind_and_listen_once(path: &str) -> io::Result<UnixListener> {
     let bytes = path.as_bytes();
     if bytes.len() >= SUN_PATH_CAP {
         // Fail loudly, never truncate (a truncated path would bind the wrong
@@ -754,6 +955,17 @@ fn bind_and_listen(path: &str) -> io::Result<UnixListener> {
         ));
     }
 
+    // Arbitrate ownership before touching the file: a live listener keeps it
+    // (the caller decides what to do instead), anything else is stale residue we
+    // clear — a prior crashed run, the listener we are replacing right now, or a
+    // non-socket file squatting the name.
+    if Path::new(path).exists() {
+        if is_live_owner(path) {
+            return Err(owned_elsewhere(path));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     // SAFETY: `socket` with AF_UNIX/SOCK_STREAM returns a new fd (or -1); no
     // arguments are pointers.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
@@ -764,9 +976,9 @@ fn bind_and_listen(path: &str) -> io::Result<UnixListener> {
     // SAFETY: `fd` is a fresh, exclusively-owned socket fd.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
 
-    // Clear any stale socket file — a prior crashed run or the listener we are
-    // replacing right now.
-    let _ = std::fs::remove_file(path);
+    // Close-on-exec, or every pty child inherits the listener (see
+    // `set_cloexec`). Load-bearing for restart stability, not hygiene.
+    set_cloexec(owned.as_raw_fd())?;
 
     // Build the AF_UNIX address. The struct is zero-initialized, so the guard
     // above (`len < SUN_PATH_CAP`) guarantees a trailing NUL remains.
@@ -834,8 +1046,10 @@ fn sleep_interruptible(delay: Duration, stop: &AtomicBool, chunk: Duration) -> b
     }
 }
 
-/// Mint the socket path: `NICE_SOCKET_PATH` override (test seam) else
-/// `$TMPDIR/nice-<pid>-<suffix>.sock`.
+/// Mint the LEGACY socket path: `NICE_SOCKET_PATH` override (test seam) else
+/// `$TMPDIR/nice-<pid>-<suffix>.sock`. Still the default for window-less call
+/// sites (unit tests, the teardown seam) and the D2 fallback when a window's
+/// stable path is held by a live owner.
 fn mint_socket_path() -> String {
     if let Ok(over) = std::env::var("NICE_SOCKET_PATH") {
         return over;
@@ -843,6 +1057,34 @@ fn mint_socket_path() -> String {
     let name = format!("nice-{}-{}.sock", std::process::id(), mint_suffix());
     std::env::temp_dir()
         .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Mint a window's RESTART-STABLE socket path: `$TMPDIR/nice-w-<12hex>.sock`,
+/// where `<12hex>` is the first 12 hex chars of the persisted window id
+/// (`PersistedWindow.id`, a UUIDv4) with the dashes stripped.
+///
+/// The whole point is that this recurs: the id is written to `sessions.json` and
+/// restored verbatim, so a session's frozen `NICE_SOCKET` still names its
+/// window's socket after Nice quits and reopens. 48 bits of UUID entropy makes a
+/// cross-window collision negligible, and the bind probe handles it gracefully
+/// if it ever happens. The `w-` discriminator keeps the `$TMPDIR` sweep's legacy
+/// pid parser inert on these names (`"w"` is not an `i32`), and the 24-byte
+/// filename is shorter than the legacy one, so the `sun_path` headroom only
+/// improves. `NICE_SOCKET_PATH` still overrides everything (test seam).
+pub(crate) fn mint_window_socket_path(window_id: &str) -> String {
+    if let Ok(over) = std::env::var("NICE_SOCKET_PATH") {
+        return over;
+    }
+    let key: String = window_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(12)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    std::env::temp_dir()
+        .join(format!("nice-w-{key}.sock"))
         .to_string_lossy()
         .into_owned()
 }
@@ -1097,7 +1339,7 @@ mod tests {
     #[test]
     fn restarts_after_accept_source_cancel() {
         // Long health-check so ONLY the forced-cancel path is under test.
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1121,7 +1363,7 @@ mod tests {
 
     #[test]
     fn restarts_when_socket_file_removed() {
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_millis(50),
             Duration::from_millis(20),
         );
@@ -1146,7 +1388,7 @@ mod tests {
 
     #[test]
     fn stop_prevents_restart() {
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_millis(50),
             Duration::from_millis(20),
         );
@@ -1180,7 +1422,7 @@ mod tests {
     #[test]
     fn session_update_dispatches_parsed_fields() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1200,7 +1442,7 @@ mod tests {
     #[test]
     fn session_update_parses_source_field() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1218,7 +1460,7 @@ mod tests {
     #[test]
     fn session_update_empty_source_normalizes_to_none() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1236,7 +1478,7 @@ mod tests {
     #[test]
     fn session_update_missing_window_id_drops_silently() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1253,7 +1495,7 @@ mod tests {
     #[test]
     fn session_update_empty_strings_drop_silently() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1270,7 +1512,7 @@ mod tests {
     #[test]
     fn session_update_non_string_fields_drop_silently() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1291,7 +1533,7 @@ mod tests {
     #[test]
     fn session_update_parses_cwd_field() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1313,7 +1555,7 @@ mod tests {
     #[test]
     fn session_update_missing_cwd_is_none() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1331,7 +1573,7 @@ mod tests {
     #[test]
     fn session_update_empty_cwd_normalizes_to_none() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1349,7 +1591,7 @@ mod tests {
     #[test]
     fn session_update_null_cwd_is_none() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1367,7 +1609,7 @@ mod tests {
     #[test]
     fn session_update_non_string_cwd_is_none() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1409,7 +1651,7 @@ mod tests {
     #[test]
     fn claude_exited_dispatches_its_term_window_id() {
         let captured = CapturedExits::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1432,7 +1674,7 @@ mod tests {
         // Nothing to clear without a window — the same required-field rule
         // `session_update` applies.
         let captured = CapturedExits::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1446,7 +1688,7 @@ mod tests {
     #[test]
     fn unknown_action_drops_silently() {
         let captured = CapturedUpdates::default();
-        let socket = NiceControlSocket::with_intervals(
+        let mut socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1519,7 +1761,7 @@ mod tests {
     }
 
     fn socket_with(handler: impl Fn(SocketMessage) + Send + Sync + 'static) -> NiceControlSocket {
-        let s = NiceControlSocket::with_intervals(
+        let mut s = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
             Duration::from_millis(20),
         );
@@ -1916,17 +2158,30 @@ mod tests {
 
     // ---- path mint + sun_path guard -----------------------------------------
 
-    #[test]
-    fn mint_path_matches_frozen_pattern() {
-        // No NICE_SOCKET_PATH in the test env → `$TMPDIR/nice-<pid>-<8hex>.sock`,
-        // the exact shape the $TMPDIR sweep parses (pid right after `nice-`).
-        let socket = NiceControlSocket::new();
-        let file = Path::new(socket.path())
+    fn file_name_of(path: &str) -> String {
+        Path::new(path)
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .to_string();
+            .to_string()
+    }
+
+    /// A scratch path in `$TMPDIR` that no other test (or Nice instance) uses.
+    fn scratch_socket_path() -> String {
+        std::env::temp_dir()
+            .join(format!("nice-test-{}.sock", mint_suffix()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn legacy_mint_path_matches_frozen_pattern() {
+        // No NICE_SOCKET_PATH in the test env → `$TMPDIR/nice-<pid>-<8hex>.sock`,
+        // the shape the $TMPDIR sweep's LEGACY branch parses (pid right after
+        // `nice-`). Still the default for window-less call sites.
+        let socket = NiceControlSocket::new();
+        let file = file_name_of(socket.path());
         let pid = std::process::id();
         let prefix = format!("nice-{pid}-");
         assert!(
@@ -1940,6 +2195,216 @@ mod tests {
             suffix.bytes().all(|b| b.is_ascii_hexdigit()),
             "suffix {suffix} must be hex (no '-', so the sweep reads the pid)"
         );
+    }
+
+    #[test]
+    fn window_mint_path_matches_frozen_pattern() {
+        // The restart-stable shape: `$TMPDIR/nice-w-<12hex>.sock`, keyed on the
+        // persisted window id with dashes stripped. No pid anywhere — that is the
+        // whole point (the path must recur after a relaunch).
+        let path = mint_window_socket_path("3f2a1b9c-77d4-4e21-9a55-0b1c2d3e4f50");
+        let file = file_name_of(&path);
+        assert_eq!(file, "nice-w-3f2a1b9c77d4.sock");
+        assert_eq!(
+            Path::new(&path).parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the window socket lives in $TMPDIR like the legacy one"
+        );
+        assert!(
+            !file.contains(&std::process::id().to_string()),
+            "a pid in the name would break restart stability"
+        );
+        assert!(
+            path.len() < SUN_PATH_CAP,
+            "the window path must stay inside sun_path capacity"
+        );
+    }
+
+    #[test]
+    fn window_mint_path_is_stable_for_the_same_window_id() {
+        let id = "8c7d6e5f-4a3b-4291-8d0e-1f2a3b4c5d6e";
+        assert_eq!(
+            mint_window_socket_path(id),
+            mint_window_socket_path(id),
+            "the same persisted window id must mint the same path across runs"
+        );
+        assert_ne!(
+            mint_window_socket_path(id),
+            mint_window_socket_path("11112222-3333-4444-8555-666677778888"),
+            "different windows must not share a path"
+        );
+    }
+
+    #[test]
+    fn window_socket_takes_over_a_stale_file() {
+        // A crashed run leaves the socket file behind with nothing listening.
+        // The probe finds no owner, so the bind clears it and takes the path —
+        // otherwise every restart would abandon its window's stable path.
+        let path = scratch_socket_path();
+        let dead = UnixListener::bind(&path).expect("precondition: bind the doomed listener");
+        drop(dead); // closes the fd; the FILE stays (crash semantics)
+        assert!(Path::new(&path).exists(), "precondition: stale file on disk");
+
+        let mut socket = NiceControlSocket::with_path_and_intervals(
+            path.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        );
+        socket.start(reply_newtab_handler).expect("takeover must bind");
+
+        assert_eq!(socket.path(), path, "takeover keeps the requested path");
+        assert_eq!(
+            send_claude(&path).as_deref(),
+            Some("newtab"),
+            "the taken-over path must answer"
+        );
+    }
+
+    #[test]
+    fn live_owner_is_never_stolen_and_forces_the_legacy_fallback() {
+        // Someone is already listening on the window-keyed path. We must NOT
+        // unlink them; this run falls back to a legacy pid+nonce path (D2).
+        let path = scratch_socket_path();
+        let owner = UnixListener::bind(&path).expect("precondition: the live owner binds");
+
+        let mut socket = NiceControlSocket::with_path_and_intervals(
+            path.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        );
+        socket
+            .start(reply_newtab_handler)
+            .expect("the fallback bind must succeed");
+
+        assert_ne!(
+            socket.path(),
+            path,
+            "start() must have moved off the contested path"
+        );
+        let file = file_name_of(socket.path());
+        assert!(
+            file.starts_with(&format!("nice-{}-", std::process::id())),
+            "the fallback is a legacy pid+nonce path, got {file}"
+        );
+        assert_eq!(
+            send_claude(socket.path()).as_deref(),
+            Some("newtab"),
+            "the fallback path must be live"
+        );
+
+        // The foreign owner is untouched: same file, still accepting.
+        assert!(Path::new(&path).exists(), "the owner's file must survive");
+        owner.set_nonblocking(true).unwrap();
+        let _client = UnixStream::connect(&path).expect("the owner must still accept connects");
+        assert!(
+            wait_for(Duration::from_secs(1), || owner.accept().is_ok()),
+            "the live owner must still be accepting on its own socket"
+        );
+
+        drop(owner);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zero_byte_connection_is_tolerated() {
+        // The bind probe (and the $TMPDIR sweep) connect without writing a byte.
+        // The server must treat that as an empty request and keep serving.
+        let mut socket = NiceControlSocket::with_intervals(
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        );
+        socket.start(reply_newtab_handler).unwrap();
+
+        assert!(
+            is_live_owner(socket.path()),
+            "a probe of our own live socket must read as a live owner"
+        );
+
+        assert_eq!(
+            send_claude(socket.path()).as_deref(),
+            Some("newtab"),
+            "a zero-byte connection must not wedge the socket"
+        );
+    }
+
+    #[test]
+    fn probe_of_a_stale_file_reports_no_owner() {
+        let path = scratch_socket_path();
+        let dead = UnixListener::bind(&path).unwrap();
+        drop(dead);
+        assert!(
+            !is_live_owner(&path),
+            "an orphaned socket file has no live owner"
+        );
+        // A non-socket file squatting the name is stale too (D5: only a
+        // successful connect proves an owner).
+        let junk = scratch_socket_path();
+        std::fs::write(&junk, b"not a socket").unwrap();
+        assert!(!is_live_owner(&junk), "a plain file is not a live owner");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&junk);
+    }
+
+    #[test]
+    fn a_surviving_child_process_does_not_answer_the_probe() {
+        // The listener fd must not reach a pty child. When it did, a child that
+        // outlived the app (a daemon-hosted Claude session, a nohup'd server)
+        // kept `connect(2)` succeeding at the window's stable path, so the next
+        // launch probed its OWN orphan as a live owner, took the D2 fallback and
+        // silently lost restart stability — the very thing this path buys.
+        let path = scratch_socket_path();
+        let listener = bind_and_listen_once(&path).expect("precondition: bind the listener");
+
+        // Forked while the listener is open — the pty-child stand-in.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("precondition: spawn a child that could inherit the fd");
+
+        // The app exits: our listener fd closes, the file stays (crash/quit
+        // residue), and only the child could still be holding the socket.
+        drop(listener);
+        let answered = is_live_owner(&path);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !answered,
+            "the listener fd leaked into the child, which now answers for an app that is gone"
+        );
+    }
+
+    #[test]
+    fn socket_fds_are_close_on_exec() {
+        let path = scratch_socket_path();
+        let listener = bind_and_listen_once(&path).expect("precondition: bind the listener");
+        let client = UnixStream::connect(&path).expect("precondition: connect a client");
+        listener.set_nonblocking(false).unwrap();
+        let (accepted, _) = listener.accept().expect("precondition: accept the client");
+
+        // The listener is ours (raw `libc::socket` + `set_cloexec`); the two
+        // stream fds come from std, which sets `FD_CLOEXEC` itself — pinned here
+        // so nothing has to re-derive that when reading `set_cloexec`.
+        for (what, fd) in [
+            ("the listener", listener.as_raw_fd()),
+            ("a connected client", client.as_raw_fd()),
+            ("an accepted stream", accepted.as_raw_fd()),
+        ] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed for {what}");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "{what} must be close-on-exec so no pty child inherits it"
+            );
+        }
+
+        drop(accepted);
+        drop(client);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

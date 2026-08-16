@@ -1537,32 +1537,54 @@ fn run_which_claude(argv: &[String]) -> Option<String> {
 /// `claude()` shadow can't reach us). Shared by [`open_managed_window`] (production) and the
 /// `shell-socket` scenario, so both wire the socket identically.
 ///
-/// The socket path is minted first (two-phase, no bind yet) so it can ride pty env
-/// before the listener arms. Bind failure is NON-fatal — logged; `NICE_SOCKET`
-/// still points at the (unbound) path so shells' `nc … -w 2` fails fast and falls
-/// back to direct `command claude` ("user always gets claude"). `health_interval`
-/// is `None` in production (30 s default) and a short value in the scenario's
-/// self-heal step. The foreground drain is **waker-woken** (App-Nap-safe) — never
-/// a coalescable timer. Returns the minted socket path (the `shell-socket`
-/// scenario drives raw `UnixStream` clients + asserts the teardown unlink against
-/// it; `open_managed_window` discards it).
+/// The path is keyed on this window's persisted id, so it RECURS after an app
+/// relaunch and a daemon-hosted session's frozen `NICE_SOCKET` keeps working.
+/// Minting stays two-phase (no bind yet), but the env is stamped **after**
+/// `start()` returns, not before: `start()` resolves the FINAL path, and if a
+/// live listener already owns the window-keyed one it falls back to a legacy
+/// pid+nonce path. Stamping earlier would point this window's shells at the
+/// foreign owner's live socket — silent cross-window misrouting, worse than a
+/// dead path. Safe to reorder because nothing forks until this returns.
+///
+/// Bind failure is NON-fatal — logged; `NICE_SOCKET` still points at the
+/// (unbound) path so shells' `nc … -w 2` fails fast and falls back to direct
+/// `command claude` ("user always gets claude"). `health_interval` is `None` in
+/// production (30 s default) and a short value in the scenario's self-heal step.
+/// The foreground drain is **waker-woken** (App-Nap-safe) — never a coalescable
+/// timer. Returns the RESOLVED socket path — read post-`start()`, the same value
+/// the shells get (the `shell-socket` scenario drives raw `UnixStream` clients +
+/// asserts the teardown unlink against it; `open_managed_window` discards it).
 pub(crate) fn arm_window_control_socket(
     ws: &mut WindowState,
     cx: &mut Context<WindowState>,
     inject_pairs: Vec<(String, String)>,
     health_interval: Option<Duration>,
 ) -> String {
-    use crate::control_socket::{socket_channel, NiceControlSocket};
+    use crate::control_socket::{mint_window_socket_path, socket_channel, NiceControlSocket};
     use crate::pty_manager::WindowShellEnv;
     use std::sync::mpsc::TryRecvError;
 
-    let socket = match health_interval {
-        Some(h) => NiceControlSocket::with_intervals(h, Duration::from_millis(500)),
-        None => NiceControlSocket::new(),
+    // The window's persisted id is already set here (fresh mint or restored from
+    // `sessions.json`), so the path is restart-stable from the first window on.
+    let minted_path = mint_window_socket_path(ws.window_session_id());
+    let mut socket = match health_interval {
+        Some(h) => {
+            NiceControlSocket::with_path_and_intervals(minted_path, h, Duration::from_millis(500))
+        }
+        None => NiceControlSocket::with_path(minted_path),
     };
-    let socket_path = socket.path().to_string();
 
-    // Set the window's shell-injection env BEFORE the caller forks the Main window.
+    // Bind + start the accept thread; drain parsed messages onto the foreground.
+    let (tx, rx) = socket_channel();
+    if let Err(e) = socket.start(move |msg| tx.post(msg)) {
+        eprintln!(
+            "nice: control socket failed to bind: {e:#} (shells fall back to direct claude)"
+        );
+    }
+
+    // Stamp the window's shell-injection env from the RESOLVED path — after
+    // `start()`, still BEFORE the caller forks the Main window.
+    let socket_path = socket.path().to_string();
     ws.ptys.set_window_shell_env(WindowShellEnv {
         socket_path: Some(socket_path.clone()),
         inject_pairs,
@@ -1572,14 +1594,6 @@ pub(crate) fn arm_window_control_socket(
                 .into_owned(),
         ),
     });
-
-    // Bind + start the accept thread; drain parsed messages onto the foreground.
-    let (tx, rx) = socket_channel();
-    if let Err(e) = socket.start(move |msg| tx.post(msg)) {
-        eprintln!(
-            "nice: control socket failed to bind: {e:#} (shells fall back to direct claude)"
-        );
-    }
 
     // The waker-woken foreground drain: park on `readable()`, then route every
     // queued message through the window state. Held (not detached) so teardown /
@@ -4525,6 +4539,90 @@ mod tests {
                 "command -v -- claude".to_string()
             ]
         );
+    }
+
+    /// Review B1, at the arm site: when a live foreign listener already owns the
+    /// window-keyed path, `start()` resolves to the D2 legacy fallback — and the
+    /// `NICE_SOCKET` this window stamps into every pty must be the RESOLVED path,
+    /// not the contested one. Stamping before `start()` would point this window's
+    /// shells at the foreign owner's LIVE socket (silent cross-window
+    /// misrouting), so this pins the ordering the reorder exists for. The
+    /// control_socket unit test covers the socket-level swap; only here do the
+    /// minted and resolved paths differ with the pty env in the picture.
+    #[gpui::test]
+    fn arm_stamps_shell_env_from_the_path_start_resolved(cx: &mut gpui::TestAppContext) {
+        use crate::control_socket::mint_window_socket_path;
+        use std::os::unix::net::UnixListener;
+        use std::path::Path;
+
+        let ws = cx.new(|_| WindowState::new("/home/u"));
+        let contested = ws.read_with(cx, |ws, _| mint_window_socket_path(ws.window_session_id()));
+        let _ = std::fs::remove_file(&contested);
+        let owner = UnixListener::bind(&contested).expect("precondition: a foreign owner binds");
+
+        let resolved = ws.update(cx, |ws, cx| {
+            arm_window_control_socket(ws, cx, Vec::new(), None)
+        });
+
+        assert_ne!(
+            resolved, contested,
+            "start() must fall back off the contested path (D2)"
+        );
+        let stamped = ws.read_with(cx, |ws, _| ws.ptys.injected_nice_socket_for_test());
+        assert_ne!(
+            stamped.as_deref(),
+            Some(contested.as_str()),
+            "NICE_SOCKET must never name the foreign owner's live socket"
+        );
+        assert_eq!(
+            stamped,
+            Some(resolved.clone()),
+            "NICE_SOCKET must carry the path start() resolved to"
+        );
+        assert!(
+            Path::new(&contested).exists(),
+            "the foreign owner's socket file must survive untouched"
+        );
+
+        ws.update(cx, |ws, _| ws.teardown());
+        drop(owner);
+        let _ = std::fs::remove_file(&contested);
+    }
+
+    /// The happy path the whole change exists for: with the window-keyed path
+    /// FREE, `start()` must keep it, and the `NICE_SOCKET` stamped into every pty
+    /// must be exactly `mint_window_socket_path(window_session_id())` — the value
+    /// that recurs after a relaunch restores this window id. The contested
+    /// sibling above only asserts `stamped == resolved`, which any path satisfies
+    /// (a legacy pid+nonce mint included); only this test ties the stamped env
+    /// back to the window id.
+    #[gpui::test]
+    fn arm_stamps_the_window_keyed_socket_path_when_uncontested(cx: &mut gpui::TestAppContext) {
+        use crate::control_socket::mint_window_socket_path;
+
+        let ws = cx.new(|_| WindowState::new("/home/u"));
+        let expected = ws.read_with(cx, |ws, _| mint_window_socket_path(ws.window_session_id()));
+        // No foreign owner. A leftover file from a crashed run would probe dead
+        // and be taken over anyway; clear it so the assertion is unambiguous.
+        let _ = std::fs::remove_file(&expected);
+
+        let resolved = ws.update(cx, |ws, cx| {
+            arm_window_control_socket(ws, cx, Vec::new(), None)
+        });
+
+        assert_eq!(
+            resolved, expected,
+            "an uncontested arm must bind the restart-stable window-keyed path"
+        );
+        let stamped = ws.read_with(cx, |ws, _| ws.ptys.injected_nice_socket_for_test());
+        assert_eq!(
+            stamped,
+            Some(expected.clone()),
+            "NICE_SOCKET must carry the window-keyed path, not a fresh/legacy one"
+        );
+
+        ws.update(cx, |ws, _| ws.teardown());
+        let _ = std::fs::remove_file(&expected);
     }
 
     #[test]

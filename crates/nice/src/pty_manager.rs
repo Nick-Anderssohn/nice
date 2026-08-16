@@ -2115,6 +2115,19 @@ impl PtyManager {
         self.window_shell_env.as_ref()
     }
 
+    /// The `NICE_SOCKET` value a pty forked right now would inherit — read
+    /// through the real [`session_window_env_pairs`](Self::session_window_env_pairs)
+    /// stamping path, not the raw field. Test-only: `app::arm_window_control_socket`
+    /// must stamp this from the socket path RESOLVED by `start()` (review B1), and
+    /// this is the seam that pins it.
+    #[cfg(test)]
+    pub(crate) fn injected_nice_socket_for_test(&self) -> Option<String> {
+        self.session_window_env_pairs("S", "P")
+            .into_iter()
+            .find(|(k, _)| k == "NICE_SOCKET")
+            .map(|(_, v)| v)
+    }
+
     /// The per-window terminal env pairs this window injects into every pty
     /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` (when
     /// set) + the active profile's injection pairs (zsh: `ZDOTDIR` +
