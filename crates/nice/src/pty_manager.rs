@@ -277,6 +277,74 @@ impl WindowPty {
     }
 }
 
+/// One detached session's LIVE ptys, moved whole out of a [`PtyManager`] and
+/// parked in the app-global [`DetachedPool`](crate::detached_pool::DetachedPool)
+/// until some window adopts it (tmux-port Phase 4, plan §P3).
+///
+/// **Opaque by design.** [`WindowPty`] and [`PaneState`] are private to this
+/// module — that is what keeps "a live pty belongs to exactly one manager" a
+/// type-level fact — so the pool stores this payload without ever seeing
+/// inside. Only `pty_manager` builds one (`take_session`) and consumes one
+/// (`insert_session`); both land with the detach slice.
+///
+/// Holding this alive is what makes detach non-destructive: the entities inside
+/// are the same `Entity<TerminalSessionHandle>`s the source window had, so
+/// nothing is dropped, no `SIGHUP` is sent, and the children never notice.
+/// Dropping it is therefore also the pool's `kill`. An EMPTY payload
+/// ([`DetachedPtys::empty`]) is a **structural** entry — a row with no live
+/// process behind it (a never-activated restored session, or the whole pool
+/// after a relaunch), which respawns lazily on adopt-activate.
+pub(crate) struct DetachedPtys {
+    /// `term_window_id -> WindowPty` — exactly the inner map
+    /// [`PtyManager::sessions`] holds for one session id.
+    windows: HashMap<String, WindowPty>,
+    /// The per-pane Claude status entries that travelled with the payload,
+    /// keyed `(term_window_id, pane_id)` — the session id is re-applied by
+    /// [`PtyManager::insert_session`], which owns the
+    /// [`pane_key`] spelling.
+    ///
+    /// Statuses MOVE with the ptys (the `move_pane_to_new_window` precedent)
+    /// rather than being dropped, so an adopted Claude pill is not stuck
+    /// dim-or-lit until its next status event.
+    statuses: HashMap<(String, String), SessionStatus>,
+}
+
+impl DetachedPtys {
+    /// The empty payload: a structural detached entry with no live child. What
+    /// launch hydration builds for every persisted row, and what P2's
+    /// model-alive-but-ptyless sessions detach as.
+    pub(crate) fn empty() -> Self {
+        DetachedPtys {
+            windows: HashMap::new(),
+            statuses: HashMap::new(),
+        }
+    }
+
+    /// Whether this payload holds no live pty entries at all (a structural
+    /// entry).
+    pub(crate) fn is_structural(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// Whether ANY pooled pane's child is still running — the poll-style
+    /// liveness read the window-less-quit check needs (plan review N2:
+    /// `TermSession::try_status()` is the ONE liveness primitive; do not invent
+    /// a second).
+    ///
+    /// A pane that has not spawned yet (an armed deferred resume) also reports
+    /// `None` and therefore reads as live. That errs toward keeping the app
+    /// alive rather than silently tearing the pool down, which is the safe
+    /// direction for D5.
+    pub(crate) fn has_live(&self, cx: &App) -> bool {
+        self.windows.values().any(|window| {
+            window
+                .panes
+                .values()
+                .any(|pane| pane.handle.read(cx).session().try_status().is_none())
+        })
+    }
+}
+
 /// The per-window pty/session manager. Session-keyed: each session maps to its live window
 /// sessions (`term_window_id -> WindowPty`), mirroring Swift's session-keyed
 /// `ptySessions` cache. A session entry existing (even empty) means Swift's
@@ -1332,6 +1400,248 @@ impl PtyManager {
         Some(new_window_id)
     }
 
+    // MARK: - Detach / adopt (tmux-port Phase 4, plan §P6)
+
+    /// Remove `session_id`'s live ptys from this manager and RETURN them, without
+    /// dropping anything — the producing half of [`DetachedPtys`].
+    ///
+    /// This is the whole reason detach is non-destructive: the entities travel out
+    /// inside the payload, so no `PaneState` is dropped and no child's process
+    /// group is SIGHUPed. An unknown session id yields an empty (structural)
+    /// payload, which is also exactly what a model-alive-but-ptyless session
+    /// detaches as (plan §P2).
+    ///
+    /// **The scrub list is explicit** (plan §P6, review I4/I7). It matters most for
+    /// the EXPLICIT detach action, where the window stays open — the close path
+    /// would get most of it free from [`teardown`](Self::teardown):
+    ///
+    /// * `window_launch_states` is keyed by the BARE `term_window_id`, so it is
+    ///   scrubbed by the session's window-id set. A leaked entry would paint a
+    ///   "Launching…" overlay for a pill this window no longer owns.
+    /// * `pane_status` entries MOVE with the payload (the
+    ///   [`move_pane_to_new_window`](Self::move_pane_to_new_window) precedent) and
+    ///   are re-seeded by [`insert_session`](Self::insert_session).
+    /// * `pending_prefill` is CLEARED on every taken pane. Its consume event (the
+    ///   pane's first `CwdChanged`) can fire subscriber-less while pooled and be
+    ///   dropped, after which the armed line would splice into the user's first
+    ///   post-adopt `cd`. A pane live enough to detach no longer needs its
+    ///   prefill, and a structural re-adopt arms a fresh one at respawn.
+    /// * `dissolved_session_ids` and `pending_project_removal` are deliberately
+    ///   LEFT: no dissolve happened (the session lives on, elsewhere), and the
+    ///   removal flags are project-scoped, not session-scoped.
+    /// * The `synthetic_*` test seams are left too — they are always empty in
+    ///   production and their owning tests never detach.
+    pub(crate) fn take_session(&mut self, session_id: &str) -> DetachedPtys {
+        let Some(mut windows) = self.sessions.remove(session_id) else {
+            return DetachedPtys::empty();
+        };
+        let mut statuses: HashMap<(String, String), SessionStatus> = HashMap::new();
+        for (term_window_id, window) in windows.iter_mut() {
+            self.window_launch_states.remove(term_window_id);
+            for (pane_id, pane) in window.panes.iter_mut() {
+                if let Some(status) = self
+                    .pane_status
+                    .remove(&pane_key(session_id, term_window_id, pane_id))
+                {
+                    statuses.insert((term_window_id.clone(), pane_id.clone()), status);
+                }
+                pane.pending_prefill = None;
+            }
+        }
+        DetachedPtys { windows, statuses }
+    }
+
+    /// Move a [`DetachedPtys`] payload INTO this manager under `session_id` — the
+    /// consuming half, and the inverse of [`take_session`](Self::take_session). The
+    /// same `Entity<TerminalSessionHandle>`s land here, so nothing respawns and the
+    /// children never notice which window owns them.
+    ///
+    /// The per-session container is created even for a STRUCTURAL payload (no
+    /// windows): [`ensure_active_window_spawned`](Self::ensure_active_window_spawned)
+    /// refuses to lazy-spawn a session that has no container, which is exactly the
+    /// respawn path a post-relaunch detached row rides on adopt-activate.
+    ///
+    /// The payload's `pane_status` entries are re-seeded under this manager's keys,
+    /// so an adopted Claude pill renders its real status immediately rather than
+    /// waiting for the next status event.
+    pub(crate) fn insert_session(&mut self, session_id: &str, payload: DetachedPtys) {
+        let DetachedPtys { windows, statuses } = payload;
+        let container = self.sessions.entry(session_id.to_string()).or_default();
+        for (term_window_id, window) in windows {
+            container.insert(term_window_id, window);
+        }
+        for ((term_window_id, pane_id), status) in statuses {
+            self.pane_status
+                .insert(pane_key(session_id, &term_window_id, &pane_id), status);
+        }
+    }
+
+    // MARK: - Tear-off (tmux-port Phase 4, plan §P9)
+
+    /// Lift one pane out of this window as a SYNTHETIC session — the model half a
+    /// brand-new OS window adopts, plus the live payload that makes the move a move
+    /// (tmux `break-pane -d` + `move-window`, plan §P9). `None` when it refused.
+    ///
+    /// The pty **moves**: the same `Entity<TerminalSessionHandle>` travels inside
+    /// the [`DetachedPtys`] payload, so nothing respawns and the child never
+    /// notices which window owns it — the same non-destructive property detach and
+    /// [`move_pane_to_new_window`](Self::move_pane_to_new_window) have.
+    ///
+    /// **Two extraction branches** (plan §P9, review I6), because
+    /// [`PaneLayout::remove`](nice_model::PaneLayout::remove) refuses the last leaf
+    /// by contract ("a pill without a pane is not representable"):
+    ///
+    /// * **multi-leaf pill** — break-pane's extraction (remove + spatial refocus +
+    ///   `is_alive` recompute), so the SOURCE pill survives, healed and refocused.
+    ///   The lifted pane is wrapped in a fresh `Terminal 1` pill;
+    /// * **single-leaf pill** — the whole [`TermWindow`] moves out through
+    ///   [`WorkspaceModel::extract_window`], which already repairs the source
+    ///   session's `active_window_id` / `prev_active_window_id` internally. The
+    ///   pill keeps its id, its title and its zoom state, and the source session
+    ///   may now hold no pills at all — the empty-session dissolve is the CALLER's
+    ///   (`WindowState::tear_off_pane` runs it through
+    ///   [`dissolve_session_if_empty`](Self::dissolve_session_if_empty), the entry
+    ///   point modelled for exactly this path).
+    ///
+    /// **Refusals** mirror break-pane: an unknown session / pill / pane, and the
+    /// CLAUDE pane. A Claude leaf becoming its own window through this path would
+    /// fork the ≤1-Claude invariant's bookkeeping, and there is a better door for
+    /// it anyway — Detach Session ▸ Open in New Window moves a Claude session
+    /// whole.
+    ///
+    /// **The armed prefill is deliberately KEPT** (unlike
+    /// [`take_session`](Self::take_session), which clears it): the whole
+    /// `PaneState` rides along exactly as break-pane's re-home does, and the
+    /// adopting window subscribes the pane in the SAME synchronous turn — the pane
+    /// is never left subscriber-less across a turn, so its consume event cannot be
+    /// dropped.
+    ///
+    /// **Accepted wart (§P11 shape 3):** the moved child's `NICE_TAB_ID` /
+    /// `NICE_PANE_ID` were fixed at fork and still name the SOURCE session, which
+    /// now lives in a DIFFERENT OS window — so a hand-typed `claude` in the torn-off
+    /// pane lights the source window's pill. Env cannot change post-fork; Phase 5's
+    /// pane addressing is the designated revisit.
+    pub(crate) fn tear_off_pane(
+        &mut self,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+    ) -> Option<(Session, DetachedPtys)> {
+        let source_session = model.session_for(session_id)?;
+        let source_window = source_session
+            .windows
+            .iter()
+            .find(|w| w.id == term_window_id)?;
+        if source_window.layout.pane(pane_id)?.kind == TermWindowKind::Claude {
+            return None;
+        }
+        let multi_leaf = source_window.layout.leaf_count() > 1;
+        let session_title = source_session.title.clone();
+        let session_cwd = source_session.cwd.clone();
+        let source_next_index = source_session.next_terminal_index;
+
+        let new_session_id = self.mint("t");
+        let mut windows: HashMap<String, WindowPty> = HashMap::new();
+        let mut statuses: HashMap<(String, String), SessionStatus> = HashMap::new();
+
+        let new_window = if multi_leaf {
+            let mut moved: Option<nice_model::Pane> = None;
+            model.mutate_session(session_id, |session| {
+                let Some(source) = session.windows.iter_mut().find(|w| w.id == term_window_id)
+                else {
+                    return;
+                };
+                // Captured BEFORE the removal — `spatial_refocus` compares against
+                // the lifted pane's own rect.
+                let rects_before = source.nominal_leaf_rects();
+                let was_focused = source.active_pane_id == pane_id;
+                let Some(pane) = source.layout.remove(pane_id) else {
+                    return;
+                };
+                if was_focused {
+                    if let Some(next) = nice_model::spatial_refocus(&rects_before, pane_id) {
+                        source.active_pane_id = next;
+                    }
+                }
+                // P4 on the source pill (the break-pane rule): it just lost a pane,
+                // so a zoom that was hiding the rest of it would now hide the wrong
+                // thing.
+                source.zoomed = false;
+                source.is_alive = source.any_pane_alive();
+                moved = Some(pane);
+            });
+            let moved = moved?;
+
+            // Re-key the live pane state + its status entry under the pill the new
+            // window will own. Read the status BEFORE the release, which drops it.
+            let status = self
+                .pane_status
+                .get(&pane_key(session_id, term_window_id, pane_id))
+                .copied();
+            let new_window_id = format!("{new_session_id}-t1");
+            if let Some(state) = self.release_pane_pty(session_id, term_window_id, pane_id) {
+                windows.insert(
+                    new_window_id.clone(),
+                    WindowPty {
+                        panes: HashMap::from([(pane_id.to_string(), state)]),
+                        active_pane: pane_id.to_string(),
+                    },
+                );
+                if let Some(status) = status {
+                    statuses.insert((new_window_id.clone(), pane_id.to_string()), status);
+                }
+            }
+            self.recompute_window_status(model, session_id, term_window_id);
+
+            let mut new_window =
+                TermWindow::new(new_window_id, "Terminal 1", TermWindowKind::Terminal);
+            new_window.cwd = moved.cwd.clone();
+            new_window.is_alive = moved.is_alive;
+            new_window.active_pane_id = moved.id.clone();
+            new_window.layout = nice_model::PaneLayout::single(moved);
+            new_window
+        } else {
+            // Whole-pill move: `extract_window` repairs the source session's
+            // active / previous window pointers itself — do not duplicate that.
+            let moved = model.extract_window(term_window_id, session_id)?;
+            let status = self
+                .pane_status
+                .remove(&pane_key(session_id, term_window_id, pane_id));
+            // The launch overlay is keyed by the BARE pill id, so it must not stay
+            // behind painting "Launching…" for a pill this window no longer owns.
+            self.window_launch_states.remove(term_window_id);
+            if let Some(window) = self
+                .sessions
+                .get_mut(session_id)
+                .and_then(|c| c.remove(term_window_id))
+            {
+                windows.insert(term_window_id.to_string(), window);
+                if let Some(status) = status {
+                    statuses.insert((term_window_id.to_string(), pane_id.to_string()), status);
+                }
+            }
+            moved
+        };
+
+        // The synthetic session wrapping it. Terminal-only by construction: no
+        // `claude_session_id` (a resume must not fire twice for one conversation)
+        // and no manual-title lock, so the new row auto-titles like any other.
+        let cwd = new_window
+            .cwd
+            .clone()
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or(session_cwd);
+        let mut session = Session::new(&new_session_id, session_title, cwd);
+        session.active_window_id = Some(new_window.id.clone());
+        // A fresh session that already spent "Terminal 1" starts at 2; the
+        // whole-pill move keeps the SOURCE counter, so the next auto-name in the
+        // new session cannot collide with the moved pill's own.
+        session.next_terminal_index = if multi_leaf { 2 } else { source_next_index };
+        session.windows = vec![new_window];
+
+        Some((session, DetachedPtys { windows, statuses }))
+    }
 
     /// A window's process exited but its view stays mounted so the user can read
     /// the scrollback (Swift's `paneHeld`, `SessionsModel.swift:362-377`): clear
@@ -1872,7 +2182,7 @@ impl PtyManager {
     // MARK: - Session spawn / focus primitives (gpui; live-wired slice 3)
 
     /// Whether `session_id` has a session container (Swift's `ptySessions[tabId]`).
-    fn session_has_pty(&self, session_id: &str) -> bool {
+    pub(crate) fn session_has_pty(&self, session_id: &str) -> bool {
         self.sessions.contains_key(session_id)
     }
 

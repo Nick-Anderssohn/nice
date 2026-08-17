@@ -968,9 +968,11 @@ mod tests {
     fn prod_action_map_pairs_every_action_by_verified_id() {
         // Actions with no Swift-prod `rawValue` counterpart: `CommandCompose` (the
         // first Rust-only action), the eight tmux Phase 1 additions, Phase
-        // 2's twelve pane verbs (prod had no splits at all), and Phase 3's two
-        // copy-mode verbs (prod had no copy mode either).
-        const RUST_ONLY: [ShortcutAction; 23] = [
+        // 2's twelve pane verbs (prod had no splits at all), Phase 3's two
+        // copy-mode verbs (prod had no copy mode either), and Phase 4's detach /
+        // adopt / tear-off trio (prod sessions died with their window, and a pane
+        // could not become a window at all).
+        const RUST_ONLY: [ShortcutAction; 26] = [
             ShortcutAction::CommandCompose,
             ShortcutAction::FocusPaneLeft,
             ShortcutAction::FocusPaneDown,
@@ -994,6 +996,9 @@ mod tests {
             ShortcutAction::SwapPaneRight,
             ShortcutAction::CopyMode,
             ShortcutAction::SearchScrollback,
+            ShortcutAction::DetachSession,
+            ShortcutAction::AdoptDetachedSession,
+            ShortcutAction::TearOffPane,
         ];
 
         for (prod_id, action) in PROD_ACTION_MAP {

@@ -44,13 +44,22 @@ struct FontsSection {
 /// [`crate::shell::resolve::ShellSetting::Automatic`]; a non-empty string is a
 /// `Path` override. Written by the Settings ▸ Advanced ▸ Shell picker
 /// ([`SettingsPrefsStore::set_shell`], migration step 6), and still tolerant of
-/// a hand-edited `ui_settings.json`.
+/// a hand-edited `ui_settings.json`. tmux-port Phase 4 adds
+/// `close_window_detaches` on the same terms.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AdvancedSection {
     #[serde(default)]
     smooth_scroll: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shell: Option<String>,
+    /// tmux-port Phase 4 (D1): whether ⌘W / the red button DETACHES the
+    /// window's running sessions into the app-global pool instead of killing
+    /// them. `Option` on purpose — `None` is "never chosen", which reads as the
+    /// shipped default **ON** ([`SettingsPrefsStore::close_window_detaches`]) —
+    /// so the default can move later without mistaking an explicit OFF for an
+    /// absent key. The checkbox always writes `Some(..)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    close_window_detaches: Option<bool>,
 }
 
 /// The on-disk document, for DECODING R23's own keys. Every other top-level key is
@@ -124,6 +133,14 @@ impl SettingsPrefsStore {
     /// The persisted smooth-scroll toggle (default OFF).
     pub fn smooth_scroll(&self) -> bool {
         self.advanced.smooth_scroll
+    }
+
+    /// Whether closing a window detaches its running sessions into the
+    /// app-global pool (tmux-port Phase 4, D1). **Default ON** — an absent key
+    /// (and an absent store) reads as detach-on-close; turning it OFF restores
+    /// the pre-Phase-4 confirm-then-kill flow.
+    pub fn close_window_detaches(&self) -> bool {
+        self.advanced.close_window_detaches.unwrap_or(true)
     }
 
     /// The persisted `advanced.shell` choice, as a
@@ -202,6 +219,18 @@ impl SettingsPrefsStore {
             return Ok(false);
         }
         self.advanced.smooth_scroll = on;
+        self.write()?;
+        Ok(true)
+    }
+
+    /// Persist the detach-on-close toggle, write-through only-if-changed.
+    /// Always writes an EXPLICIT `Some(on)`, so re-picking the default value
+    /// still records the user's choice rather than leaving the key absent.
+    pub fn set_close_window_detaches(&mut self, on: bool) -> std::io::Result<bool> {
+        if self.advanced.close_window_detaches == Some(on) {
+            return Ok(false);
+        }
+        self.advanced.close_window_detaches = Some(on);
         self.write()?;
         Ok(true)
     }
@@ -508,6 +537,57 @@ mod tests {
         std::fs::write(&path, br#"{"version":1,"advanced":{"shell":""}}"#).unwrap();
         let store = SettingsPrefsStore::load(path);
         assert_eq!(store.shell(), None);
+    }
+
+    /// tmux-port Phase 4 (D1): the detach-on-close toggle defaults ON when the
+    /// key is absent, round-trips both values through the file, writes an
+    /// EXPLICIT `Some(..)` (so a user who ticks the default back on still
+    /// records it), and only reports real changes.
+    #[test]
+    fn close_window_detaches_defaults_on_and_round_trips() {
+        let path = temp_path("detach-on-close");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        assert!(
+            store.close_window_detaches(),
+            "absent key ⇒ the shipped default ON"
+        );
+
+        assert!(store.set_close_window_detaches(false).unwrap());
+        assert!(
+            !store.set_close_window_detaches(false).unwrap(),
+            "re-setting the identical value must not rewrite"
+        );
+        let reloaded = SettingsPrefsStore::load(path.clone());
+        assert!(!reloaded.close_window_detaches(), "OFF survived the file");
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["advanced"]["close_window_detaches"], false);
+
+        let mut store = reloaded;
+        assert!(store.set_close_window_detaches(true).unwrap());
+        let reloaded = SettingsPrefsStore::load(path.clone());
+        assert!(reloaded.close_window_detaches());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["advanced"]["close_window_detaches"], true,
+            "ticking the default back on writes an explicit true, not an absent key"
+        );
+    }
+
+    /// The new advanced key co-exists with `shell` — one section, two
+    /// independent slots through the read-merge-write writer.
+    #[test]
+    fn close_window_detaches_and_shell_co_exist() {
+        let path = temp_path("detach-plus-shell");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        store.set_shell(Some("/bin/bash".to_string())).unwrap();
+        store.set_close_window_detaches(false).unwrap();
+
+        let reloaded = SettingsPrefsStore::load(path);
+        assert_eq!(reloaded.shell(), Some("/bin/bash".to_string()));
+        assert!(!reloaded.close_window_detaches());
     }
 
     /// `advanced.shell` survives a write of an unrelated advanced field

@@ -313,6 +313,22 @@ async fn run_persistence_restore(
 
     let mut failures: Vec<String> = Vec::new();
 
+    // tmux-port Phase 4 (plan N5): `route_close_disk_fate` now runs the
+    // detach partition before the snapshot read, so this scenario — which drives
+    // that function directly — would exercise it if a pool were installed. It is
+    // not: `run_selftest` installs no `DetachedPool` (the hermeticity rule, and
+    // `detach_on_close_enabled` reads pool presence first), so leg (c)'s Confirm
+    // close keeps its pre-Phase-4 behaviour exactly. Asserted rather than assumed,
+    // because a future pool install here would silently turn this suite's
+    // kill-on-close legs into detaches.
+    if cx.update(|app| crate::detached_pool::pool(app).is_some()) {
+        failures.push(
+            "(pre) a DetachedPool is installed under run_selftest — the close legs below \
+             would detach instead of kill (plan N5)"
+                .to_string(),
+        );
+    }
+
     // === (a) restore round-trip ============================================
     // Model tree: the saved grouping is trusted (proj + Terminals), lineage intact.
     let session_ids = state.update(cx, |s, _| {
@@ -770,6 +786,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
     let state = session_store::PersistedState {
         version: session_store::CURRENT_VERSION,
         windows: vec![good.clone(), ghost],
+        detached: Vec::new(),
     };
     let _ = std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap());
 

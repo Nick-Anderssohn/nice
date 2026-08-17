@@ -40,6 +40,27 @@ pub(crate) fn toggle_smooth_scroll(cx: &mut App, on: bool) {
     cx.refresh_windows();
 }
 
+/// The persisted detach-on-close value (tmux-port Phase 4, D1). Default **ON**;
+/// an absent store also reads ON, so a scenario-built app behaves like a
+/// default install.
+fn close_window_detaches_on(cx: &App) -> bool {
+    cx.try_global::<SettingsPrefsStore>()
+        .map(|s| s.close_window_detaches())
+        .unwrap_or(true)
+}
+
+/// Persist the detach-on-close toggle. No-op when the store is absent (the
+/// `toggle_smooth_scroll` fail-soft precedent). Nothing live has to be
+/// refreshed: the close path reads the setting at ⌘W time.
+pub(crate) fn toggle_close_window_detaches(cx: &mut App, on: bool) {
+    if cx.try_global::<SettingsPrefsStore>().is_some() {
+        let _ = cx
+            .global_mut::<SettingsPrefsStore>()
+            .set_close_window_detaches(on);
+    }
+    cx.refresh_windows();
+}
+
 /// The raw persisted `advanced.shell` path (`None` ⇒ Automatic, which is also
 /// what an absent store reads as).
 fn persisted_shell(cx: &App) -> Option<String> {
@@ -155,15 +176,18 @@ pub(crate) fn perform_pick_shell(cx: &mut App, path: Option<String>) {
 
 /// The Advanced pane body (The spec §Advanced). **Shell** first — the dropdown
 /// over [`shell_dropdown_items`], with the "new terminals only" promise in its ⓘ
-/// ([`shell_row_info`]) — then the "Smooth scrolling" [`toggle_switch`] (a11y
-/// `settings.advanced.smoothScrolling`; click → [`toggle_smooth_scroll`] with the
-/// flipped value).
+/// ([`shell_row_info`]) — then tmux-port Phase 4's "Closing a window detaches
+/// its running sessions" [`toggle_switch`] (a11y
+/// `settings.advanced.closeWindowDetaches`, default ON, D1) — then the "Smooth
+/// scrolling" [`toggle_switch`] (a11y `settings.advanced.smoothScrolling`;
+/// click → [`toggle_smooth_scroll`] with the flipped value).
 ///
 /// Takes `&mut Context<SettingsRootView>` rather than `&mut App` because the
 /// dropdown's open-menu state lives on the root view — the same shape the
 /// Claude / Font / Appearance panes already have.
 pub(crate) fn advanced_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     let on = smooth_scroll_on(cx);
+    let detaches = close_window_detaches_on(cx);
     // The ALREADY-resolved active profile's name: with Automatic selected it is
     // by definition what Automatic picked, which is what row 0 names.
     let automatic_name = crate::shell::active_display_name(cx);
@@ -188,6 +212,21 @@ pub(crate) fn advanced_pane(window: &mut Window, cx: &mut Context<SettingsRootVi
             "Shell",
             shell_row_info(&automatic_name),
             dropdown(SHELL_DROPDOWN_ID, current_label, items, window, cx),
+            cx,
+        ))
+        .child(setting_row_info(
+            "Closing a window detaches its running sessions",
+            "On: closing a window moves its running sessions to the Detached \
+             section instead of ending them, and skips the close confirmation. \
+             Off: closing asks first, then ends them.",
+            toggle_switch(
+                "settings.advanced.closeWindowDetaches",
+                detaches,
+                cx,
+                move |cx| {
+                    toggle_close_window_detaches(cx, !detaches);
+                },
+            ),
             cx,
         ))
         .child(setting_row(

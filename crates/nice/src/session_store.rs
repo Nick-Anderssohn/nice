@@ -17,6 +17,11 @@
 //! missing/corrupt/shape-mismatched file decodes to `{version:3, windows:[]}` —
 //! never an error, so the app always launches. Writes are `version: 3`.
 //!
+//! Phase 4 adds ONE top-level optional slot on the same terms:
+//! [`PersistedState::detached`], the app-global detached pool
+//! ([`PersistedDetachedSession`] rows, most recently detached first). Absent ⇒
+//! empty; empty ⇒ the key is not written at all.
+//!
 //! ## Store machinery (the observable contract — dossier §3.2)
 //!
 //! * (a) mutations never block — `upsert`/`remove`/`prune_empty_windows` update
@@ -69,7 +74,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use nice_model::PersistedProject;
+use nice_model::{PersistedProject, PersistedSession};
 
 /// The schema version R18 writes. v1/v2 files fail to decode and start fresh
 /// (the same one-off migration Swift accepted at the v2→v3 bump).
@@ -141,20 +146,70 @@ impl PersistedWindow {
     }
 }
 
+/// A detached session's project provenance (Phase 4, plan §P4). A **new
+/// 3-field frozen struct**, deliberately NOT [`PersistedProject`]: that type's
+/// required `tabs` array would make this shape a decode failure, and a decode
+/// failure degrades the WHOLE document to [`PersistedState::empty`] — wiping
+/// `sessions.json` on the next write (plan review I3).
+///
+/// The keys `id` / `name` / `path` freeze at ship, like the rest of v3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedDetachedProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// One row of the top-level `detached` bucket (Phase 4, plan §P4): the session
+/// subtree exactly as it is written inside `windows[]`, plus the project it was
+/// detached out of (so adoption can re-home it into whatever window takes it).
+///
+/// Array ORDER is the pool order — most recently detached first — so the
+/// adopt-latest chord pops the head. There is deliberately no timestamp and no
+/// source-window id: no consumer needs them, and both stay additive later.
+///
+/// **No `Eq`** — `PersistedSession` carries `f32` split ratios.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedDetachedSession {
+    pub project: PersistedDetachedProject,
+    pub session: PersistedSession,
+}
+
 /// The whole persisted document. `version` is written `3`; unknown future
 /// versions still decode (forward-compat) since there is no version gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedState {
     pub version: i64,
     pub windows: Vec<PersistedWindow>,
+    /// Phase 4's app-global detached pool. OPTIONAL + serde-default: an old
+    /// file with no `detached` key decodes to an empty pool, and an empty pool
+    /// writes no key at all — so a user who never detaches keeps a
+    /// byte-identical `sessions.json` (the `sidebarMode` / `sidebarWidth`
+    /// precedent; no `CURRENT_VERSION` bump — the schema is tolerant by SHAPE).
+    ///
+    /// **Downgrade honesty (plan review I2b):** the serializer here is a typed
+    /// struct with no unknown-key preservation, so an OLD build reading a new
+    /// file decodes fine but its first debounced write permanently deletes this
+    /// array. A release downgrade loses persisted detached rows. Accepted and
+    /// stated, not implied inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached: Vec<PersistedDetachedSession>,
 }
 
 impl PersistedState {
     /// The empty state a missing/corrupt/shape-mismatched file decodes to.
+    ///
+    /// The empty `detached` here is CORRECT (this constructs the empty
+    /// document, it does not rebuild an existing cache) — unlike the
+    /// `upsert`/`remove`/`prune` rebuild sites, which must CARRY the pool
+    /// forward or every window save would wipe the bucket (plan review I2a).
     pub fn empty() -> Self {
         PersistedState {
             version: CURRENT_VERSION,
             windows: Vec::new(),
+            detached: Vec::new(),
         }
     }
 }
@@ -334,9 +389,13 @@ impl SessionStore {
             Some(idx) => windows[idx] = window,
             None => windows.push(window),
         }
+        // CARRY the detached bucket forward (plan review I2a): rebuilding the
+        // literal with `Vec::new()` would wipe the pool on every window save.
+        let detached = std::mem::take(&mut inner.cached.detached);
         inner.cached = PersistedState {
             version: CURRENT_VERSION,
             windows,
+            detached,
         };
         self.mark_dirty_and_schedule(&mut inner);
     }
@@ -355,9 +414,12 @@ impl SessionStore {
             inner.cached.windows = windows;
             return;
         }
+        // CARRY the detached bucket forward (plan review I2a).
+        let detached = std::mem::take(&mut inner.cached.detached);
         inner.cached = PersistedState {
             version: CURRENT_VERSION,
             windows,
+            detached,
         };
         self.mark_dirty_and_schedule(&mut inner);
     }
@@ -384,11 +446,38 @@ impl SessionStore {
             inner.cached.windows = windows;
             return;
         }
+        // CARRY the detached bucket forward (plan review I2a).
+        let detached = std::mem::take(&mut inner.cached.detached);
         inner.cached = PersistedState {
             version: CURRENT_VERSION,
             windows,
+            detached,
         };
         self.mark_dirty_and_schedule(&mut inner);
+    }
+
+    /// Replace the whole `detached` bucket in the cache and schedule a debounced
+    /// write — the [`DetachedPool`](crate::detached_pool::DetachedPool)'s
+    /// write-through hook (plan §P6/I5). Every pool mutation calls this, so
+    /// EVERY existing flush point (`route_close_disk_fate`'s, `quit_cascade`'s,
+    /// `on_app_quit`'s, `Drop`'s) covers the pool for free — the plan's
+    /// "persist the pool" steps are ordering guarantees, not extra writes.
+    ///
+    /// No-op (no write scheduled) when the value is unchanged, matching
+    /// [`remove`](Self::remove)'s "a no-op must not schedule spurious I/O" rule.
+    pub fn set_detached(&self, detached: Vec<PersistedDetachedSession>) {
+        let mut inner = self.shared.inner.lock().unwrap();
+        if inner.cached.detached == detached {
+            return;
+        }
+        inner.cached.detached = detached;
+        self.mark_dirty_and_schedule(&mut inner);
+    }
+
+    /// The current `detached` bucket (the cache; no disk hit) — the pool's
+    /// read-at-launch source alongside [`load`](Self::load)'s `windows`.
+    pub fn detached(&self) -> Vec<PersistedDetachedSession> {
+        self.shared.inner.lock().unwrap().cached.detached.clone()
     }
 
     fn mark_dirty_and_schedule(&self, inner: &mut Inner) {
@@ -530,6 +619,27 @@ pub fn clear_global() {
     *global_cell().lock().unwrap() = None;
 }
 
+/// The mutex every test that INSTALLS the process store must hold for its whole
+/// body. The store global is process-wide while libtest runs cases on parallel
+/// threads, so two installers would clobber each other's `sessions.json`; this
+/// serializes just those tests instead of making the suite single-threaded.
+///
+/// It is the ONE such lock in the crate's test binary, deliberately: a per-module
+/// mutex only excludes its own module's tests, so the holders here
+/// (`app`'s BUGHUNT1-D acceptance tests, `window_registry`'s detach-close tests,
+/// and this module's own) must all take THIS one or they race each other.
+///
+/// Poisoning is recovered from deliberately: a panicking holder leaves the lock
+/// poisoned, but the next holder re-installs the store from scratch anyway, so
+/// refusing to run would only turn one failure into many.
+#[cfg(test)]
+pub(crate) fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Persistence hooks — each a NO-OP when no store is installed.
 pub fn upsert(window: PersistedWindow) {
     if let Some(store) = global() {
@@ -552,6 +662,15 @@ pub fn prune_empty_windows(keeping: &str) {
 pub fn prune_empty_windows_keeping(keeping: &[String]) {
     if let Some(store) = global() {
         store.prune_empty_windows_keeping(keeping);
+    }
+}
+
+/// Write the detached pool through into the store cache (debounced). A no-op
+/// when no store is installed — scenarios and `run_selftest` build pools with
+/// no persistence behind them.
+pub fn set_detached(detached: Vec<PersistedDetachedSession>) {
+    if let Some(store) = global() {
+        store.set_detached(detached);
     }
 }
 

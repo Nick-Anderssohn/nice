@@ -19,9 +19,40 @@ restart-stable) instead of app pid + nonce, and arbitrate ownership on bind
 with a connect probe.
 
 **Known gaps (deliberate):**
-- A session whose window is never restored still holds a dead path
-  (unchanged from roadmap). Revisit with Phase 4 adopt-into-window, which
-  re-homes sessions across windows anyway.
+- ~~A session whose window is never restored still holds a dead path.
+  Revisit with Phase 4 adopt-into-window.~~ **PARTLY CLOSED by Phase 4
+  (2026-08-16, `docs/plans/phase-4-detach-adopt-tearoff.md` §P11).** A
+  **structural** detached entry — the post-relaunch row, and a
+  model-alive-but-ptyless session — respawns on adopt-activate with the
+  ADOPTING window's env, so it gets a fresh live socket and never holds a
+  dead path again. That is the whole of what this gap named.
+
+  What Phase 4 did NOT close, because env is frozen at fork and nothing
+  re-stamps a live child, is a **live** pane that moved. Three shapes, each
+  failing differently, all accepted and all pointing at Phase 5's pane
+  addressing:
+  1. **Close-path detach → adopt: DEAD socket.** The source window closed,
+     so its path was unlinked and its slot removed; the id — and the path —
+     never recur. Handoff / dispatch / promotion from that pane fails
+     loudly ("no reply from control socket") until it respawns. The manual
+     `NICE_SOCKET=<live sock>` override is the bridge.
+  2. **Explicit detach (⌃⌘⇧D) from a window that stays open → adopt: LIVE
+     socket, wrong window, no session.** The source socket is healthy and
+     answers, but `NICE_TAB_ID` names a session that window no longer owns.
+     Phase 4 made that reply an explicit unknown-session error, so the
+     shell shadow falls back to `command claude` — never a partial
+     behaviour.
+  3. **Tear-off (⌃⌘N): LIVE socket, wrong window, and the session
+     RESOLVES.** Only the pane moved; the source session still exists in
+     the source window, so promotions light the SOURCE window's pill and
+     spawned Claude windows land there. This is break-pane's documented
+     `NICE_TAB_ID`/`NICE_PANE_ID` wart escalated from "wrong pill, same
+     window" to "wrong window entirely", and it is the shape a user hits
+     first.
+
+  Considered and deferred: having the adopting window additionally bind the
+  source window's stable path and route it. A real fix with real
+  complexity — Phase 5 candidate, recorded so it is not re-derived.
 - The fix only helps sessions forked AFTER the upgrade. Pre-upgrade
   sessions hold `nice-<oldpid>-<nonce>.sock` in their frozen env; that
   path never recurs under the new scheme, so the first post-upgrade

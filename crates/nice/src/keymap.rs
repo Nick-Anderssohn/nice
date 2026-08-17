@@ -74,6 +74,7 @@ use nice_term_view::FontSettings;
 use crate::app_shell::{
     min_ratio_for, split_available_px, PANE_DIVIDER_PX, PANE_MIN_HEIGHT, PANE_MIN_WIDTH,
 };
+use crate::pty_manager::DissolveTerminus;
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
@@ -121,6 +122,9 @@ gpui::actions!(
         SwapPaneRight,
         CopyMode,
         SearchScrollback,
+        DetachSession,
+        AdoptDetachedSession,
+        TearOffPane,
     ]
 );
 
@@ -484,6 +488,10 @@ fn register_window_scoped_actions(cx: &mut App) {
     // -- Phase 3 (tmux port): copy mode + scrollback search -------------------
     cx.on_action(|_: &CopyMode, cx: &mut App| toggle_copy_mode(cx));
     cx.on_action(|_: &SearchScrollback, cx: &mut App| open_scrollback_search(cx));
+    // -- Phase 4 (tmux port): detach ------------------------------------------
+    cx.on_action(|_: &DetachSession, cx: &mut App| detach_active_session(cx));
+    cx.on_action(|_: &AdoptDetachedSession, cx: &mut App| adopt_detached_session(cx));
+    cx.on_action(|_: &TearOffPane, cx: &mut App| tear_off_focused_pane(cx));
     cx.on_action(|action: &SelectWindowIndex, cx: &mut App| {
         let index = action.index;
         with_active_state(cx, |s, _cx| {
@@ -802,6 +810,172 @@ fn break_focused_pane(cx: &mut App) {
             session.switch_active_window(&new_window_id);
         });
         s.save_to_store();
+    });
+}
+
+// ===========================================================================
+// Phase 4 (tmux port) — detach
+// ===========================================================================
+
+/// `⌃⌘⇧D` — detach the ACTIVE session out of the active window into the
+/// app-global pool (tmux `detach-client` for one session, plan §P7). The session
+/// keeps running with no window; nothing is killed.
+///
+/// A no-op with no pool installed (`run_selftest` and the scenarios install none
+/// — the hermeticity rule) or with no active session, so the chord is consumed
+/// rather than leaking to the pty either way. The Settings ▸ Advanced
+/// detach-on-close toggle is deliberately NOT consulted: it governs what CLOSING
+/// a window does, not whether the explicit verb exists.
+pub(crate) fn detach_active_session(cx: &mut App) {
+    let Some(state) = WindowRegistry::active_state(cx, true) else {
+        return;
+    };
+    let Some(session_id) = state
+        .read(cx)
+        .workspace
+        .active_session_id()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    detach_session_from_window(cx, &state, &session_id);
+}
+
+/// Detach `session_id` out of `state`'s window, then apply §P7's terminus: a
+/// window whose LAST session just detached is now empty, so it closes through
+/// the normal window-close path.
+///
+/// Routing the close through `remove_window()` (rather than
+/// [`PtyManager::apply_dissolve_terminus`], which quits outright when it is the
+/// only window) is load-bearing under D5: the close observer's pool-aware
+/// quit check is what decides whether the app survives, and detaching the last
+/// session of the last window is exactly the case where a live pool must keep it
+/// alive. The removal is DEFERRED out of the entity lease — driving gpui's
+/// synchronous window-removal trail from inside one re-enters this same
+/// `WindowState` through the close observer and aborts the process.
+///
+/// Shared by the `⌃⌘⇧D` chord and the sidebar row's Detach Session menu item.
+pub(crate) fn detach_session_from_window(
+    cx: &mut App,
+    state: &Entity<WindowState>,
+    session_id: &str,
+) {
+    let Some(terminus) = crate::detached_pool::detach_into_pool(cx, state, session_id) else {
+        return;
+    };
+    if terminus != DissolveTerminus::WindowEmptied {
+        return;
+    }
+    // Drop the emptied window's disk slot (else it restores as a broken empty
+    // window next launch), set on the state BEFORE the defer.
+    state.update(cx, |ws, _cx| ws.mark_removed_if_window_emptied(terminus));
+    if let Some(handle) = state.read(cx).window_handle() {
+        cx.defer(move |app| {
+            let _ = handle.update(app, |_root, window, _app| window.remove_window());
+        });
+    }
+}
+
+/// `⌃⌘A` — adopt the most recently detached session (the pool HEAD) into the
+/// active window (tmux `attach-session`, plan §P8). The inverse of ⌃⌘⇧D: a live
+/// entry's ptys move back in with no respawn, a structural one rides the lazy
+/// spawn on activation.
+///
+/// A no-op with no pool installed, an empty pool, or no active window — the chord
+/// is still registered either way, so it is consumed rather than leaking to the
+/// pty.
+pub(crate) fn adopt_detached_session(cx: &mut App) {
+    let Some(state) = WindowRegistry::active_state(cx, true) else {
+        return;
+    };
+    crate::detached_pool::adopt_head_into(cx, &state);
+}
+
+/// `⌃⌘N` — move the focused pane into an OS window of its own (tmux
+/// `break-pane -d` + `move-window`, plan §P9 / D4). The pty MOVES: whatever was
+/// running keeps running, scrollback and all.
+///
+/// [`WindowState::tear_off_pane`] owns both extraction branches and every refusal
+/// (unknown ids, and the Claude pane — refused SILENTLY, exactly as ⌃⌘b's
+/// break-pane refuses it, so the two pane-to-window verbs behave the same way when
+/// they decline). This only routes the synthetic entry into the new window and
+/// applies the source window's terminus.
+///
+/// Two recoveries, neither of which may drop a live child:
+///
+/// * the window could not open ⇒ the entry comes back and the SOURCE window
+///   re-adopts it, so the pane reappears there as its own pill rather than dying.
+///   A source window the tear-off had emptied is re-populated and stays open, so
+///   the emptying's `user_initiated_close` latch is cleared again — otherwise a
+///   later non-user, non-quit close would drop a disk slot holding a live session;
+/// * tearing off the source window's LAST pane emptied it ⇒ it closes through the
+///   normal window-close path, the same routing the explicit detach uses (§P7), so
+///   the pool-aware quit check stays in charge of whether the app survives. The
+///   removal is DEFERRED out of the entity lease for the reason
+///   [`detach_session_from_window`] records.
+///
+/// [`WindowState::tear_off_pane`]: crate::window_state::WindowState::tear_off_pane
+pub(crate) fn tear_off_focused_pane(cx: &mut App) {
+    let Some(state) = WindowRegistry::active_state(cx, true) else {
+        return;
+    };
+    let Some((session_id, term_window_id, pane_id)) = ({
+        let s = state.read(cx);
+        active_session_window(s).and_then(|(session_id, term_window_id)| {
+            with_active_window(s, &session_id, &term_window_id, |w| w.effective_pane_id())
+                .map(|pane_id| (session_id, term_window_id, pane_id))
+        })
+    }) else {
+        return;
+    };
+
+    let Some((entry, terminus)) = state.update(cx, |ws, wcx| {
+        ws.tear_off_pane(&session_id, &term_window_id, &pane_id, wcx)
+    }) else {
+        return;
+    };
+
+    if let Err(entry) = crate::app::open_managed_window_adopting(cx, entry) {
+        return_torn_off_entry(cx, &state, entry, terminus);
+        return;
+    }
+
+    if terminus != DissolveTerminus::WindowEmptied {
+        return;
+    }
+    if let Some(handle) = state.read(cx).window_handle() {
+        cx.defer(move |app| {
+            let _ = handle.update(app, |_root, window, _app| window.remove_window());
+        });
+    }
+}
+
+/// The tear-off open-failure recovery: the pane is already out of its old pill,
+/// so hand it back to the window it came from rather than dropping a running
+/// child on the floor.
+///
+/// `terminus` is what the extraction reported. `WindowEmptied` means
+/// [`WindowState::tear_off_pane`] latched `user_initiated_close` (drop my disk
+/// slot on close) — but this window just took the pane back and is STAYING OPEN,
+/// so the latch is now wrong state: a later close that is neither user-initiated
+/// nor part of a quit would read it and drop a disk slot holding a live session.
+/// A successful re-adopt therefore undoes exactly what the emptying set, and
+/// nothing else (a refused re-adopt leaves the window as the tear-off left it).
+///
+/// Extracted from [`tear_off_focused_pane`] so the recovery is reachable in a
+/// test without having to make `open_window` fail.
+///
+/// [`WindowState::tear_off_pane`]: crate::window_state::WindowState::tear_off_pane
+fn return_torn_off_entry(
+    cx: &mut App,
+    state: &Entity<WindowState>,
+    entry: crate::detached_pool::DetachedEntry,
+    terminus: DissolveTerminus,
+) {
+    state.update(cx, |ws, wcx| {
+        if ws.adopt_entry(entry, wcx).is_ok() && terminus == DissolveTerminus::WindowEmptied {
+            ws.set_user_initiated_close(false);
+        }
     });
 }
 
@@ -1166,6 +1340,9 @@ fn shortcut_binding(
         ShortcutAction::SwapPaneRight => Box::new(SwapPaneRight),
         ShortcutAction::CopyMode => Box::new(CopyMode),
         ShortcutAction::SearchScrollback => Box::new(SearchScrollback),
+        ShortcutAction::DetachSession => Box::new(DetachSession),
+        ShortcutAction::AdoptDetachedSession => Box::new(AdoptDetachedSession),
+        ShortcutAction::TearOffPane => Box::new(TearOffPane),
         // Handled above — it is the one action that is not one binding.
         ShortcutAction::WindowByIndex => unreachable!("WindowByIndex expands via window_index_bindings"),
     };
@@ -1913,6 +2090,30 @@ mod tests {
                     .is_empty(),
                 "⌘C stays the terminal's copy, unbound in the keymap"
             );
+
+            // -- Phase 4 (detach) ------------------------------------------
+            // ⌃⌘⇧D joins the four pane-focus letters on the ⌃⌘⇧ rung. Bare
+            // ⌃⌘D is unusable — macOS's dictionary hotkey eats that keydown
+            // before the app sees it — and injected keystrokes enter
+            // downstream of that intercept, so THIS assertion proves the
+            // binding exists, never that the OS lets it through. That is a
+            // hand gate.
+            assert!(
+                bound(&DetachSession, "cmd-ctrl-shift-d"),
+                "⌃⌘⇧D detaches the active session"
+            );
+            // Its inverse sits on the BARE rung, where `a` was still free — no
+            // OS intercept in the way, so this binding is provable end to end.
+            assert!(
+                bound(&AdoptDetachedSession, "cmd-ctrl-a"),
+                "⌃⌘A adopts the pool head into the active window"
+            );
+            // "N = New window": the ⌃⌘ echo of ⌘N. The reservation on ⌘N is
+            // exact-combo, so the held-modifier rung's `n` was free.
+            assert!(
+                bound(&TearOffPane, "cmd-ctrl-n"),
+                "⌃⌘N tears the focused pane into a window of its own"
+            );
         });
     }
 
@@ -2280,5 +2481,269 @@ mod tests {
         // A pane that is not in the tree cannot be measured, so it is not
         // refused here — the split itself declines it.
         assert!(split_fits(&layout, "zzz", SplitOrient::Beside, content(10.0, 10.0)));
+    }
+}
+
+// ===========================================================================
+// Phase 4 (tmux port) — the detach action's handler behavior
+// ===========================================================================
+
+#[cfg(test)]
+mod detach_action_tests {
+    use super::{detach_active_session, detach_session_from_window};
+    use crate::detached_pool::{DetachedPool, DetachedPoolGlobal};
+    use crate::pty_manager::DissolveTerminus;
+    use crate::window_registry::WindowRegistry;
+    use crate::window_state::WindowState;
+    use gpui::{AppContext, Entity, TestAppContext};
+    use nice_model::{Session, TermWindow, TermWindowKind, WorkspaceModel};
+
+    /// A registered window with the seeded Terminals/Main session plus one extra
+    /// live project session, and an installed (empty) pool.
+    fn window_with_two_sessions(cx: &mut TestAppContext) -> Entity<WindowState> {
+        let mut model = WorkspaceModel::new("/home/u");
+        let pi = model.ensure_project("p", "P", "/home/u/proj");
+        let mut session = Session::new("t1", "Work", "/home/u/proj");
+        session.windows = vec![TermWindow::new("t1-w", "Terminal 1", TermWindowKind::Terminal)];
+        session.active_window_id = Some("t1-w".to_string());
+        model.projects[pi].sessions.push(session);
+        model.select_session("t1");
+
+        let state = cx.new(|_cx| WindowState::with_model(model));
+        let id = cx.add_window(|_w, _cx| gpui::Empty).window_id();
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+            WindowRegistry::register(app, id, state.clone());
+            let pool = app.new(|_cx| DetachedPool::new());
+            app.set_global(DetachedPoolGlobal(pool));
+        });
+        state
+    }
+
+    fn pooled_ids(cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|app| {
+            app.global::<DetachedPoolGlobal>()
+                .0
+                .read(app)
+                .entries()
+                .iter()
+                .map(|e| e.session.id.clone())
+                .collect()
+        })
+    }
+
+    /// Pool row titles in pool order — what an assertion about ORDER has to read,
+    /// since the ids are minted at detach.
+    fn pooled_titles(cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|app| {
+            app.global::<DetachedPoolGlobal>()
+                .0
+                .read(app)
+                .entries()
+                .iter()
+                .map(|e| e.session.title.clone())
+                .collect()
+        })
+    }
+
+    /// ⌃⌘⇧D pools the ACTIVE session, leaves the rest of the window alone, and
+    /// falls the active session back in navigable order. The pooled row carries a
+    /// FRESH id: a session is re-keyed on its way out of a window
+    /// ([`WindowState::detach_session`]), because the pool is app-global while a
+    /// `WorkspaceModel`'s ids are only unique inside one window.
+    #[gpui::test]
+    fn detach_action_pools_the_active_session(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        cx.update(detach_active_session);
+
+        let pooled = pooled_ids(cx);
+        assert_eq!(pooled.len(), 1, "one row on the pool: {pooled:?}");
+        assert_ne!(pooled[0], "t1", "re-keyed on the way out");
+        state.update(cx, |s, _cx| {
+            assert!(
+                s.workspace.session_for("t1").is_none(),
+                "the detached session left this window"
+            );
+            assert!(
+                s.workspace.session_for("terminals-main").is_some(),
+                "its neighbours stay attached"
+            );
+            assert_eq!(
+                s.workspace.active_session_id(),
+                Some("terminals-main"),
+                "the active session falls back in navigable order"
+            );
+        });
+    }
+
+    /// With no pool installed the chord is inert — it is still registered (so it
+    /// never leaks to the pty), but nothing is extracted. This is the shape every
+    /// scenario and `run_selftest` run in.
+    #[gpui::test]
+    fn detach_action_is_inert_without_a_pool(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        cx.update(|app| app.remove_global::<DetachedPoolGlobal>());
+        cx.update(detach_active_session);
+        state.update(cx, |s, _cx| {
+            assert!(
+                s.workspace.session_for("t1").is_some(),
+                "no pool ⇒ the chord changes nothing"
+            );
+        });
+    }
+
+    /// §P7: detaching the LAST session empties the window, which then closes
+    /// through the normal close path — so its disk slot is marked for removal
+    /// rather than restoring next launch as a broken empty window.
+    #[gpui::test]
+    fn detaching_the_last_session_marks_the_window_for_close(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        cx.update(|app| {
+            detach_session_from_window(app, &state, "t1");
+            assert!(
+                !state.read(app).user_initiated_close(),
+                "one of two sessions detached — the window stays"
+            );
+            detach_session_from_window(app, &state, "terminals-main");
+        });
+
+        let pooled = pooled_ids(cx);
+        assert_eq!(pooled.len(), 2, "both sessions pooled: {pooled:?}");
+        assert_ne!(pooled[0], pooled[1], "each row took its own fresh id");
+        // Ordering is asserted on the titles, since the ids are minted: the
+        // second detach is the head.
+        assert_eq!(
+            pooled_titles(cx),
+            vec!["Main".to_string(), "Work".to_string()],
+            "most recently detached first"
+        );
+        cx.update(|app| {
+            assert!(
+                state.read(app).user_initiated_close(),
+                "the emptied window is marked so its disk slot is dropped"
+            );
+        });
+    }
+
+    /// ⌃⌘N refuses the Claude pane, and refuses it BEFORE it opens anything —
+    /// the break-pane scope guard (§P9), silent exactly as ⌃⌘b's refusal is. A
+    /// Claude session moves whole through Detach ▸ Open in New Window instead.
+    #[gpui::test]
+    fn tear_off_action_refuses_a_claude_pane(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        state.update(cx, |s, _cx| {
+            s.workspace.mutate_session("t1", |session| {
+                let window = session.windows.iter_mut().find(|w| w.id == "t1-w").unwrap();
+                window.kind = TermWindowKind::Claude;
+                window.layout = nice_model::PaneLayout::single(nice_model::Pane::new(
+                    "t1-w",
+                    TermWindowKind::Claude,
+                ));
+            });
+        });
+
+        cx.update(super::tear_off_focused_pane);
+
+        state.update(cx, |s, _cx| {
+            let session = s
+                .workspace
+                .session_for("t1")
+                .expect("the refused session is untouched");
+            assert_eq!(session.windows.len(), 1, "its pill never left");
+            assert_eq!(session.windows[0].layout.leaf_count(), 1);
+        });
+    }
+
+    /// The tear-off open-failure recovery on a source window the tear-off had
+    /// EMPTIED: the pane comes back, and the `user_initiated_close` latch the
+    /// emptying set comes off with it. Left latched, a later non-user, non-quit
+    /// close of this (re-populated, still-open) window would drop a disk slot that
+    /// holds a live session.
+    #[gpui::test]
+    fn tear_off_recovery_unlatches_the_emptied_source_window(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        // Leave exactly one session, so tearing off its only pane empties the window.
+        cx.update(|app| detach_session_from_window(app, &state, "t1"));
+
+        let (window_id, pane_id) = state.read_with(cx, |s, _cx| {
+            let window = &s.workspace.session_for("terminals-main").unwrap().windows[0];
+            (window.id.clone(), window.effective_pane_id())
+        });
+        let (entry, terminus) = state
+            .update(cx, |ws, wcx| {
+                ws.tear_off_pane("terminals-main", &window_id, &pane_id, wcx)
+            })
+            .expect("the only pane tears off");
+        assert_eq!(
+            terminus,
+            DissolveTerminus::WindowEmptied,
+            "its last session dissolved with it"
+        );
+        let torn_off = entry.session.id.clone();
+        cx.update(|app| {
+            assert!(
+                state.read(app).user_initiated_close(),
+                "the emptying latched the drop-my-disk-slot flag"
+            );
+            // The new window could not open: the entry comes home.
+            super::return_torn_off_entry(app, &state, entry, terminus);
+        });
+
+        state.update(cx, |s, _cx| {
+            assert!(
+                s.workspace.session_for(&torn_off).is_some(),
+                "the pane is back in the window it came from"
+            );
+            assert!(
+                !s.user_initiated_close(),
+                "the window is re-populated and staying open — the latch is off"
+            );
+        });
+    }
+
+    /// ⌃⌘A adopts the pool HEAD into the active window — the round trip through
+    /// both chords, which is the shape the hand gate exercises.
+    #[gpui::test]
+    fn adopt_action_pulls_the_pool_head_into_the_active_window(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        cx.update(detach_active_session);
+        let pooled = pooled_ids(cx);
+        assert_eq!(pooled.len(), 1, "one row on the pool: {pooled:?}");
+        let detached = pooled[0].clone();
+
+        cx.update(super::adopt_detached_session);
+        assert!(pooled_ids(cx).is_empty(), "the head left the pool");
+        state.update(cx, |s, _cx| {
+            assert!(
+                s.workspace.session_for(&detached).is_some(),
+                "it came back to the window it left"
+            );
+            assert_eq!(
+                s.workspace.active_session_id(),
+                Some(detached.as_str()),
+                "and it is selected"
+            );
+        });
+    }
+
+    /// The chord is inert on an empty pool and with no pool installed — it is
+    /// still registered either way, so it is consumed rather than leaking to the
+    /// pty.
+    #[gpui::test]
+    fn adopt_action_is_inert_without_anything_to_adopt(cx: &mut TestAppContext) {
+        let state = window_with_two_sessions(cx);
+        let before = state.read_with(cx, |s, _| s.workspace.navigable_sidebar_session_ids());
+
+        cx.update(super::adopt_detached_session);
+        cx.update(|app| app.remove_global::<DetachedPoolGlobal>());
+        cx.update(super::adopt_detached_session);
+
+        state.update(cx, |s, _cx| {
+            assert_eq!(
+                s.workspace.navigable_sidebar_session_ids(),
+                before,
+                "nothing to adopt ⇒ nothing changes"
+            );
+        });
     }
 }
