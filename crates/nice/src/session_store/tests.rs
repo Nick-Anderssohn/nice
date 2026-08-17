@@ -195,6 +195,7 @@ fn sidebar_mode_round_trips_and_defaults_absent() {
     let state = PersistedState {
         version: CURRENT_VERSION,
         windows: vec![w],
+        detached: Vec::new(),
     };
     let bytes = serialize_state(&state).unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
@@ -226,6 +227,7 @@ fn sidebar_width_round_trips_and_defaults_absent() {
     let state = PersistedState {
         version: CURRENT_VERSION,
         windows: vec![w],
+        detached: Vec::new(),
     };
     let bytes = serialize_state(&state).unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
@@ -864,8 +866,10 @@ fn open_absent_own_yields_empty_no_file() {
 
 #[test]
 fn global_routing_then_absent_is_noop() {
-    // Single test owns the process Global (no other test installs it), so this
-    // is race-free under libtest's parallelism.
+    // The process Global is shared across libtest's threads, so every test that
+    // installs it holds this lock for its whole body (see `global_test_lock`) —
+    // the Phase-4 close-path ordering seam is the second such installer.
+    let _serialize = super::global_test_lock();
     clear_global();
     assert!(global().is_none());
     // Absent ⇒ every hook is a no-op and load() is empty.
@@ -994,4 +998,151 @@ fn re_serializing_pre_rename_fixture_is_byte_identical() {
         "the v3 key spellings are frozen: re-writing a pre-rename file must not \
          change a single byte"
     );
+}
+
+// MARK: - the Phase 4 `detached` bucket (plan §P4)
+
+/// The detached row a bucket test writes: a Claude session with one pill, so
+/// the frozen v3 leaf spellings (`panes`, `activePaneId`) are pinned INSIDE the
+/// new bucket too.
+fn make_detached_row(session_id: &str) -> PersistedDetachedSession {
+    PersistedDetachedSession {
+        project: PersistedDetachedProject {
+            id: "proj-nice".into(),
+            name: "nice".into(),
+            path: "/Users/nick/Projects/nice".into(),
+        },
+        session: PersistedSession {
+            id: session_id.into(),
+            title: "Fix top bar height".into(),
+            cwd: "/Users/nick/Projects/nice".into(),
+            claude_session_id: Some("e4f1a2b3-c0d4-4e5f-9a0b-1c2d3e4f5a6b".into()),
+            active_window_id: Some("p1".into()),
+            windows: vec![PersistedTermWindow {
+                id: "p1".into(),
+                title: "Claude".into(),
+                kind: TermWindowKind::Claude,
+                cwd: None,
+                title_manually_set: None,
+                layout: None,
+                active_leaf_id: None,
+            }],
+            title_manually_set: None,
+            parent_session_id: None,
+            next_terminal_index: None,
+        },
+    }
+}
+
+/// FROZEN-STRING gate for every key Phase 4 introduces: the top-level
+/// `detached` array, each row's `project` object, and that object's
+/// `id`/`name`/`path`. A rename without a matching `#[serde(rename = "…")]`
+/// fails here — and the row's own session keeps the frozen v3 leaf spellings
+/// (`panes`, `activePaneId`), because it IS a `PersistedSession`.
+#[test]
+fn detached_bucket_pins_its_frozen_keys() {
+    let state = PersistedState {
+        version: CURRENT_VERSION,
+        windows: vec![],
+        detached: vec![make_detached_row("t-detached")],
+    };
+    let text = String::from_utf8(serialize_state(&state).unwrap()).unwrap();
+
+    assert!(text.contains("\"detached\": ["), "the bucket key: {text}");
+    assert!(text.contains("\"project\": {"), "the provenance key: {text}");
+    assert!(text.contains("\"id\": \"proj-nice\""), "project id: {text}");
+    assert!(text.contains("\"name\": \"nice\""), "project name: {text}");
+    assert!(
+        text.contains("\"path\": \"/Users/nick/Projects/nice\""),
+        "project path: {text}"
+    );
+    assert!(text.contains("\"session\": {"), "the session key: {text}");
+    assert!(
+        text.contains("\"panes\": ["),
+        "the row's session keeps the frozen v3 `panes` spelling: {text}"
+    );
+    assert!(
+        text.contains("\"activePaneId\": \"p1\""),
+        "the row's session keeps the frozen v3 `activePaneId` spelling: {text}"
+    );
+
+    let decoded: PersistedState = serde_json::from_slice(&serialize_state(&state).unwrap()).unwrap();
+    assert_eq!(decoded, state, "the bucket round-trips exactly");
+}
+
+/// Old-file tolerance: a v3 document with no `detached` key decodes to an empty
+/// bucket, and an empty bucket writes NO key — so a user who never detaches
+/// keeps a byte-identical `sessions.json` (the `sidebarMode`/`sidebarWidth`
+/// slot pattern).
+#[test]
+fn absent_detached_key_decodes_empty_and_empty_writes_no_key() {
+    let legacy = r#"{"version":3,"windows":[{"id":"w","sidebarCollapsed":false,"projects":[]}]}"#;
+    let decoded: PersistedState = serde_json::from_str(legacy).unwrap();
+    assert!(decoded.detached.is_empty(), "absent ⇒ empty pool");
+
+    let text = String::from_utf8(serialize_state(&decoded).unwrap()).unwrap();
+    assert!(
+        !text.contains("detached"),
+        "an empty pool writes no key at all: {text}"
+    );
+}
+
+/// The I2a pin: the detached bucket SURVIVES every cache-rebuilding window
+/// write. `upsert`, `remove` and `prune_empty_windows_keeping` each rebuild the
+/// cache as a fresh `PersistedState` literal — carrying `Vec::new()` there
+/// instead of the live value would silently wipe the pool on the next window
+/// save.
+#[test]
+fn detached_bucket_survives_window_writes() {
+    let (store, _writes, _rx) = recorder_store(Duration::ZERO);
+    let row = make_detached_row("t-detached");
+    store.set_detached(vec![row.clone()]);
+    assert_eq!(store.detached(), vec![row.clone()]);
+
+    store.upsert(make_window("w1", vec![make_persisted_session("s1")]));
+    assert_eq!(store.load().detached, vec![row.clone()], "upsert carried it");
+
+    store.upsert(make_window("w2", vec![]));
+    store.prune_empty_windows_keeping(&["w1".to_string()]);
+    assert_eq!(store.load().detached, vec![row.clone()], "prune carried it");
+
+    store.remove("w1");
+    assert_eq!(store.load().detached, vec![row.clone()], "remove carried it");
+    assert!(store.load().windows.is_empty(), "the windows really did go");
+}
+
+/// `set_detached` schedules a write when the bucket changes and is a silent
+/// no-op when it does not (the `remove` "no spurious I/O" rule) — and the
+/// written snapshot carries the bucket, which is what makes every existing
+/// flush point cover the pool for free (plan review I5).
+#[test]
+fn set_detached_writes_through_and_no_ops_when_unchanged() {
+    let (store, writes, rx) = recorder_store(Duration::ZERO);
+    let row = make_detached_row("t-detached");
+
+    store.set_detached(vec![row.clone()]);
+    store.flush();
+    rx.recv_timeout(Duration::from_secs(5)).expect("a write fired");
+    {
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 1, "the pool write reached the writer thread");
+        assert_eq!(w[0].snapshot.detached, vec![row.clone()]);
+    }
+
+    store.set_detached(vec![row.clone()]);
+    store.flush();
+    assert_eq!(
+        writes.lock().unwrap().len(),
+        1,
+        "re-setting the identical bucket must not schedule a second write"
+    );
+
+    store.set_detached(Vec::new());
+    store.flush();
+    rx.recv_timeout(Duration::from_secs(5)).expect("the clear fired");
+    {
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 2);
+        assert!(w[1].snapshot.detached.is_empty(), "adoption emptied the pool");
+    }
 }

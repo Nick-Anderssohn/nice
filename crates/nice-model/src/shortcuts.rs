@@ -34,7 +34,7 @@
 /// case here extends [`ShortcutAction::ALL`] (which the completeness test pins
 /// against [`default_bindings`]) and the recorder list R24 iterates.
 ///
-/// The set is intentionally exactly these 34 — the actions Nice lets a user
+/// The set is intentionally exactly these 39 — the actions Nice lets a user
 /// rebind. Window-management accelerators that are *not* rebindable (New Window
 /// ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent: they live as fixed menu
 /// actions in `crates/nice`, not in this table.
@@ -183,6 +183,24 @@ pub enum ShortcutAction {
     /// there. The default direction is BACKWARD — the flagship "find what
     /// scrolled past" direction.
     SearchScrollback,
+    // -- Phase 4 (tmux port): detach / adopt ---------------------------------
+    /// Detach the active session out of its window into the app-global pool
+    /// (⌃⌘⇧D) — tmux `detach-client` for one session. "D = Detach", placed on
+    /// the ⌃⌘⇧ rung because BARE ⌃⌘D never reaches the app: macOS's
+    /// dictionary-lookup hotkey swallows that keydown (the same OS intercept
+    /// that moved [`ScrollHalfPageDown`](Self::ScrollHalfPageDown) onto the
+    /// arrows). The session keeps running with no window; adopting it back is
+    /// the pool's job.
+    DetachSession,
+    /// Adopt the most recently detached session out of the app-global pool into
+    /// the active window (⌃⌘A) — tmux `attach-session` aimed at the pool head.
+    /// "A = Attach", free on the bare ⌃⌘ rung. A no-op on an empty pool.
+    AdoptDetachedSession,
+    /// Move the focused pane into an OS window of its own (⌃⌘N) — tmux
+    /// `break-pane -d` + `move-window`. "N = New window", pairing with ⌘N on the
+    /// ⌃⌘ rung; the reservations are exact-combo, so ⌘N's does not cover it.
+    /// Refuses the Claude pane exactly as [`BreakPane`](Self::BreakPane) does.
+    TearOffPane,
 }
 
 /// The nine key tokens the single [`ShortcutAction::WindowByIndex`] row expands
@@ -207,7 +225,7 @@ impl ShortcutAction {
     /// Every action, in a stable order. Used by the completeness test and by
     /// R24's recorder (which renders one row per action). The order matches the
     /// enum declaration and Swift's `allCases`.
-    pub const ALL: [ShortcutAction; 36] = [
+    pub const ALL: [ShortcutAction; 39] = [
         ShortcutAction::NextSidebarSession,
         ShortcutAction::PrevSidebarSession,
         ShortcutAction::NextWindow,
@@ -246,6 +264,10 @@ impl ShortcutAction {
         // Phase 3 (copy mode + search).
         ShortcutAction::CopyMode,
         ShortcutAction::SearchScrollback,
+        // Phase 4 (detach / adopt / tear-off).
+        ShortcutAction::DetachSession,
+        ShortcutAction::AdoptDetachedSession,
+        ShortcutAction::TearOffPane,
     ];
 
     /// Human-readable label for the (future) recorder row. Ported verbatim from
@@ -293,6 +315,10 @@ impl ShortcutAction {
             // Phase 3 (copy mode + search) — same pane-family capitalization.
             ShortcutAction::CopyMode => "Copy Mode",
             ShortcutAction::SearchScrollback => "Search Scrollback",
+            // Phase 4 (detach / adopt) — same pane-family capitalization.
+            ShortcutAction::DetachSession => "Detach Session",
+            ShortcutAction::AdoptDetachedSession => "Adopt Detached Session",
+            ShortcutAction::TearOffPane => "Tear Off Pane to Window",
         }
     }
 
@@ -373,6 +399,10 @@ impl ShortcutAction {
             // Phase 3 (tmux port) — additive again, same load rule 5.
             ShortcutAction::CopyMode => "copyMode",
             ShortcutAction::SearchScrollback => "searchScrollback",
+            // Phase 4 (tmux port) — additive again, same load rule 5.
+            ShortcutAction::DetachSession => "detachSession",
+            ShortcutAction::AdoptDetachedSession => "adoptDetachedSession",
+            ShortcutAction::TearOffPane => "tearOffPane",
         }
     }
 
@@ -507,7 +537,7 @@ impl KeyCombo {
 /// with the pane verbs that have no direction (`⌃⌘-`, `⌃⌘\`, `⌃⌘z`, `⌃⌘b`) on
 /// the bare rung. Phase 3 adds two more of those: `⌃⌘c` (copy mode) and `⌃⌘/`
 /// (search scrollback).
-pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 36] {
+pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 39] {
     use ShortcutAction::*;
     [
         // The ladder's bare-⌃⌘ rung, vertical axis: j = down the sidebar list
@@ -790,6 +820,37 @@ pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 36] {
             KeyCombo {
                 modifiers: Modifiers::CONTROL_COMMAND,
                 key: "/",
+            },
+        ),
+        // -- Phase 4 (tmux port): detach ------------------------------------
+        // "D = Detach" on the ⌃⌘⇧ rung, whose only other tenants are the four
+        // pane-focus letters. BARE ⌃⌘D is unusable: macOS's dictionary hotkey
+        // eats that keydown before the app sees it. The shift variant is
+        // expected to survive, but injected keystrokes enter downstream of the
+        // OS intercept, so only a hand press can prove it.
+        (
+            DetachSession,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND_SHIFT,
+                key: "d",
+            },
+        ),
+        // "A = Attach" on the BARE rung, which still has `a` free. The inverse
+        // verb of the row above, so the two read as a pair in the recorder.
+        (
+            AdoptDetachedSession,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "a",
+            },
+        ),
+        // "N = New window", the ⌃⌘ echo of ⌘N. `n` is free on the bare rung:
+        // RESERVED_NEW_WINDOW claims the exact combo ⌘N, not the key.
+        (
+            TearOffPane,
+            KeyCombo {
+                modifiers: Modifiers::CONTROL_COMMAND,
+                key: "n",
             },
         ),
     ]
@@ -1144,11 +1205,11 @@ mod tests {
     #[test]
     fn table_is_complete_every_action_bound_exactly_once() {
         let table = default_bindings();
-        assert_eq!(table.len(), 36, "36 rebindable actions");
+        assert_eq!(table.len(), 39, "39 rebindable actions");
         assert_eq!(
             ShortcutAction::ALL.len(),
-            36,
-            "ALL enumerates all 36 actions"
+            39,
+            "ALL enumerates all 39 actions"
         );
         // Every action in ALL appears exactly once as a table key.
         for action in ShortcutAction::ALL {
@@ -1233,6 +1294,10 @@ mod tests {
         // -- Phase 3 (copy mode + search) -------------------------------------
         assert_eq!(combo(ShortcutAction::CopyMode), "cmd-ctrl-c");
         assert_eq!(combo(ShortcutAction::SearchScrollback), "cmd-ctrl-/");
+        // -- Phase 4 (detach / adopt / tear-off) ------------------------------
+        assert_eq!(combo(ShortcutAction::DetachSession), "cmd-ctrl-shift-d");
+        assert_eq!(combo(ShortcutAction::AdoptDetachedSession), "cmd-ctrl-a");
+        assert_eq!(combo(ShortcutAction::TearOffPane), "cmd-ctrl-n");
     }
 
     /// The pane family's ids, spelled out — they are persistence keys the moment
@@ -1252,6 +1317,13 @@ mod tests {
             (ShortcutAction::SwapPaneDown, "swapPaneDown"),
             (ShortcutAction::SwapPaneUp, "swapPaneUp"),
             (ShortcutAction::SwapPaneRight, "swapPaneRight"),
+            // Phase 4's ids freeze on the same terms.
+            (ShortcutAction::DetachSession, "detachSession"),
+            (
+                ShortcutAction::AdoptDetachedSession,
+                "adoptDetachedSession",
+            ),
+            (ShortcutAction::TearOffPane, "tearOffPane"),
         ] {
             assert_eq!(action.id(), id);
             assert_eq!(ShortcutAction::from_id(id), Some(action));

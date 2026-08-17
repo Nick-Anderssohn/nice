@@ -109,6 +109,9 @@ gpui::actions!(
         // is that ⌃⌘C and ⌃⌘/ parse into gpui bindings.
         CopyMode,
         SearchScrollback,
+        DetachSession,
+        AdoptDetachedSession,
+        TearOffPane,
     ]
 );
 
@@ -426,6 +429,12 @@ fn register_window_scoped_actions(cx: &mut App) {
     // Phase 3's copy-mode verbs — registered for the same reason.
     cx.on_action(|_: &CopyMode, _cx: &mut App| {});
     cx.on_action(|_: &SearchScrollback, _cx: &mut App| {});
+    // Phase 4's detach / adopt / tear-off verbs — registered so their chords are
+    // consumed, not routed (the probe app has no detached pool and no panes to
+    // tear off).
+    cx.on_action(|_: &DetachSession, _cx: &mut App| {});
+    cx.on_action(|_: &AdoptDetachedSession, _cx: &mut App| {});
+    cx.on_action(|_: &TearOffPane, _cx: &mut App| {});
 }
 
 /// Route a window-scoped action to the key window's state (mirror of
@@ -492,6 +501,11 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
         ShortcutAction::SwapPaneRight => KeyBinding::new(chord, SwapPaneRight, None),
         ShortcutAction::CopyMode => KeyBinding::new(chord, CopyMode, None),
         ShortcutAction::SearchScrollback => KeyBinding::new(chord, SearchScrollback, None),
+        ShortcutAction::DetachSession => KeyBinding::new(chord, DetachSession, None),
+        ShortcutAction::AdoptDetachedSession => {
+            KeyBinding::new(chord, AdoptDetachedSession, None)
+        }
+        ShortcutAction::TearOffPane => KeyBinding::new(chord, TearOffPane, None),
     }
 }
 

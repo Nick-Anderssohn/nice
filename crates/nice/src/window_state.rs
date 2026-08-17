@@ -106,6 +106,17 @@ fn mint_window_session_id() -> String {
     mint_session_uuid()
 }
 
+/// The `claude` reply for a request whose `NICE_TAB_ID` names a session this
+/// window does not own (tmux-port Phase 4 §P11 shape 2).
+///
+/// It is deliberately NOT one of the four protocol verbs (`newtab` / `inplace` /
+/// `attach` / `resume`): both shell shadows route an unrecognized first field
+/// through their catch-all arm, which prints the reply verbatim on stderr and
+/// then `exec command claude "$@"`. So the user still gets Claude — loudly, in
+/// the pane they typed in — instead of a silent session opening in some other
+/// window. The second field names the reason so the stderr line is diagnosable.
+const UNKNOWN_SESSION_REPLY: &str = "error unknown-session";
+
 /// A deferred `newtab` spawn request returned by
 /// [`WindowState::resolve_claude_request`] — the `newtab` reply has already gone
 /// out, and the gpui-context-carrying caller must build + spawn the Claude session.
@@ -1437,7 +1448,9 @@ impl WindowState {
     /// (Swift `handleClaudeSocketRequest:834-910`). Replies exactly once. Returns
     /// `Some(NewSessionSpawn)` when the caller must build + spawn a fresh Claude session
     /// (the `newtab` reply already went out); `None` when it promoted in place (the
-    /// model mutation is applied and the `inplace…` reply already went out).
+    /// model mutation is applied and the `inplace…` reply already went out) or when
+    /// the request named a session this window does not own (the
+    /// [`UNKNOWN_SESSION_REPLY`] already went out).
     fn resolve_claude_request(
         &mut self,
         cwd: &str,
@@ -1446,9 +1459,27 @@ impl WindowState {
         term_window_id: &str,
         reply: Reply,
     ) -> Option<NewSessionSpawn> {
+        // tmux-port Phase 4 (§P11 shape 2): a NAMED session this window does not
+        // own is an explicit ERROR, not a newtab.
+        //
+        // Env is frozen at fork, so a pane detached out of a window that STAYS
+        // OPEN keeps pointing `NICE_SOCKET` at that window while its `NICE_TAB_ID`
+        // names a session the window no longer has. Answering `newtab` there
+        // would silently open a Claude session in the WRONG window — a partial
+        // behaviour with no failure signal, in a window the user is not even
+        // looking at. An error reply falls through the shadow's catch-all arm to
+        // `command claude`, which honours the "the user always gets claude"
+        // contract loudly.
+        //
+        // An EMPTY tab id is untouched: that is the Main-terminal signal for
+        // "always open a new sidebar session", not a stale pointer.
+        if !session_id.is_empty() && self.workspace.session_for(session_id).is_none() {
+            reply.send(UNKNOWN_SESSION_REPLY);
+            return None;
+        }
         // Decision: promote in place ONLY when the request names a real window in a
         // known, non-Terminals session that has NO running Claude; else open a new session
-        // (empty/unknown tabId, a Terminals-group session, a stale paneId, or the
+        // (empty tabId, a Terminals-group session, a stale paneId, or the
         // ≤1-Claude-per-session guard).
         let known = !session_id.is_empty() && self.workspace.session_for(session_id).is_some();
         let is_terminals = self.workspace.is_terminals_project_session(session_id);
@@ -2397,8 +2428,10 @@ impl WindowState {
     }
 
     /// Flip the user-initiated-close flag (the confirmed red-button / ⌘W path, or
-    /// the no-live-windows unconditional close). Only ever set to `true`; a window
-    /// that stays open (Cancel) leaves it `false`.
+    /// the no-live-windows unconditional close). A window that stays open (Cancel)
+    /// leaves it `false`. The one `false` write is the tear-off recovery
+    /// (`keymap::tear_off_focused_pane`): the emptied source window took its pane
+    /// back and is staying open, so the latch the emptying set must come off again.
     pub(crate) fn set_user_initiated_close(&mut self, value: bool) {
         self.user_initiated_close = value;
     }
@@ -2583,6 +2616,298 @@ impl WindowState {
         for session_id in self.ptys.take_dissolved_session_ids() {
             self.file_browser.remove_state(&session_id);
         }
+    }
+
+    // MARK: - Detach (tmux-port Phase 4, plan §P6)
+
+    /// Extract `session_id` out of this window as a
+    /// [`DetachedEntry`](crate::detached_pool::DetachedEntry) — the model subtree,
+    /// its LIVE pty payload, and the project it came out of — leaving the window
+    /// otherwise intact. `None` for a session this window does not own.
+    ///
+    /// This is deliberately NOT a dissolve. Nothing is killed: the model subtree
+    /// travels out whole and
+    /// [`PtyManager::take_session`](crate::pty_manager::PtyManager::take_session)
+    /// moves the live entities rather than dropping them, so the children never
+    /// notice. Both detach doors share it — the close-path bulk detach
+    /// ([`crate::window_registry::WindowRegistry::route_close_disk_fate`]) and the
+    /// explicit Detach Session action.
+    ///
+    /// **The WindowState-side scrub** (plan §P6; the pty-side list lives on
+    /// `take_session`). It is what makes the EXPLICIT detach safe on a window that
+    /// stays open — the close path would get most of it free from
+    /// [`teardown`](Self::teardown):
+    ///
+    /// * the selection is pruned against the shrunken navigable set (the
+    ///   dissolve-cascade rule), and the active session falls back in navigable
+    ///   order when the detached one held it;
+    /// * the session's `file_browser` state is dropped — a leaked entry would
+    ///   resurrect stale browser state if the same session were re-adopted here;
+    /// * the search bar closes when it was searching a pane of this session;
+    /// * the subscription ensure pass runs SYNCHRONOUSLY in this same update. On
+    ///   detach that is hygiene (a stale subscription early-returns at its model
+    ///   lookup, before any arm that could act); the HARD requirement is on the
+    ///   adopt side, per the pass's own arming-site rule.
+    ///
+    /// **The session is RE-KEYED on the way out.** A `WorkspaceModel` only
+    /// guarantees session ids unique inside ONE window, and every fresh window
+    /// seeds the same constant `terminals-main`
+    /// ([`WorkspaceModel::MAIN_TERMINAL_SESSION_ID`]) — so the pool, which is
+    /// app-global, is the first place in Nice where two windows' ids share a
+    /// namespace. Left alone, the everyday flow breaks three ways: adopting a
+    /// pooled `terminals-main` into any window that seeded its own is refused by
+    /// the duplicate-id guard (a dead click), two windows detaching their Mains
+    /// put two rows with the SAME id in the pool, and the launch reconcile then
+    /// collapses those two rows into one — silently destroying a detached
+    /// session's record. Minting here closes all three at the one boundary that
+    /// creates the problem, and makes `adopt_entry`'s guard the belt-and-braces
+    /// check it was written as.
+    ///
+    /// Nothing outside the model keys on the old value: session ids are internal
+    /// (`NICE_TAB_ID` is frozen in the child's env at fork whatever we do — §P11),
+    /// the pool's persisted row carries the new id, and a `/branch` child's
+    /// `parent_session_id` is swept by `remove_session` on the way past. It is the
+    /// same mint tear-off's synthetic session already takes.
+    ///
+    /// The returned [`DissolveTerminus`] reports whether that left the window with
+    /// no sessions at all. The close path ignores it (the window is already
+    /// going); the explicit action closes the window through the normal close path
+    /// (plan §P7), which is what keeps the pool-aware quit check in charge of
+    /// whether the app survives.
+    pub(crate) fn detach_session(
+        &mut self,
+        session_id: &str,
+        cx: &mut gpui::Context<WindowState>,
+    ) -> Option<(crate::detached_pool::DetachedEntry, DissolveTerminus)> {
+        let (pi, ti) = self.workspace.project_session_index(session_id)?;
+        let project = crate::detached_pool::DetachedProject {
+            id: self.workspace.projects[pi].id.clone(),
+            name: self.workspace.projects[pi].name.clone(),
+            path: self.workspace.projects[pi].path.clone(),
+        };
+        // Model side: the single removal entry point (array remove + the
+        // parent-pointer sweep, so no `/branch` child is left orphaned).
+        let mut session = self.workspace.remove_session(pi, ti);
+        // Pty side: MOVE, never drop.
+        let ptys = self.ptys.take_session(session_id);
+        // The leaving session takes a PROCESS-UNIQUE id (see the doc comment's
+        // "re-keyed on the way out"). Minted from the same seam tear-off's
+        // synthetic session uses, so an injected test mint drives both.
+        session.id = self.ptys.mint_session_id("t");
+
+        // -- the WindowState-side scrub ------------------------------------
+        let valid: HashSet<String> = self
+            .workspace
+            .navigable_sidebar_session_ids()
+            .into_iter()
+            .collect();
+        self.selection.prune(&valid);
+        self.file_browser.remove_state(session_id);
+        if self
+            .search_bar
+            .as_ref()
+            .is_some_and(|bar| bar.session_id == session_id)
+        {
+            self.search_bar = None;
+        }
+        if self.workspace.active_session_id() == Some(session_id) {
+            if let Some(fallback) = self
+                .workspace
+                .navigable_sidebar_session_ids()
+                .into_iter()
+                .next()
+            {
+                self.workspace.select_session(&fallback);
+            }
+            // else: no navigable session remains — the window is empty and the
+            // caller closes it (the same "leaving the stale id is harmless"
+            // reasoning the dissolve cascade records).
+        }
+        // Retire the detached panes' subscriptions in this same update.
+        self.subscribe_spawned_windows(cx);
+        self.save_to_store();
+
+        let terminus = if self.workspace.projects.iter().all(|p| p.sessions.is_empty()) {
+            DissolveTerminus::WindowEmptied
+        } else {
+            DissolveTerminus::None
+        };
+        Some((
+            crate::detached_pool::DetachedEntry {
+                session,
+                ptys,
+                project,
+            },
+            terminus,
+        ))
+    }
+
+    /// Tear one pane out of this window as a synthetic
+    /// [`DetachedEntry`](crate::detached_pool::DetachedEntry) that a brand-new OS
+    /// window adopts (plan §P9). `None` when the extraction refused (an unknown
+    /// session / pill / pane, or a Claude pane — see
+    /// [`PtyManager::tear_off_pane`](crate::pty_manager::PtyManager::tear_off_pane),
+    /// which owns both branches and every refusal).
+    ///
+    /// Tear-off is adoption's other door, not a second mechanism: it MINTS the
+    /// entry the pool would otherwise have handed over, and the receiving window
+    /// lands it through the same [`adopt_entry`](Self::adopt_entry). The pane's
+    /// live `Entity<TerminalSessionHandle>` travels inside the entry, so nothing
+    /// respawns.
+    ///
+    /// The window-side repairs after the extraction, in order:
+    ///
+    /// * the **empty-session dissolve** — the single-leaf branch can leave the
+    ///   source session with no pills at all, and
+    ///   [`PtyManager::dissolve_session_if_empty`] runs the same cascade a
+    ///   last-window exit would (remove + parent sweep + selection prune + active
+    ///   fallback). It is a no-op while the session still has pills, so the
+    ///   multi-leaf branch pays nothing;
+    /// * the dissolved session's `file_browser` state is dropped through the one
+    ///   drain every dissolve path uses;
+    /// * the search bar closes when it was searching the pane that just left (its
+    ///   pane is gone from this window, so the field would sit over nothing);
+    /// * the subscription ensure pass runs SYNCHRONOUSLY in this same update, which
+    ///   retires the moved pane's subscription before the receiving window arms its
+    ///   own.
+    ///
+    /// The returned [`DissolveTerminus`] reports whether that emptied the WHOLE
+    /// window (the source session was its last, and it just dissolved). The disk
+    /// slot is already marked here — actually closing the window is the caller's,
+    /// exactly as it is for the explicit detach (plan §P7), so the pool-aware quit
+    /// check stays in charge of whether the app survives.
+    pub(crate) fn tear_off_pane(
+        &mut self,
+        session_id: &str,
+        term_window_id: &str,
+        pane_id: &str,
+        cx: &mut gpui::Context<WindowState>,
+    ) -> Option<(crate::detached_pool::DetachedEntry, DissolveTerminus)> {
+        let (pi, _) = self.workspace.project_session_index(session_id)?;
+        let project = crate::detached_pool::DetachedProject {
+            id: self.workspace.projects[pi].id.clone(),
+            name: self.workspace.projects[pi].name.clone(),
+            path: self.workspace.projects[pi].path.clone(),
+        };
+        let (session, ptys) =
+            self.ptys
+                .tear_off_pane(&mut self.workspace, session_id, term_window_id, pane_id)?;
+
+        // -- the WindowState-side repairs ----------------------------------
+        let terminus =
+            self.ptys
+                .dissolve_session_if_empty(&mut self.workspace, &mut self.selection, session_id);
+        self.prune_dissolved_file_browser_states();
+        self.mark_removed_if_window_emptied(terminus);
+        if self
+            .search_bar
+            .as_ref()
+            .is_some_and(|bar| bar.pane_id == pane_id)
+        {
+            self.search_bar = None;
+        }
+        // Retire the moved pane's subscription in this same update.
+        self.subscribe_spawned_windows(cx);
+        self.save_to_store();
+        cx.notify();
+
+        Some((
+            crate::detached_pool::DetachedEntry {
+                session,
+                ptys,
+                project,
+            },
+            terminus,
+        ))
+    }
+
+    /// Adopt a pooled [`DetachedEntry`](crate::detached_pool::DetachedEntry) INTO
+    /// this window — the inverse of [`detach_session`](Self::detach_session), and
+    /// the one adoption primitive behind every door (a sidebar row click, the
+    /// context menu, and the ⌃⌘A chord).
+    ///
+    /// Nothing respawns for a live entry: the same
+    /// `Entity<TerminalSessionHandle>`s land in this window's `PtyManager`, so the
+    /// children never notice which window owns them. A STRUCTURAL entry (the
+    /// post-relaunch rows, and §P2's model-alive-but-ptyless sessions) carries an
+    /// empty payload and rides the existing lazy respawn on activation — the same
+    /// `ResumeDeferred`/fresh-shell machinery a restored window uses, with no new
+    /// spawn path. A pane whose child died while pooled adopts held-style, its
+    /// scrollback intact.
+    ///
+    /// **Refusal hands the entry BACK** (`Err(entry)`) rather than dropping it:
+    /// dropping would SIGHUP a live child on what is a belt-and-braces guard. The
+    /// one refusal is a duplicate session id (review B3c) — a model that already
+    /// contains it must never gain a second copy, because every id-keyed
+    /// cross-window lookup (`WindowRegistry::state_for_*`) would then resolve to
+    /// whichever window matched first.
+    ///
+    /// The steps, in the order they must run:
+    ///
+    /// 1. **Project re-homing** through
+    ///    [`WorkspaceModel::ensure_project_by_path`] — an existing group at the
+    ///    same path is REUSED rather than duplicated, and a Terminals-provenance
+    ///    entry lands in this window's own pinned Terminals group (every window
+    ///    seeds one).
+    /// 2. **Parent-ref clearing** (review N7): a `/branch` child whose parent did
+    ///    not come along loses its `parent_session_id`, or the sidebar would
+    ///    render an indented row under a session that does not exist here. The
+    ///    `prune_dangling_parent_references` precedent, applied to the one
+    ///    arriving session.
+    /// 3. **The live payload** moves in via
+    ///    [`PtyManager::insert_session`](crate::pty_manager::PtyManager::insert_session).
+    /// 4. **The subscription ensure pass**, SYNCHRONOUSLY in this same update.
+    ///    This is the pass's own arming-site rule and it is a HARD requirement
+    ///    here (unlike on detach, where it is hygiene): an adopted pane can emit
+    ///    its first OSC 7 on the very next foreground turn.
+    /// 5. **Select + focus**: the model selection moves to the adopted session and
+    ///    `WindowHostView`'s render does the activation + key-focus move off it,
+    ///    exactly as it does for a sidebar click.
+    /// 6. **One save.** The caller's pool `take` already wrote the shrunken bucket
+    ///    into the store CACHE, and this `upsert` joins it in the SAME debounced
+    ///    batch (review B3b) — split batches plus a hard kill in the 500 ms gap
+    ///    would leave the session in both buckets at once.
+    // The `Err` variant IS the entry, deliberately: boxing it would allocate for
+    // a value the caller immediately pushes back onto the pool.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn adopt_entry(
+        &mut self,
+        entry: crate::detached_pool::DetachedEntry,
+        cx: &mut gpui::Context<WindowState>,
+    ) -> Result<(), crate::detached_pool::DetachedEntry> {
+        if self.workspace.session_for(&entry.session.id).is_some() {
+            return Err(entry);
+        }
+        let crate::detached_pool::DetachedEntry {
+            mut session,
+            ptys,
+            project,
+        } = entry;
+        let session_id = session.id.clone();
+
+        let pi = self
+            .workspace
+            .ensure_project_by_path(&project.id, &project.name, &project.path);
+        if session
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|parent| self.workspace.session_for(parent).is_none())
+        {
+            session.parent_session_id = None;
+        }
+        self.workspace.projects[pi].sessions.push(session);
+
+        self.ptys.insert_session(&session_id, ptys);
+        // Subscribe the arriving panes NOW, in this same update — an adopted
+        // pane's drain task cannot run mid-update, so the subscription always
+        // precedes its next emit.
+        self.subscribe_spawned_windows(cx);
+
+        self.workspace.select_session(&session_id);
+        self.selection.replace(&session_id);
+        self.save_to_store();
+        cx.notify();
+        Ok(())
     }
 
     /// Real close of a session through the session manager (pty release + dissolve
@@ -4184,6 +4509,43 @@ mod tests {
     fn claude_empty_session_id_replies_newtab() {
         let mut state = WindowState::new("/home/u");
         assert_eq!(drive_claude(&mut state, "/tmp/x", &[], "", "p"), "newtab\n");
+    }
+
+    /// §P11 shape 2: a NAMED session this window does not own gets an explicit
+    /// error, never a newtab. This is what an explicit detach leaves behind — the
+    /// source window's socket is healthy and its env still points at it, but the
+    /// session moved on — and a `newtab` there would silently open Claude in the
+    /// wrong window with nothing to tell the user.
+    ///
+    /// The reply is deliberately not a protocol verb, so both shell shadows take
+    /// their catch-all arm: print it and `exec command claude "$@"`.
+    #[test]
+    fn claude_unknown_session_id_replies_with_an_explicit_error() {
+        let mut state = WindowState::new("/home/u");
+        let reply = drive_claude(&mut state, "/tmp/p", &[], "detached-elsewhere", "some-window");
+        assert_eq!(reply, format!("{UNKNOWN_SESSION_REPLY}\n"));
+        assert_ne!(reply, "newtab\n", "an unknown session must never newtab here");
+        assert!(
+            state.workspace.session_for("detached-elsewhere").is_none(),
+            "and nothing is created in this window"
+        );
+    }
+
+    /// The empty-tab-id signal is untouched by the shape-2 guard: it means "the
+    /// Main terminal, always open a new sidebar session", not a stale pointer.
+    /// Likewise a KNOWN session named with a stale WINDOW id still newtabs — only
+    /// the SESSION being unknown is the error.
+    #[test]
+    fn the_unknown_session_error_does_not_swallow_the_newtab_signals() {
+        let mut state = WindowState::new("/home/u");
+        assert_eq!(drive_claude(&mut state, "/tmp/x", &[], "", "p"), "newtab\n");
+
+        let mut state = WindowState::new("/home/u");
+        seed_claude_session(&mut state.workspace, "t1", "c1", false);
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &[], "t1", "ghost-window"),
+            "newtab\n"
+        );
     }
 
     #[test]

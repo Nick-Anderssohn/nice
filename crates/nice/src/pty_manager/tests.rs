@@ -3466,3 +3466,371 @@ fn pane_cwd_changed_unknown_pane_is_noop() {
         "neither the pill cwd nor any pane may move"
     );
 }
+
+// ===========================================================================
+// tmux-port Phase 4 — take_session / insert_session (plan §P6)
+// ===========================================================================
+
+/// A cheap hermetic child: no shell rc, no user config, just a process that sits
+/// on its pty until its `PaneState` is dropped.
+fn detach_fixture_spec() -> SpawnSpec {
+    SpawnSpec::shell(std::env::temp_dir().to_string_lossy().to_string()).with_argv(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "sleep 30".to_string(),
+    ])
+}
+
+/// The load-bearing property of detach: taking a session out does NOT drop its
+/// `PaneState`, so no `SIGHUP` reaches the child. Pinned on the real liveness
+/// primitive (`TermSession::try_status()` — `None` while the child runs), the
+/// same one `DetachedPtys::has_live` reads, and across the full take → insert
+/// round trip so the pooled-then-adopted child is the SAME process throughout.
+#[gpui::test]
+fn take_session_moves_the_live_pty_without_sighup(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let mut mgr = PtyManager::new();
+        mgr.set_event_wakes_enabled_for_test(false);
+        mgr.spawn_window("t1", "w1", detach_fixture_spec(), cx).unwrap();
+
+        let handle = mgr
+            .pane_handle("t1", "w1", "w1")
+            .expect("the spawned pane has a handle");
+        assert!(
+            handle.read(cx).session().try_status().is_none(),
+            "the fixture child must be running before the take"
+        );
+
+        let payload = mgr.take_session("t1");
+        assert!(!payload.is_structural(), "a live session takes a live payload");
+        assert!(payload.has_live(cx), "the taken payload still holds a running child");
+        assert!(
+            !mgr.has_window("t1", "w1"),
+            "the source manager no longer owns the pill"
+        );
+        // The SAME entity, still alive: nothing was dropped, so nothing was
+        // SIGHUPed.
+        assert!(
+            handle.read(cx).session().try_status().is_none(),
+            "taking a session must not tear its child down"
+        );
+
+        // And the inverse re-homes it under a second manager, same entity again.
+        let mut target = PtyManager::new();
+        target.set_event_wakes_enabled_for_test(false);
+        target.insert_session("t1", payload);
+        let adopted = target
+            .pane_handle("t1", "w1", "w1")
+            .expect("the adopted pane has a handle");
+        assert_eq!(
+            adopted.entity_id(),
+            handle.entity_id(),
+            "adoption moves the SAME handle — no respawn"
+        );
+        assert!(
+            adopted.read(cx).session().try_status().is_none(),
+            "the child survives the whole detach → adopt round trip"
+        );
+
+        target.teardown();
+        mgr.teardown();
+    });
+}
+
+/// I7: an armed app-typed prefill is CLEARED by the take. Its consume event (the
+/// pane's first `CwdChanged`) can fire subscriber-less while pooled and be
+/// dropped, after which the surviving line would splice into the user's first
+/// post-adopt `cd`.
+#[gpui::test]
+fn take_session_clears_every_armed_prefill(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let mut mgr = PtyManager::new();
+        mgr.set_event_wakes_enabled_for_test(false);
+        mgr.spawn_window("t1", "w1", detach_fixture_spec(), cx).unwrap();
+        mgr.record_pending_prefill("t1", "w1", "w1", "claude --resume abc".to_string());
+        assert_eq!(
+            mgr.pending_prefill("t1", "w1", "w1"),
+            Some("claude --resume abc"),
+            "precondition: the slot is armed"
+        );
+
+        let payload = mgr.take_session("t1");
+        let mut target = PtyManager::new();
+        target.set_event_wakes_enabled_for_test(false);
+        target.insert_session("t1", payload);
+
+        assert_eq!(
+            target.pending_prefill("t1", "w1", "w1"),
+            None,
+            "the armed line must not survive the pool"
+        );
+        target.teardown();
+        mgr.teardown();
+    });
+}
+
+/// The rest of the §P6 scrub list, without needing a real child: launch-overlay
+/// states go (they are keyed by the BARE pill id, so a leak would paint
+/// "Launching…" over a pill this window no longer owns), pane statuses MOVE with
+/// the payload and are re-seeded on insert, and the two deliberately-left maps
+/// stay put.
+#[gpui::test]
+fn take_session_scrubs_launch_states_and_moves_pane_status(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let mut mgr = PtyManager::new();
+        mgr.set_event_wakes_enabled_for_test(false);
+        mgr.spawn_window("t1", "w1", detach_fixture_spec(), cx).unwrap();
+
+        let mut model = seeded();
+        let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+        // A launch overlay on the detaching session's pill, and one on a pill of
+        // another session (which must survive).
+        mgr.register_window_launch("w1", "sleep 30");
+        mgr.register_window_launch("other-w", "sleep 30");
+        // A recorded per-pane status on the detaching session.
+        mgr.record_pane_status(&mut model, "t1", &claude_id, &claude_id, SessionStatus::Thinking);
+        // A project-scoped flag that must NOT be cleared by a session detach.
+        mgr.mark_project_pending_removal("proj");
+
+        let payload = mgr.take_session("t1");
+
+        assert!(
+            mgr.window_launch_state("w1").is_none(),
+            "the detached pill's launch overlay is scrubbed"
+        );
+        assert!(
+            mgr.window_launch_state("other-w").is_some(),
+            "another session's launch overlay is untouched"
+        );
+        assert!(
+            mgr.take_dissolved_session_ids().is_empty(),
+            "a detach is not a dissolve — nothing is queued for file-browser cleanup"
+        );
+        assert!(
+            mgr.pending_project_removal.contains("proj"),
+            "project-removal flags are project-scoped and survive a session detach"
+        );
+
+        // The status rode the payload: re-seeded verbatim on the adopting side.
+        let mut target = PtyManager::new();
+        target.set_event_wakes_enabled_for_test(false);
+        target.insert_session("t1", payload);
+        let term_window = window_in(&model, "t1", &claude_id).clone();
+        let pane = term_window.layout.pane(&claude_id).unwrap().clone();
+        assert_eq!(
+            target.resolved_pane_status("t1", &term_window, &pane),
+            SessionStatus::Thinking,
+            "an adopted Claude pill renders its real status immediately"
+        );
+
+        target.teardown();
+        mgr.teardown();
+    });
+}
+
+/// A model-alive-but-ptyless session (P2's never-activated restored row) takes a
+/// STRUCTURAL payload, and inserting one still registers the per-session
+/// container so the lazy respawn on adopt-activate is reachable.
+#[test]
+fn take_session_of_a_ptyless_session_is_structural_and_still_registers_on_insert() {
+    let mut mgr = PtyManager::new();
+    let payload = mgr.take_session("never-spawned");
+    assert!(payload.is_structural(), "no ptys ⇒ a structural payload");
+
+    let mut target = PtyManager::new();
+    target.insert_session("never-spawned", payload);
+    assert!(
+        target.session_has_pty("never-spawned"),
+        "a structural adopt must still register the container — \
+         `ensure_active_window_spawned` refuses to lazy-spawn without one"
+    );
+}
+
+// ===========================================================================
+// Tear-off (tmux-port Phase 4, plan §P9)
+// ===========================================================================
+
+/// Multi-leaf branch: the pane leaves its pill, the SOURCE pill survives healed
+/// and refocused, and the lifted pane comes back wrapped in a synthetic session
+/// the new window will adopt.
+#[test]
+fn tear_off_of_a_split_pane_heals_the_source_pill() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+    mgr.pane_cwd_changed(&mut model, "t1", &claude_id, "shell", "/tmp/work");
+
+    let (session, _ptys) = mgr
+        .tear_off_pane(&mut model, "t1", &claude_id, "shell")
+        .expect("a shell pane in a split pill tears off");
+
+    // Source side: the pill is still there, one leaf lighter, focus fallen back.
+    let source_session = model.session_for("t1").expect("the source session survives");
+    assert_eq!(
+        source_session
+            .windows
+            .iter()
+            .map(|w| w.id.clone())
+            .collect::<Vec<_>>(),
+        vec![claude_id.clone(), terminal_id],
+        "no new pill in the SOURCE session — the pane left the window entirely"
+    );
+    let source = window_in(&model, "t1", &claude_id);
+    assert_eq!(source.layout.leaf_count(), 1);
+    assert_eq!(source.active_pane_id, claude_id, "focus fell back into the source pill");
+    assert!(source.layout_is_valid());
+
+    // The synthetic session: one Terminal pill holding the moved pane verbatim.
+    assert_eq!(session.windows.len(), 1);
+    let moved = &session.windows[0];
+    assert_eq!(moved.kind, TermWindowKind::Terminal);
+    assert_eq!(moved.title, "Terminal 1", "a fresh session's first pill");
+    assert_eq!(moved.cwd.as_deref(), Some("/tmp/work"));
+    assert_eq!(
+        moved.active_pane_id, "shell",
+        "the pane keeps its id, which is what lets its live pty re-key without respawning"
+    );
+    assert_eq!(session.active_window_id.as_deref(), Some(moved.id.as_str()));
+    assert_eq!(session.cwd, "/tmp/work", "the new session anchors at the pane's cwd");
+    assert_eq!(session.next_terminal_index, 2, "\"Terminal 1\" is spent");
+    assert_eq!(session.claude_session_id, None, "a torn-off shell resumes nothing");
+    assert!(moved.layout_is_valid());
+}
+
+/// Single-leaf branch: `PaneLayout::remove` refuses the last leaf, so the WHOLE
+/// pill moves out. The source session keeps its other pills and `extract_window`
+/// repairs its active-window pointer.
+#[test]
+fn tear_off_of_an_unsplit_pill_moves_the_whole_pill() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        session.active_window_id = Some(terminal_id.clone());
+    });
+
+    let (session, _ptys) = mgr
+        .tear_off_pane(&mut model, "t1", &terminal_id, &terminal_id)
+        .expect("an unsplit terminal pill tears off whole");
+
+    let source_session = model.session_for("t1").expect("the source session survives");
+    assert_eq!(
+        source_session
+            .windows
+            .iter()
+            .map(|w| w.id.clone())
+            .collect::<Vec<_>>(),
+        vec![claude_id.clone()],
+        "the pill left the source session"
+    );
+    assert_eq!(
+        source_session.active_window_id.as_deref(),
+        Some(claude_id.as_str()),
+        "`extract_window` repaired the source session's active pill"
+    );
+    assert_eq!(session.windows.len(), 1);
+    assert_eq!(
+        session.windows[0].id, terminal_id,
+        "the pill travels whole — same id, same title"
+    );
+    assert_eq!(session.windows[0].title, "Terminal 1");
+    assert_eq!(
+        session.next_terminal_index,
+        source_session.next_terminal_index,
+        "the counter comes along, so the next auto-name cannot collide with the moved pill"
+    );
+}
+
+/// The whole-pill move can leave the source session with no pills at all — the
+/// state `dissolve_session_if_empty` (the caller's step) exists for.
+#[test]
+fn tear_off_of_a_sessions_last_pill_leaves_it_empty_for_the_dissolve() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
+
+    let (session, _ptys) = mgr
+        .tear_off_pane(&mut model, "t1", "p1", "p1")
+        .expect("the only pill of a session tears off");
+
+    assert!(
+        model
+            .session_for("t1")
+            .expect("still present until the caller dissolves it")
+            .windows
+            .is_empty(),
+        "the source session is now pill-less"
+    );
+    assert_ne!(session.id, "t1", "the torn-off pill became a session of its own");
+}
+
+/// The scope guard, matching break-pane's for the same reason: a Claude leaf must
+/// never become its own window through this path. Refused SILENTLY and with no
+/// mutation — a Claude session moves whole through Detach ▸ Open in New Window.
+#[test]
+fn tear_off_refuses_the_claude_pane() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal_id) = seed_claude_session(&mut model, "t1");
+    split_window(&mut model, "t1", &claude_id, "shell");
+
+    assert!(
+        mgr.tear_off_pane(&mut model, "t1", &claude_id, &claude_id).is_none(),
+        "the Claude leaf of a split pill is refused"
+    );
+    assert!(
+        mgr.tear_off_pane(&mut model, "unknown", "nope", "nope").is_none(),
+        "so is an id this window does not own"
+    );
+    let source = window_in(&model, "t1", &claude_id);
+    assert_eq!(source.layout.leaf_count(), 2, "a refusal mutates nothing");
+    assert_eq!(model.session_for("t1").unwrap().windows.len(), 2);
+}
+
+/// The load-bearing property of tear-off, in both branches: the pane's live
+/// `Entity<TerminalSessionHandle>` MOVES inside the payload — same entity, child
+/// still running — so nothing respawns and the scrollback is the scrollback the
+/// user was reading.
+#[gpui::test]
+fn tear_off_moves_the_live_handle_without_respawning(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let mut mgr = counting_manager();
+        mgr.set_event_wakes_enabled_for_test(false);
+        let mut model = seeded();
+        seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
+        mgr.spawn_window("t1", "p1", detach_fixture_spec(), cx).unwrap();
+        let handle = mgr
+            .pane_handle("t1", "p1", "p1")
+            .expect("the spawned pane has a handle");
+
+        let (session, payload) = mgr
+            .tear_off_pane(&mut model, "t1", "p1", "p1")
+            .expect("the pill tears off");
+        assert!(payload.has_live(cx), "the payload carries a running child");
+        assert!(
+            !mgr.has_window("t1", "p1"),
+            "the source manager gave the pill up"
+        );
+
+        // The receiving window's manager — the same move `adopt_entry` performs.
+        let mut target = PtyManager::new();
+        target.set_event_wakes_enabled_for_test(false);
+        target.insert_session(&session.id, payload);
+        let moved = target
+            .pane_handle(&session.id, "p1", "p1")
+            .expect("the new window owns the pane now");
+        assert_eq!(
+            moved.entity_id(),
+            handle.entity_id(),
+            "the SAME handle — the child never noticed the move"
+        );
+        assert!(
+            moved.read(cx).session().try_status().is_none(),
+            "and it is still running"
+        );
+
+        target.teardown();
+        mgr.teardown();
+    });
+}

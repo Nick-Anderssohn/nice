@@ -110,6 +110,14 @@
 //!     non-destructive `~/.claude/settings.json` merge (nested SessionStart
 //!     group, stale-`UserPromptSubmit` strip, write-only-if-changed), both
 //!     against injectable base paths; `app::run` bootstrap wiring only.
+//!   * [`detached_pool`] — the tmux-port Phase 4 app-global pool of sessions that
+//!     outlived their OS window: the observable `DetachedPool` entity behind its
+//!     `Global` handle, the detach/adopt/kill drivers every door shares, the
+//!     detach-eligibility partition, and the launch-time duplicate-id reconcile.
+//!   * [`detach_adopt_live`] — the Phase 4 detach / adopt / tear-off self-test
+//!     scenario (`detach-adopt`): a real close detaches a live pty into the pool,
+//!     a fresh window renders the Detached section, and click-adopt / ⌃⌘⇧D / ⌃⌘A /
+//!     ⌃⌘N move the SAME session handle without a respawn.
 //!   * [`tmp_sweep`] — the R14 stale-`$TMPDIR` sweep: the pure `tempFileDecision`
 //!     classifier + the `nice-*.sock` / legacy `nice-zdotdir-*` sweep with an
 //!     injected `kill(pid,0)` liveness probe (keeps a live sibling app's debris).
@@ -136,6 +144,8 @@ mod confirmation_modal;
 mod context_menu;
 mod control_socket;
 mod cwd_heal;
+mod detach_adopt_live;
+mod detached_pool;
 mod dispatch_live;
 mod file_browser;
 mod file_browser_live;

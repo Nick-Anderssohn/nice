@@ -174,6 +174,33 @@ const SF_PLUS: &str = "plus";
 // 2026-07 restyle's stroke SVGs from `crate::chrome_icons` (`MODE_SESSIONS` /
 // `MODE_FILES` / `MODE_GEAR`), not SF Symbols — see [`SidebarShellView::build_footer`].
 
+// ---- The Detached section (tmux-port Phase 4, §P12) -------------------------
+
+/// The synthetic Detached group's internal id — the key the disclosure set uses
+/// and the sentinel `snapshot_groups` stamps. Namespaced so it can never collide
+/// with a real project id (which is either a UUID or the reserved `terminals`).
+const DETACHED_GROUP_ID: &str = "nice.detached";
+/// The Detached group's header label.
+const DETACHED_GROUP_NAME: &str = "Detached";
+/// FROZEN a11y/test id: the Detached section's root element. An AX walk finds it
+/// on role + this label, the [`SIDEBAR_ROOT_LABEL`] idiom.
+pub(crate) const SIDEBAR_DETACHED_SECTION_ID: &str = "sidebar.detached.section";
+/// FROZEN a11y/test id: one detached row. Every row carries it as its AX label
+/// (the rows are told apart by title, the way the section's own rows are); the
+/// gpui element id appends the session id so siblings stay unique.
+pub(crate) const SIDEBAR_DETACHED_ROW_ID: &str = "sidebar.detached.row";
+/// The a11y ROLE each of those two elements exposes — declared here and used at
+/// the build site, so the `detach-adopt` scenario's AX assertion reads the same
+/// value the element carries instead of restating it. (An element reaches the
+/// macOS AX tree only with both an `.id()` and a non-generic `.role()`; the role
+/// is what a walker matches on, so a silent change of it is a broken anchor.)
+///
+/// The section is a container; a row is a CONTROL — clicking it adopts the
+/// session (D3) — so it takes `Button`, the same role the sidebar's settings gear
+/// carries for the same reason.
+pub(crate) const SIDEBAR_DETACHED_SECTION_ROLE: gpui::Role = gpui::Role::Group;
+pub(crate) const SIDEBAR_DETACHED_ROW_ROLE: gpui::Role = gpui::Role::Button;
+
 /// Sidebar row status-dot size (pt). Matches the window-strip dot
 /// (`toolbar::TAB_STATUS_DOT_SIZE`, 7pt) so the sidebar and title-bar status
 /// dots read the same size; the default is 8pt. Only the size parameter
@@ -422,6 +449,11 @@ struct GroupVm {
     id: String,
     name: String,
     is_terminals: bool,
+    /// tmux-port Phase 4 (§P12): this is the ONE synthetic group rendered from
+    /// the app-global detached pool rather than from this window's
+    /// [`WorkspaceModel`]. Its rows adopt on click; they never select, rename,
+    /// drag or close, so it takes a different builder.
+    is_detached: bool,
     is_open: bool,
     hovered: bool,
     sessions: Vec<SessionVm>,
@@ -642,6 +674,14 @@ pub(crate) struct SidebarShellView {
     /// Re-render when the sidebar-font entity notifies (a Font-pane size change).
     /// `None` when the entity is absent (isolated scenarios).
     _sidebar_font_sub: Option<Subscription>,
+    /// tmux-port Phase 4 (§P12): re-render when the app-global
+    /// [`DetachedPool`](crate::detached_pool::DetachedPool) notifies, so a detach
+    /// or adopt in ANY window repaints this window's Detached section. This is
+    /// the whole reason the pool is an `Entity` behind a global rather than a
+    /// plain global — plain globals are not observable. `None` when no pool is
+    /// installed (`run_selftest` / the scenarios), which is also when the section
+    /// never renders.
+    _pool_sub: Option<Subscription>,
 }
 
 impl SidebarShellView {
@@ -673,6 +713,11 @@ impl SidebarShellView {
             .unwrap_or(crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX);
         let sidebar_font_sub =
             sidebar_font.map(|e| cx.observe(&e, |_this, _e, cx| cx.notify()));
+        // Phase 4 (§P12): observe the app-global detached pool so this window's
+        // Detached section repaints when ANY window detaches or adopts. Absent in
+        // the scenarios, where the section simply never renders.
+        let pool_sub = crate::detached_pool::pool(cx)
+            .map(|pool| cx.observe(&pool, |_this, _pool, cx| cx.notify()));
         // Phase 0: seed the live width from the persisted per-window width
         // (restore ran before this view exists); absent ⇒ the default.
         let initial_width = state
@@ -715,6 +760,7 @@ impl SidebarShellView {
             window_scale: 2.0,
             sidebar_font_px,
             _sidebar_font_sub: sidebar_font_sub,
+            _pool_sub: pool_sub,
         }
     }
 
@@ -762,6 +808,59 @@ impl SidebarShellView {
     // MARK: - Snapshot
 
     fn snapshot_groups(&self, cx: &mut Context<Self>) -> Vec<GroupVm> {
+        let mut groups = self.snapshot_project_groups(cx);
+        // §P12: the ONE synthetic group, appended after the project groups and
+        // present only when the pool is non-empty. Every window renders the same
+        // section — it is app-global state, not this window's.
+        groups.extend(self.snapshot_detached_group(cx));
+        groups
+    }
+
+    /// The Detached group, or `None` when there is nothing to show (no pool
+    /// installed, or an empty one).
+    ///
+    /// Rows carry no live status: while pooled a session has no subscriber, so
+    /// nothing would update a dot. They render a STATIC glyph instead (§P3), and
+    /// the flags a project row uses to mean active / selected / editing are all
+    /// false by construction — a detached row is none of those things.
+    fn snapshot_detached_group(&self, cx: &App) -> Option<GroupVm> {
+        let rows = crate::detached_pool::pool_rows(cx);
+        if rows.is_empty() {
+            return None;
+        }
+        let is_open = !self.collapsed_projects.contains(DETACHED_GROUP_ID);
+        let sessions = if is_open {
+            rows.into_iter()
+                .map(|(id, title, has_claude)| SessionVm {
+                    id,
+                    title,
+                    // Flat: a pooled `/branch` child's parent may not be pooled
+                    // with it, so there is no lineage to indent against.
+                    indented: false,
+                    child_count: 0,
+                    has_claude,
+                    status: SessionStatus::Idle,
+                    waiting_ack: false,
+                    is_active: false,
+                    is_selected: false,
+                    is_editing: false,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(GroupVm {
+            id: DETACHED_GROUP_ID.to_string(),
+            name: DETACHED_GROUP_NAME.to_string(),
+            is_terminals: false,
+            is_detached: true,
+            is_open,
+            hovered: false,
+            sessions,
+        })
+    }
+
+    fn snapshot_project_groups(&self, cx: &mut Context<Self>) -> Vec<GroupVm> {
         let ws = self.state.read(cx);
         let active = ws.workspace.active_session_id().map(|s| s.to_string());
         ws.workspace
@@ -796,6 +895,7 @@ impl SidebarShellView {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     is_terminals: p.id == WorkspaceModel::TERMINALS_PROJECT_ID,
+                    is_detached: false,
                     is_open,
                     hovered: self.hovered_project.as_deref() == Some(p.id.as_str()),
                     sessions,
@@ -1271,6 +1371,28 @@ impl SidebarShellView {
             }));
         }
 
+        // tmux-port Phase 4 (§P7): Detach Session — the explicit door into the
+        // app-global pool, the sidebar twin of ⌃⌘⇧D. Offered for a single row
+        // only (detach is per-session, and the multi-row verb would need its own
+        // batch semantics), and only when this row is detach-ELIGIBLE, so the
+        // menu never offers to pool a session with nothing left running. Absent
+        // entirely with no pool installed (scenarios / `run_selftest`).
+        if action_ids.len() == 1 {
+            let eligible = crate::detached_pool::pool(cx).is_some()
+                && crate::detached_pool::detach_eligible_session_ids(
+                    &self.state.read(cx).workspace,
+                )
+                .iter()
+                .any(|id| id == session_id);
+            if eligible {
+                let tid = session_id.to_string();
+                let state = self.state.clone();
+                items.push(ContextMenuItem::entry("Detach Session", move |_window, app| {
+                    crate::keymap::detach_session_from_window(app, &state, &tid);
+                }));
+            }
+        }
+
         let close_label = close_menu_label(action_ids.len());
         let ids = action_ids.clone();
         let tid = session_id.to_string();
@@ -1698,6 +1820,12 @@ impl SidebarShellView {
     }
 
     fn build_project_group(&self, g: &GroupVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // §P12: the synthetic Detached group takes its own builder — its rows
+        // adopt on click and carry none of the project-row machinery (selection,
+        // rename, drag-reorder, close).
+        if g.is_detached {
+            return self.build_detached_group(g, s, cx);
+        }
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
         let family = self.mono_family(cx);
@@ -2108,6 +2236,225 @@ impl SidebarShellView {
         div().px(px(6.0)).w_full().child(inner).into_any_element()
     }
 
+    // MARK: - The Detached section (tmux-port Phase 4, §P12)
+
+    /// The synthetic Detached group: a disclosure header over the pool's rows.
+    ///
+    /// It deliberately has NO `+` button (nothing creates a detached session) and
+    /// no drop region (drag-to-adopt is out of scope — D3), so it is a much
+    /// thinner element than a project group. The disclosure reuses
+    /// `collapsed_projects`, keyed by [`DETACHED_GROUP_ID`].
+    fn build_detached_group(
+        &self,
+        g: &GroupVm,
+        s: &Slots,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ink2 = slot_to_rgba(s.ink2);
+        let ink3 = slot_to_rgba(s.ink3);
+        let family = self.mono_family(cx);
+        let (symbol, fallback) = disclosure_icon(g.is_open);
+
+        let header = div()
+            .id("sidebar.detached.header")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(16.0))
+            .py(px(4.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(self.sidebar_pt(HEADER_DISCLOSURE_SLOT)))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .opacity(0.7)
+                    .child(sf_symbol_icon(
+                        symbol,
+                        fallback,
+                        self.sidebar_pt(10.0),
+                        SymbolWeight::Semibold,
+                        ink2,
+                        self.window_scale,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(self.sidebar_pt(12.0)))
+                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_12)))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ink3)
+                    .when_some(family, |el, fam| el.font_family(fam))
+                    .child(SharedString::from(g.name.to_uppercase())),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                    this.toggle_disclosure(DETACHED_GROUP_ID, cx);
+                    cx.stop_propagation();
+                }),
+            );
+
+        let rows: Vec<gpui::AnyElement> = g
+            .sessions
+            .iter()
+            .map(|t| self.build_detached_row(t, s, cx))
+            .collect();
+
+        div()
+            // FROZEN a11y anchor: `.id()` + a non-generic `.role()` are what put
+            // an element in the macOS AX tree; the label becomes its `AXTitle`.
+            .id(SIDEBAR_DETACHED_SECTION_ID)
+            .role(SIDEBAR_DETACHED_SECTION_ROLE)
+            .aria_label(SIDEBAR_DETACHED_SECTION_ID)
+            .flex()
+            .flex_col()
+            .w_full()
+            .pb(px(4.0))
+            .child(header)
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// One detached row. Click ADOPTS it into this window (D3); right-click opens
+    /// the three-verb menu. Everything a project row does that implies ownership
+    /// — selection, rename, drag-reorder, close — is absent: the pool is not this
+    /// window's model.
+    ///
+    /// The leading glyph is STATIC. A pooled session has no subscriber, so no
+    /// status event can reach it (§P3) — a live-looking dot would be a lie.
+    fn build_detached_row(&self, t: &SessionVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
+        let ink3 = slot_to_rgba(s.ink3);
+        let glass = glass_fill_rgba(scheme);
+        let family = self.mono_family(cx);
+
+        let leading = if t.has_claude {
+            // The dot shape a Claude row always wears, pinned Idle: pooled means
+            // nothing is thinking or waiting, and nothing would clear a pulse.
+            StatusDot::new(
+                SharedString::from(format!("detached.{}", t.id)),
+                SessionStatus::Idle,
+                slot_srgba(s.ink3),
+            )
+            .size(SIDEBAR_ROW_DOT_SIZE)
+            .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(16.0))
+                .h(px(16.0))
+                .child(sf_symbol_icon(
+                    SF_TERMINAL,
+                    ICON_TERMINAL,
+                    12.0,
+                    SymbolWeight::Regular,
+                    ink3,
+                    self.window_scale,
+                    cx,
+                ))
+                .into_any_element()
+        };
+
+        let tid_click = t.id.clone();
+        let tid_menu = t.id.clone();
+        let inner = div()
+            .id(SharedString::from(format!(
+                "{SIDEBAR_DETACHED_ROW_ID}.{}",
+                t.id
+            )))
+            .role(SIDEBAR_DETACHED_ROW_ROLE)
+            .aria_label(SIDEBAR_DETACHED_ROW_ID)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(ROW_INDENT_ROOT))
+            .pr(px(10.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .hover(move |st| st.bg(glass))
+            .child(leading)
+            .child(
+                div()
+                    .flex_1()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .whitespace_nowrap()
+                    .truncate()
+                    .text_size(px(self.sidebar_pt(13.0)))
+                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_13)))
+                    // Dimmed against the attached rows' `ink2`: the row is real,
+                    // but it lives nowhere until it is adopted.
+                    .text_color(ink3)
+                    .when_some(family, |el, fam| el.font_family(fam))
+                    .child(SharedString::from(t.title.clone())),
+            )
+            .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                this.adopt_detached_row(&tid_click, cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.open_detached_context_menu(&tid_menu, e.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+
+        div().px(px(6.0)).w_full().child(inner).into_any_element()
+    }
+
+    /// Adopt a detached row into THIS window (the click, and the menu's first
+    /// entry).
+    ///
+    /// The `false` return — the row is no longer pooled — is deliberately a
+    /// SILENT no-op: the same row can be clicked in two windows across a notify
+    /// gap, and the loser of that race must do nothing rather than adopt a second
+    /// copy (review N-r2-6c).
+    fn adopt_detached_row(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        crate::detached_pool::adopt_into(cx, &state, session_id);
+        // The adopted session is this window's active one now; re-arm the rename
+        // gate so the click that adopted it cannot also open an inline rename.
+        self.reseed_selection_after_create(cx);
+        cx.notify();
+    }
+
+    /// The detached row's context menu (D3): adopt here, adopt into a window of
+    /// its own, or kill it outright. No "Rename"/"Close" — those are verbs on a
+    /// session this window owns.
+    fn open_detached_context_menu(
+        &mut self,
+        session_id: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        let adopt_id = session_id.to_string();
+        let new_window_id = session_id.to_string();
+        let kill_id = session_id.to_string();
+        let items = vec![
+            ContextMenuItem::entry("Adopt into This Window", move |_window, app| {
+                let _ = weak.update(app, |this, cx| this.adopt_detached_row(&adopt_id, cx));
+            }),
+            ContextMenuItem::entry("Open in New Window", move |_window, app| {
+                crate::detached_pool::adopt_into_new_window(app, &new_window_id);
+            }),
+            ContextMenuItem::entry("Kill", move |_window, app| {
+                crate::detached_pool::kill_pooled(app, &kill_id);
+            }),
+        ];
+        self.present_context_menu(items, position, window, cx);
+    }
+
     /// The footer: the sessions/files mode switcher at the leading edge and the
     /// Settings gear at the trailing edge, sitting flush on the flat sidebar
     /// surface (no top rule — the 2026-07 restyle removed it). The mode buttons
@@ -2309,6 +2656,15 @@ impl SidebarShellView {
     /// [`WindowState::toggle_sidebar_collapsed`] seam the titlebar control also drives.
     pub(crate) fn drive_toggle_collapsed(&mut self, cx: &mut Context<Self>) {
         self.toggle_collapsed(cx);
+    }
+
+    /// Adopt a detached row through the SHIPPED row handler — the exact call the
+    /// row's click listener makes (the `detach-adopt` scenario's door). Driving
+    /// the pool's `adopt_into` directly would skip the sidebar's own half of the
+    /// click (the rename-gate reseed), which is the half a click regression
+    /// breaks.
+    pub(crate) fn drive_adopt_detached_row(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        self.adopt_detached_row(session_id, cx);
     }
 
     /// The `(status, waiting_acknowledged)` pair the row would feed its
@@ -2692,6 +3048,181 @@ mod tests {
         assert_eq!(dimmed.a, SEL_ALPHA_DARK * 0.5);
         // Same hue, different alpha (rgb carried straight from the accent).
         assert_eq!((active.r, active.g, active.b), (dimmed.r, dimmed.g, dimmed.b));
+    }
+
+    // ---- The Detached section (tmux-port Phase 4, §P12) ---------------------
+
+    /// The a11y/test ids freeze at ship: the scenario and any AX walk find the
+    /// section and its rows by these exact strings.
+    #[test]
+    fn detached_a11y_ids_are_frozen() {
+        assert_eq!(SIDEBAR_DETACHED_SECTION_ID, "sidebar.detached.section");
+        assert_eq!(SIDEBAR_DETACHED_ROW_ID, "sidebar.detached.row");
+        // The internal group key is namespaced so it can never collide with a
+        // real project id (a UUID, or the reserved `terminals`).
+        assert_ne!(DETACHED_GROUP_ID, WorkspaceModel::TERMINALS_PROJECT_ID);
+        assert!(DETACHED_GROUP_ID.starts_with("nice."));
+    }
+
+    /// The AX anchor is the id AND the role — a walker matches on both, so the
+    /// roles are as frozen as the strings. Pinned here because the ids test
+    /// cannot see them and only the live scenario would otherwise notice a drift
+    /// (it did: the section and the row were built with different roles than the
+    /// scenario asserted).
+    #[test]
+    fn detached_a11y_roles_are_frozen() {
+        assert_eq!(SIDEBAR_DETACHED_SECTION_ROLE, gpui::Role::Group);
+        // A row is a control: clicking it adopts the session.
+        assert_eq!(SIDEBAR_DETACHED_ROW_ROLE, gpui::Role::Button);
+    }
+
+    fn shell_over(
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<SidebarShellView> {
+        let state = cx.new(|_cx| WindowState::with_model(WorkspaceModel::new("/home/u")));
+        cx.new(|cx| SidebarShellView::new(state, cx))
+    }
+
+    fn pool_with(
+        cx: &mut gpui::TestAppContext,
+        ids: &[&str],
+    ) -> Entity<crate::detached_pool::DetachedPool> {
+        use crate::detached_pool::{DetachedEntry, DetachedPool, DetachedPoolGlobal, DetachedProject};
+        cx.update(|app| {
+            let pool = app.new(|_cx| DetachedPool::new());
+            pool.update(app, |pool, pcx| {
+                // Pushed in reverse so the pool reads in the given order.
+                for id in ids.iter().rev() {
+                    pool.push_front(
+                        DetachedEntry::structural(
+                            nice_model::Session::new(*id, format!("Session {id}"), "/home/u"),
+                            DetachedProject {
+                                id: "p".into(),
+                                name: "Work".into(),
+                                path: "/home/u".into(),
+                            },
+                        ),
+                        pcx,
+                    );
+                }
+            });
+            app.set_global(DetachedPoolGlobal(pool.clone()));
+            pool
+        })
+    }
+
+    /// With a non-empty pool the synthetic group is APPENDED after the project
+    /// groups, carries the pool's own order, and is flagged so the row builder
+    /// takes the adopt path rather than the project-row one.
+    #[gpui::test]
+    fn a_non_empty_pool_appends_the_detached_group_last(cx: &mut gpui::TestAppContext) {
+        let _pool = pool_with(cx, &["newer", "older"]);
+        let shell = shell_over(cx);
+        shell.update(cx, |shell, cx| {
+            let groups = shell.snapshot_groups(cx);
+            let last = groups.last().expect("at least the Terminals group");
+            assert!(last.is_detached, "the Detached group comes last");
+            assert_eq!(last.id, DETACHED_GROUP_ID);
+            assert_eq!(last.name, "Detached");
+            assert!(!last.is_terminals);
+            let ids: Vec<&str> = last.sessions.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, ["newer", "older"], "pool order, most recent first");
+            assert_eq!(
+                groups.iter().filter(|g| g.is_detached).count(),
+                1,
+                "exactly one synthetic group"
+            );
+            // A pooled row is none of the things a project row can be — nothing
+            // subscribes to it, so it can carry no live status either.
+            let row = &last.sessions[0];
+            assert!(!row.is_active && !row.is_selected && !row.is_editing);
+            assert!(!row.indented && row.child_count == 0);
+            assert_eq!(row.status, SessionStatus::Idle);
+        });
+    }
+
+    /// An EMPTY pool renders no section at all (§P12: visible only when
+    /// non-empty), and neither does an app with no pool installed — the shape
+    /// every scenario and `run_selftest` run in.
+    #[gpui::test]
+    fn an_empty_or_absent_pool_renders_no_section(cx: &mut gpui::TestAppContext) {
+        let pool = pool_with(cx, &[]);
+        let shell = shell_over(cx);
+        shell.update(cx, |shell, cx| {
+            assert!(shell.snapshot_groups(cx).iter().all(|g| !g.is_detached));
+        });
+
+        pool.update(cx, |pool, pcx| {
+            pool.push_front(
+                crate::detached_pool::DetachedEntry::structural(
+                    nice_model::Session::new("t1", "Work", "/home/u"),
+                    crate::detached_pool::DetachedProject {
+                        id: "p".into(),
+                        name: "Work".into(),
+                        path: "/home/u".into(),
+                    },
+                ),
+                pcx,
+            );
+        });
+        shell.update(cx, |shell, cx| {
+            assert!(shell.snapshot_groups(cx).iter().any(|g| g.is_detached));
+        });
+
+        cx.update(|app| app.remove_global::<crate::detached_pool::DetachedPoolGlobal>());
+        shell.update(cx, |shell, cx| {
+            assert!(
+                shell.snapshot_groups(cx).iter().all(|g| !g.is_detached),
+                "no pool installed ⇒ no section"
+            );
+        });
+    }
+
+    /// The section collapses like a project group, through the same disclosure
+    /// set keyed by [`DETACHED_GROUP_ID`].
+    #[gpui::test]
+    fn the_detached_section_collapses(cx: &mut gpui::TestAppContext) {
+        let _pool = pool_with(cx, &["t1"]);
+        let shell = shell_over(cx);
+        shell.update(cx, |shell, cx| {
+            shell.toggle_disclosure(DETACHED_GROUP_ID, cx);
+            let groups = shell.snapshot_groups(cx);
+            let detached = groups.iter().find(|g| g.is_detached).unwrap();
+            assert!(!detached.is_open);
+            assert!(detached.sessions.is_empty(), "a collapsed group paints no rows");
+        });
+    }
+
+    /// Clicking a row adopts it into THIS window through the shipped driver, and
+    /// clicking a row that is no longer pooled changes nothing (review N-r2-6c).
+    #[gpui::test]
+    fn clicking_a_detached_row_adopts_it_here(cx: &mut gpui::TestAppContext) {
+        let pool = pool_with(cx, &["t1"]);
+        let shell = shell_over(cx);
+
+        shell.update(cx, |shell, cx| shell.adopt_detached_row("t1", cx));
+        shell.update(cx, |shell, cx| {
+            assert!(shell.state.read(cx).workspace.session_for("t1").is_some());
+            assert!(
+                shell.snapshot_groups(cx).iter().all(|g| !g.is_detached),
+                "the pool emptied, so the section is gone"
+            );
+        });
+        pool.read_with(cx, |pool, _| assert!(pool.is_empty()));
+
+        // A second click on the same (now absent) row is a silent no-op.
+        shell.update(cx, |shell, cx| shell.adopt_detached_row("t1", cx));
+        shell.update(cx, |shell, cx| {
+            let ws = shell.state.read(cx);
+            let count = ws
+                .workspace
+                .projects
+                .iter()
+                .flat_map(|p| p.sessions.iter())
+                .filter(|s| s.id == "t1")
+                .count();
+            assert_eq!(count, 1, "never a second copy");
+        });
     }
 
     #[test]

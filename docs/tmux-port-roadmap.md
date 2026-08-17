@@ -93,6 +93,10 @@ sidebar request actually decomposes into:
   Rust port (`crates/README.md:603-605`), but `TabModel::extract_pane` /
   `insert_pane` (`tab_model.rs:499/522`), `dissolve_tab_if_empty`, and
   `WindowRegistry::state_for_window` survived for exactly this future.
+  **Phase 4 spent them:** action tear-off (⌃⌘N) ships on the pill-level
+  `extract_window` seam plus break-pane's extraction, and the dissolve +
+  registry lookups carry the session across windows. Only the DRAG half is
+  still cut.
 
 ## 4. The genuinely hard parts
 
@@ -128,7 +132,7 @@ drag-resize, directional navigation, zoom (temporary single-leaf render),
 and a persistence bump (schema is shape-tolerant; add `layout` to
 `PersistedTab`).
 
-### Detach / reattach
+### Detach / reattach — SOLVED in Phase 4 (option (a))
 No daemon; `SessionManager` (per-window) owns the ptys, and quit/close drops
 them (SIGHUP→SIGKILL, `deferred.rs:531-559`, `pty.rs:445-475`). Options:
 
@@ -144,7 +148,11 @@ them (SIGHUP→SIGKILL, `deferred.rs:531-559`, `pty.rs:445-475`). Options:
   Not recommended until (a) proves insufficient.
 
 Recommendation: (a), plus the existing `sessions.json` restore as the
-across-restart story.
+across-restart story. **Shipped as (a) with one refinement:** ownership did
+NOT move app-global for every session — only the detached ones live in the
+app-global pool, because moving attached sessions out of their window would
+rewrite the ownership story of every feature built on the per-window
+`WorkspaceModel`. See § Phase 4.
 
 ### Copy mode
 State machine + rendering, not plumbing: keyboard-driven cursor in
@@ -514,9 +522,67 @@ Phase 2's deferral list.
 Full implementation plan: `docs/plans/phase-3-copy-mode-search.md`. Live
 gate: the `copy-mode` self-test scenario.
 
-### Phase 4 — detach, adopt, tear-off (M-L)
-- App-global session registry; "detached sessions" sidebar section;
-  close-window-keeps-sessions option; adopt-into-window.
+### Phase 4 — detach, adopt, tear-off (M-L) — SHIPPED (2026-08-16)
+
+A session now outlives its OS window. Closing a window moves its running
+sessions into an app-global **detached pool** instead of killing them; the
+pool renders as a "Detached" section in every window's sidebar; clicking a
+row adopts it into that window with the pty **moved, not respawned**. A
+focused pane tears off into an OS window of its own by action. tmux
+`detach` / `attach` / `break-pane -d` + `move-window`, in Nice's shape.
+
+What shipped:
+
+- **The pool** (`crates/nice/src/detached_pool.rs`): a gpui `Entity`
+  behind a `Global` handle (observable — every sidebar `cx.observe`s it),
+  holding ONLY detached entries. Attached sessions keep living in their
+  window's own `WorkspaceModel` + `PtyManager`; the isolation invariant
+  that every multi-window feature was built on is untouched. Entries are
+  `{ session, ptys, project }`, most recently detached first, and the pool
+  is **passive** while it holds them — no subscriptions, no status
+  updates, liveness re-read at adopt.
+- **Detach** (`window_registry.rs`, `window_state.rs`, `pty_manager.rs`):
+  `take_session` / `insert_session` move a session's live ptys without
+  dropping them (no SIGHUP), and the close path partitions the closing
+  window BEFORE its snapshot is read, so the pool bucket and the window
+  slot land in the ONE existing flush — a crash can never leave a session
+  in neither bucket. Model-alive-but-ptyless sessions (restored,
+  never-activated rows) detach as structural entries rather than being
+  dropped. With detach on, ⌘W skips the confirmation: nothing is
+  destroyed, so there is nothing to confirm. Settings ▸ Advanced restores
+  the old confirm-then-kill flow.
+- **Persistence** (`session_store.rs`): a top-level optional `detached`
+  bucket in `sessions.json` — no version bump (v3 read tolerance), every
+  pool mutation write-through into the store cache so every existing
+  flush point covers it, and a launch-time reconcile that drops a
+  `detached[]` row whose id also appears under `windows[]`. Processes do
+  not survive quit (no daemon); rows come back as re-attachable structural
+  entries that respawn on adopt.
+- **Adopt** (`sidebar_shell.rs`, `window_state.rs`, `keymap.rs`): the
+  Detached section with click-adopt and an Adopt / Open in New Window /
+  Kill context menu, plus **⌃⌘A** for the pool head and **⌃⌘⇧D** to detach
+  the active session explicitly. `adopt_entry` re-homes the project,
+  inserts the live payload, re-arms subscriptions and selects — one
+  primitive behind every door.
+- **Tear-off** (**⌃⌘N** + File ▸ Tear Off Pane): both extraction branches
+  (multi-leaf via break-pane's, single-leaf via `extract_window`) wrapped
+  as a synthetic entry and handed to a new window through the same
+  construction path adoption uses. Drag-a-pane-out stays Phase 5.
+- **Window-less mode** (D5): the app survives closing its last window
+  while a pooled child runs (dock + menu bar only); dock-reopen brings a
+  window back, and ⌘Q counts the pool in its confirmation.
+
+Accepted, documented staleness: env is frozen at fork, so a moved pane's
+`NICE_SOCKET` / `NICE_TAB_ID` keep naming the window it came from — three
+distinct shapes, all recorded in the plan's §P11 and in
+`docs/plans/stable-control-socket.md` § Known gaps. Phase 5's pane
+addressing is the designated fix. What this phase DOES close is that
+plan's carried gap: a structural entry respawns on adopt with the
+ADOPTING window's env, so it never holds a dead path.
+
+Full implementation plan: `docs/plans/phase-4-detach-adopt-tearoff.md`.
+Live gate: the `detach-adopt` self-test scenario.
+
 - **Stable control-socket paths — CARVED OUT, shipped separately (2026-08-16,
   see `docs/plans/stable-control-socket.md`).** Was slotted here because this
   phase is about sessions outliving their windows, but the fix was urgent
@@ -529,11 +595,16 @@ gate: the `copy-mode` self-test scenario.
   unlink+rebind), and the `$TMPDIR` sweep gained a matching connect-probe
   branch for the new name shape ahead of its legacy pid-liveness branch.
   Known gap carried forward: a session whose window is never restored still
-  holds a dead path — revisit with adopt-into-window below, which re-homes
-  sessions across windows anyway.
-- Revive cross-window pane move / tear-off on the surviving seams
-  (`extract_pane`/`insert_pane`, `zed-external-drag-out` already proves the
-  NSDraggingSource path).
+  holds a dead path — **closed by the adopt path above** for structural
+  entries (they respawn with the adopting window's env); a LIVE moved pane
+  still carries its fork-time path, which is the §P11 wart Phase 5's pane
+  addressing owns.
+- ~~Revive cross-window pane move / tear-off on the surviving seams~~ —
+  **done as an ACTION** (⌃⌘N / File ▸ Tear Off Pane), on the pill-level
+  `extract_window` seam rather than the stale `extract_pane`/`insert_pane`
+  names. Drag-a-pane-out (and drag-into-another-window) is still Phase 5:
+  the gpui cross-OS-window drag mechanism is unproven, and
+  `zed-external-drag-out` proves only the drag-OUT-to-other-apps half.
 
 ### Phase 5 — power features (à la carte, S-M each)
 - `nice` CLI speaking the control socket: `split`, `send-keys`,

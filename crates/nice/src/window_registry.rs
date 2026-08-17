@@ -281,7 +281,11 @@ impl WindowRegistry {
             .map_or(true, |r| r.entries.is_empty());
         let settings_live = crate::settings::window::current_settings_window(cx)
             .is_some_and(|h| h.window_id() != closed_id);
-        should_quit_on_window_close(registry_empty, settings_live)
+        // tmux-port Phase 4 (D5): a detached session with a live child keeps the
+        // app alive window-less, the way a tmux server outlives its clients.
+        // Quitting here would SIGHUP exactly what detach promised to preserve.
+        let pool_live = crate::detached_pool::pool_has_live(cx);
+        should_quit_on_window_close(registry_empty, settings_live, pool_live)
     }
 
     /// The disk-fate + teardown half of [`handle_window_closed`], WITHOUT the
@@ -295,6 +299,16 @@ impl WindowRegistry {
     pub(crate) fn route_close_disk_fate(cx: &mut App, id: WindowId) {
         if let Some(state) = Self::deregister(cx, id) {
             let app_quitting = cx.has_global::<crate::lifecycle::AppQuitting>();
+            // tmux-port Phase 4 (D1/§P5): move this window's detach-eligible
+            // sessions into the app-global pool BEFORE the snapshot is read, so
+            // the snapshot describes only what is left behind. The pool push
+            // writes the bucket into the store CACHE on the spot (write-through),
+            // and the window slot's Remove/Preserve lands in the same batch — the
+            // ONE existing flush below then covers both. That ordering is
+            // crash-consistency load-bearing: a second flush after the pool write
+            // would open a window in which a hard kill leaves the detached
+            // sessions in NEITHER `windows[]` NOR `detached[]`.
+            Self::detach_eligible_sessions_into_pool(cx, &state, app_quitting);
             let (user_initiated, snapshot) = {
                 let s = state.read(cx);
                 (s.user_initiated_close(), s.persisted_snapshot())
@@ -311,15 +325,62 @@ impl WindowRegistry {
             state.update(cx, |s, _cx| s.teardown());
         }
     }
+
+    /// The close-path detach partition (plan §D1/§P2/§P5): move every
+    /// detach-eligible session of the closing window into the app-global pool,
+    /// leaving the model-dead ones behind for today's teardown.
+    ///
+    /// Three gates, each a deliberate no-op rather than a special case:
+    ///
+    /// * **Quit** (`app_quitting`) is untouched. `AppQuitting` still `Preserve`s
+    ///   whole windows, so sessions attached at quit stay in their windows and
+    ///   restore there; the pool persists only what was already detached.
+    /// * **No pool installed** ⇒ nothing happens. `run_selftest` and the
+    ///   scenarios build no pool (the hermeticity rule), so every landed close
+    ///   test keeps its pre-Phase-4 behavior byte-for-byte — including the
+    ///   `persistence-restore` scenario, which drives this function directly.
+    /// * **The setting is OFF** ⇒ nothing happens: the user asked for the
+    ///   pre-Phase-4 confirm-then-kill flow, and `request_window_close` has
+    ///   already presented the confirmation that goes with it.
+    ///
+    /// Sessions are taken in REVERSE sidebar order and each pushed onto the pool
+    /// head, so the pool ends up carrying this window's sessions in the order the
+    /// sidebar showed them.
+    fn detach_eligible_sessions_into_pool(
+        cx: &mut App,
+        state: &Entity<WindowState>,
+        app_quitting: bool,
+    ) {
+        if app_quitting || !crate::detached_pool::detach_on_close_enabled(cx) {
+            return;
+        }
+        let mut eligible =
+            crate::detached_pool::detach_eligible_session_ids(&state.read(cx).workspace);
+        eligible.reverse();
+        for session_id in eligible {
+            crate::detached_pool::detach_into_pool(cx, state, &session_id);
+        }
+    }
 }
 
-/// Pure quit-when-empty predicate (BUGS.md #13, D4): the app quits on a window
-/// close only when the [`WindowRegistry`] holds no remaining live window AND no
-/// Settings window is still live. Split from
-/// [`WindowRegistry::should_quit_after_close`] (which reads the app to derive both
-/// inputs) so the decision is unit-testable without a window.
-pub(crate) fn should_quit_on_window_close(registry_empty: bool, settings_live: bool) -> bool {
-    registry_empty && !settings_live
+/// Pure quit-when-empty predicate (BUGS.md #13, D4; tmux-port Phase 4 D5): the
+/// app quits on a window close only when the [`WindowRegistry`] holds no
+/// remaining live window, no Settings window is still live, AND the detached pool
+/// holds no live session. Split from
+/// [`WindowRegistry::should_quit_after_close`] (which reads the app to derive all
+/// three inputs) so the decision is unit-testable without a window.
+///
+/// `pool_live` is the D5 term: detach must never kill, so closing the last window
+/// while a pooled child is still running leaves Nice running dock-only rather
+/// than SIGHUPing it. A pool holding only STRUCTURAL rows (nothing running)
+/// contributes nothing — those cost no process, and hanging the app on them would
+/// make a stale persisted row unquittable.
+pub(crate) fn should_quit_on_window_close(
+    registry_empty: bool,
+    settings_live: bool,
+    pool_live: bool,
+) -> bool {
+    registry_empty && !settings_live && !pool_live
 }
 
 #[cfg(test)]
@@ -416,15 +477,38 @@ mod tests {
     #[test]
     fn should_quit_only_when_registry_empty_and_no_settings_live() {
         use super::should_quit_on_window_close as q;
-        // The only quitting combination: no registered window left AND no Settings
-        // window still open — today's single-window "close quits the app".
-        assert!(q(true, false), "empty registry, no Settings ⇒ quit");
+        // The only quitting combination: no registered window left, no Settings
+        // window still open, and no live pooled session — today's single-window
+        // "close quits the app".
+        assert!(q(true, false, false), "empty registry, no Settings ⇒ quit");
         // Settings still open ⇒ never quit, even with an empty registry (#13: closing
         // the last terminal window must not take Settings down mid-use).
-        assert!(!q(true, true), "empty registry but Settings live ⇒ stay");
+        assert!(!q(true, true, false), "empty registry but Settings live ⇒ stay");
         // Another registered window survives ⇒ never quit, Settings or not.
-        assert!(!q(false, false), "registered windows remain ⇒ stay");
-        assert!(!q(false, true), "registered windows remain + Settings ⇒ stay");
+        assert!(!q(false, false, false), "registered windows remain ⇒ stay");
+        assert!(!q(false, true, false), "registered windows remain + Settings ⇒ stay");
+    }
+
+    /// tmux-port Phase 4 (D5): a live detached session keeps the app alive
+    /// window-less. It is an independent veto — it holds with no windows and no
+    /// Settings, which is exactly the state closing the last window lands in.
+    #[test]
+    fn a_live_detached_pool_keeps_the_app_alive_window_less() {
+        use super::should_quit_on_window_close as q;
+        assert!(
+            !q(true, false, true),
+            "last window closed but a pooled child is still running ⇒ stay alive"
+        );
+        assert!(
+            !q(false, false, true),
+            "a live pool never quits, windows or not"
+        );
+        // An EMPTY-or-structural-only pool changes nothing: no process is at
+        // risk, so the app must still quit rather than hang on a persisted row.
+        assert!(
+            q(true, false, false),
+            "a pool with nothing running does not hold the app open"
+        );
     }
 
     /// The decision seam [`super::WindowRegistry::should_quit_after_close`] derives
@@ -475,5 +559,303 @@ mod tests {
                 "closing Settings as the last live window still quits"
             );
         });
+    }
+}
+
+// ===========================================================================
+// tmux-port Phase 4 — the close-path detach partition (plan §D1/§P2/§P5)
+// ===========================================================================
+
+#[cfg(test)]
+mod detach_close_tests {
+    use std::path::PathBuf;
+
+    use gpui::AppContext;
+    use nice_model::{Session, TermWindow, TermWindowKind, WorkspaceModel};
+    use nice_term_core::SpawnSpec;
+
+    use super::WindowRegistry;
+    use crate::detached_pool::DetachedPoolGlobal;
+    use crate::session_store::{self, SessionStore};
+    use crate::settings::prefs_store::SettingsPrefsStore;
+    use crate::window_state::WindowState;
+
+    /// A scratch dir for one case's `sessions.json` + `ui_settings.json`.
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nice-p4-close-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A cheap hermetic child that sits on its pty until its `PaneState` drops —
+    /// so "the pool got it before `teardown` ran" is observable as a process that
+    /// is still running.
+    fn fixture_spec() -> SpawnSpec {
+        SpawnSpec::shell(std::env::temp_dir().to_string_lossy().to_string()).with_argv(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ])
+    }
+
+    /// A window model with the seeded Terminals/Main session (model-ALIVE) plus a
+    /// second project holding one HELD session (model-dead) — the two sides of
+    /// the §P2 partition in one window.
+    fn model_with_a_live_and_a_held_session() -> WorkspaceModel {
+        let mut model = WorkspaceModel::new("/tmp");
+        let pi = model.ensure_project("proj", "Project", "/tmp/proj");
+        let mut held = Session::new("held", "Held", "/tmp/proj");
+        let mut window = TermWindow::new("held-w", "Terminal 1", TermWindowKind::Terminal);
+        window.is_alive = false;
+        held.active_window_id = Some(window.id.clone());
+        held.windows = vec![window];
+        model.projects[pi].sessions.push(held);
+        model
+    }
+
+    /// The `sessions.json` actually on disk (never the cache) — the whole point
+    /// of the ordering pin is that the flush already carried the pool.
+    fn on_disk(path: &PathBuf) -> serde_json::Value {
+        let text = std::fs::read_to_string(path).expect("sessions.json was flushed");
+        serde_json::from_str(&text).expect("sessions.json is valid JSON")
+    }
+
+    fn detached_ids(doc: &serde_json::Value) -> Vec<String> {
+        doc["detached"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| r["session"]["id"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// §P5's pinned ordering, asserted through its three observable
+    /// consequences at once:
+    ///
+    /// 1. the eligible session is in the POOL and out of the window's model;
+    /// 2. its child is STILL RUNNING after the close — so the extraction beat
+    ///    `WindowState::teardown`, which would have SIGHUPed it;
+    /// 3. the flushed `sessions.json` already carries the `detached` bucket AND
+    ///    has dropped the window slot — so the pool write landed in the cache
+    ///    before the ONE flush, not after it. A second flush would open the
+    ///    crash window in which the session is in neither bucket.
+    ///
+    /// The model-dead `held` session is left behind for today's `Remove` fate.
+    #[gpui::test]
+    fn close_path_detaches_eligible_sessions_before_the_single_flush(cx: &mut gpui::TestAppContext) {
+        let _serialize = session_store::global_test_lock();
+        let dir = scratch("flush-order");
+        let store_path = dir.join("sessions.json");
+        session_store::clear_global();
+        let _store = session_store::install_global(SessionStore::open(store_path.clone()));
+
+        let win = cx.add_window(|_w, _cx| gpui::Empty);
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+            crate::detached_pool::install(app);
+            app.set_global(SettingsPrefsStore::with_defaults(dir.join("ui_settings.json")));
+
+            let state = app.new(|_cx| WindowState::with_model(model_with_a_live_and_a_held_session()));
+            let main_window_id = state
+                .read(app)
+                .workspace
+                .session_for("terminals-main")
+                .and_then(|s| s.active_window_id.clone())
+                .expect("the seeded Main session has a window");
+            let handle = state
+                .update(app, |ws, cx| {
+                    ws.ptys.set_event_wakes_enabled_for_test(false);
+                    ws.ptys
+                        .spawn_window("terminals-main", &main_window_id, fixture_spec(), cx)
+                        .unwrap();
+                    ws.ptys.pane_handle("terminals-main", &main_window_id, &main_window_id)
+                })
+                .expect("the Main pane spawned");
+            // The D1 no-confirm close branch sets this before the window goes.
+            state.update(app, |ws, _| ws.set_user_initiated_close(true));
+            WindowRegistry::register(app, win.window_id(), state.clone());
+
+            WindowRegistry::route_close_disk_fate(app, win.window_id());
+
+            // (1) pooled, and gone from the window; the held session stayed.
+            let pool = app.global::<DetachedPoolGlobal>().0.clone();
+            let pooled: Vec<String> = pool
+                .read(app)
+                .entries()
+                .iter()
+                .map(|e| e.session.id.clone())
+                .collect();
+            // Re-keyed on the way out (`WindowState::detach_session`): the pool is
+            // app-global, so a row cannot keep the `terminals-main` that EVERY
+            // window seeds — it would collide with the next window to adopt it.
+            assert_eq!(pooled.len(), 1, "exactly one detached row: {pooled:?}");
+            assert_ne!(pooled[0], "terminals-main", "re-keyed on the way out");
+            let detached_id = pooled[0].clone();
+            assert!(
+                state.read(app).workspace.session_for("terminals-main").is_none(),
+                "the detached session left the window's model"
+            );
+            assert!(
+                state.read(app).workspace.session_for("held").is_some(),
+                "a model-dead session is NOT detached — it keeps today's Remove fate"
+            );
+
+            // (2) the child outlived teardown.
+            assert!(
+                handle.read(app).session().try_status().is_none(),
+                "the pooled child must still be running after the window closed"
+            );
+
+            // (3) the ONE flush already carried both writes.
+            let doc = on_disk(&store_path);
+            assert_eq!(
+                detached_ids(&doc),
+                vec![detached_id],
+                "the detached bucket was in the cache before the flush"
+            );
+            assert!(
+                doc["windows"].as_array().map_or(true, |w| w.is_empty()),
+                "the confirmed close removed the window slot in the same batch"
+            );
+
+            pool.update(app, |p, cx| p.clear_live(cx));
+        });
+        session_store::clear_global();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Setting OFF ⇒ the pre-Phase-4 path, byte for byte: nothing is pooled, the
+    /// window slot is still removed by the confirmed close, and the file carries
+    /// no `detached` bucket at all.
+    #[gpui::test]
+    fn close_path_with_detach_off_keeps_todays_behavior(cx: &mut gpui::TestAppContext) {
+        let _serialize = session_store::global_test_lock();
+        let dir = scratch("setting-off");
+        let store_path = dir.join("sessions.json");
+        session_store::clear_global();
+        let _store = session_store::install_global(SessionStore::open(store_path.clone()));
+
+        let win = cx.add_window(|_w, _cx| gpui::Empty);
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+            crate::detached_pool::install(app);
+            let mut prefs = SettingsPrefsStore::with_defaults(dir.join("ui_settings.json"));
+            let _ = prefs.set_close_window_detaches(false);
+            app.set_global(prefs);
+
+            let state = app.new(|_cx| WindowState::with_model(model_with_a_live_and_a_held_session()));
+            // Persist the window first, so "the confirmed close DROPS the slot"
+            // is a visible transition rather than a slot that was never there.
+            state.update(app, |ws, _| ws.save_to_store());
+            session_store::flush();
+            assert!(
+                !on_disk(&store_path)["windows"].as_array().unwrap().is_empty(),
+                "precondition: the window has a persisted slot"
+            );
+            state.update(app, |ws, _| ws.set_user_initiated_close(true));
+            WindowRegistry::register(app, win.window_id(), state.clone());
+
+            WindowRegistry::route_close_disk_fate(app, win.window_id());
+
+            let pool = app.global::<DetachedPoolGlobal>().0.clone();
+            assert!(
+                pool.read(app).is_empty(),
+                "with the setting OFF the close kills as it always did"
+            );
+            assert!(
+                state.read(app).workspace.session_for("terminals-main").is_some(),
+                "no session was extracted from the model"
+            );
+            let doc = on_disk(&store_path);
+            assert!(detached_ids(&doc).is_empty(), "no detached bucket is written");
+            assert!(
+                doc["windows"].as_array().map_or(true, |w| w.is_empty()),
+                "the confirmed close still drops the window slot"
+            );
+        });
+        session_store::clear_global();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quit is untouched (§P5): with `AppQuitting` latched the close `Preserve`s
+    /// the WHOLE window, so sessions attached at quit stay in `windows[]` and
+    /// restore there — the pool persists only what was already detached.
+    #[gpui::test]
+    fn quit_preserves_attached_sessions_and_never_detaches(cx: &mut gpui::TestAppContext) {
+        let _serialize = session_store::global_test_lock();
+        let dir = scratch("quit-parity");
+        let store_path = dir.join("sessions.json");
+        session_store::clear_global();
+        let _store = session_store::install_global(SessionStore::open(store_path.clone()));
+
+        let win = cx.add_window(|_w, _cx| gpui::Empty);
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+            crate::detached_pool::install(app);
+            app.set_global(SettingsPrefsStore::with_defaults(dir.join("ui_settings.json")));
+            app.set_global(crate::lifecycle::AppQuitting);
+
+            // One row was ALREADY detached before the quit began.
+            let pool = app.global::<DetachedPoolGlobal>().0.clone();
+            let mut pooled = Session::new("pre-detached", "Pooled", "/tmp/work");
+            pooled.windows = vec![TermWindow::new(
+                "pre-detached-w",
+                "Terminal 1",
+                TermWindowKind::Terminal,
+            )];
+            pooled.active_window_id = Some("pre-detached-w".into());
+            pool.update(app, |p, cx| {
+                p.push_front(
+                    crate::detached_pool::DetachedEntry::structural(
+                        pooled,
+                        crate::detached_pool::DetachedProject {
+                            id: "proj".into(),
+                            name: "Project".into(),
+                            path: "/tmp/proj".into(),
+                        },
+                    ),
+                    cx,
+                )
+            });
+
+            let state = app.new(|_cx| WindowState::with_model(model_with_a_live_and_a_held_session()));
+            WindowRegistry::register(app, win.window_id(), state.clone());
+            WindowRegistry::route_close_disk_fate(app, win.window_id());
+
+            assert_eq!(
+                pool.read(app).len(),
+                1,
+                "quit adds nothing to the pool — attached sessions stay attached"
+            );
+            assert!(
+                state.read(app).workspace.session_for("terminals-main").is_some(),
+                "the quit close extracts nothing from the model"
+            );
+            let doc = on_disk(&store_path);
+            assert_eq!(
+                detached_ids(&doc),
+                vec!["pre-detached".to_string()],
+                "the pool persists exactly what was already detached"
+            );
+            let window_sessions: Vec<String> = doc["windows"][0]["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|p| p["tabs"].as_array().cloned().unwrap_or_default())
+                .map(|s| s["id"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert!(
+                window_sessions.contains(&"terminals-main".to_string()),
+                "an attached session is preserved under windows[]: {window_sessions:?}"
+            );
+        });
+        session_store::clear_global();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
