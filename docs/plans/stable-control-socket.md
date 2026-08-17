@@ -1,11 +1,13 @@
 # Stable control-socket paths (Phase 4 carve-out)
 
-**Status:** PLANNED, twice Fable-reviewed (round 1: 1 blocking + 3
-important + 6 nit, all folded; round 2: 10/10 folds verified, 0 blocking
-+ 2 important + 4 nit fresh findings, all folded — reports at
-`.claude/handoff/stable-socket-plan-review.md` + `…-round2.md`). Carved
-out of Phase 4 (roadmap § "Phase 4 — detach, adopt, tear-off") to ship
-ahead of the rest of the phase. The bug is live:
+**Status:** SHIPPED — landed on main 2026-08-16 (squash `341d234`,
+feel-check passed incl. the hand-only `/nice-handoff`-across-restart
+gate). See § As shipped. Twice Fable-reviewed pre-implementation
+(round 1: 1 blocking + 3 important + 6 nit, all folded; round 2: 10/10
+folds verified, 0 blocking + 2 important + 4 nit fresh findings, all
+folded — reports at `.claude/handoff/stable-socket-plan-review.md` +
+`…-round2.md`). Carved out of Phase 4 (roadmap § "Phase 4 — detach,
+adopt, tear-off") to ship ahead of the rest of the phase. The bug is live:
 since Claude Code 2.1.139 daemon-hosts sessions across client restarts,
 every Nice relaunch strands the fork-time `NICE_SOCKET` in every long-lived
 session ("no reply from control socket", first hit 2026-08-13).
@@ -303,3 +305,50 @@ call-site change); 3 is independent after 1 defines the name.
   started this. The session MUST have been forked under the NEW build
   (a pre-upgrade session holds an old-format path and false-fails — see
   Known gaps). gpui-level scenarios can't see this; hand-test only.
+
+## As shipped (2026-08-16)
+
+Implemented by dev-cycle-orchestrator-fable run `stable-control-socket`
+(state/report at `/Users/nick/Projects/nice-cycle-runs/stable-control-socket/`):
+single cycle, squash `341d234` (9 files, +1265/−111), 3 review rounds,
+zero drift, zero rejected findings. Feel-check passed 2026-08-16 incl.
+the hand-only gate (`/nice-handoff` from a pre-restart daemon-hosted
+session forked under the new build, delivered after a Nice Dev restart).
+
+Beyond the plan — found and fixed in-cycle:
+
+- **Listener fd now sets `FD_CLOEXEC`** (`set_cloexec` right after
+  `libc::socket`, + a test pinning the asymmetry vs. accepted streams,
+  which std already covers). Without it every pty child inherited the
+  listener fd; harmless under pid+nonce paths, fatal under stable ones —
+  any child outliving the app kept `connect(2)` succeeding at the stable
+  path, so the next launch's probe read Nice's OWN orphan as a live
+  owner → permanent D2 legacy fallback → fix silently defeated.
+- **Sweep D3 is a real three-way verdict** (`SocketLiveness::{Live,
+  Stale, Unknown}`, delete on Stale only — Stale = `ECONNREFUSED`/
+  `ENOENT`). An early implementation collapsed it to
+  delete-on-any-error; caught as a blocking review finding. The module
+  header now states why the sweep and bind taxonomies deliberately
+  differ — do not "unify" them.
+- **`shell-socket` scenario reports a missing `--features selftest`
+  build up front** instead of failing blind (record assertions compile
+  to no-ops without the feature; the FAIL looks like a product bug).
+- Arm-seam tests pin BOTH the uncontested window-keyed stamping
+  (`arm_stamps_the_window_keyed_socket_path_when_uncontested`) and the
+  contested post-`start()` stamp ordering
+  (`arm_stamps_shell_env_from_the_path_start_resolved`, verified to
+  bite on a reorder).
+
+Validation as run: full `cargo test -p nice` 1114 green; `shell-socket`
+selftest PASS under the worktree lock; black-box scratch-env restart
+survival PASSED both legs (same `nice-w-<12hex>` path — derived from the
+scratch `sessions.json` — answers `nc` after graceful quit→relaunch and
+after SIGKILL→relaunch), plus an automated stand-in of the hand gate
+(real `claude` request to the pre-restart frozen path answered after
+restart).
+
+Parked (deliberate — don't re-litigate unprompted): the accept-loop
+contested-path retry branch and the bare-`EADDRINUSE` arm of the
+contested-path predicate have no direct test (both graceful-degradation
+backstops; non-steal + reclaim are covered via the tested probe and
+self-heal paths).
