@@ -969,10 +969,10 @@ mod tests {
         // Actions with no Swift-prod `rawValue` counterpart: `CommandCompose` (the
         // first Rust-only action), the eight tmux Phase 1 additions, Phase
         // 2's twelve pane verbs (prod had no splits at all), Phase 3's two
-        // copy-mode verbs (prod had no copy mode either), and Phase 4's detach /
-        // adopt / tear-off trio (prod sessions died with their window, and a pane
-        // could not become a window at all).
-        const RUST_ONLY: [ShortcutAction; 26] = [
+        // copy-mode verbs (prod had no copy mode either), and Phase 4's
+        // tear-off verb (prod had no pane, and a pane could not become a
+        // window at all).
+        const RUST_ONLY: [ShortcutAction; 24] = [
             ShortcutAction::CommandCompose,
             ShortcutAction::FocusPaneLeft,
             ShortcutAction::FocusPaneDown,
@@ -996,8 +996,6 @@ mod tests {
             ShortcutAction::SwapPaneRight,
             ShortcutAction::CopyMode,
             ShortcutAction::SearchScrollback,
-            ShortcutAction::DetachSession,
-            ShortcutAction::AdoptDetachedSession,
             ShortcutAction::TearOffPane,
         ];
 

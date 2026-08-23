@@ -2621,7 +2621,7 @@ impl WindowState {
     // MARK: - Detach (tmux-port Phase 4, plan §P6)
 
     /// Extract `session_id` out of this window as a
-    /// [`DetachedEntry`](crate::detached_pool::DetachedEntry) — the model subtree,
+    /// [`DetachedEntry`](crate::session_transfer::DetachedEntry) — the model subtree,
     /// its LIVE pty payload, and the project it came out of — leaving the window
     /// otherwise intact. `None` for a session this window does not own.
     ///
@@ -2678,9 +2678,9 @@ impl WindowState {
         &mut self,
         session_id: &str,
         cx: &mut gpui::Context<WindowState>,
-    ) -> Option<(crate::detached_pool::DetachedEntry, DissolveTerminus)> {
+    ) -> Option<(crate::session_transfer::DetachedEntry, DissolveTerminus)> {
         let (pi, ti) = self.workspace.project_session_index(session_id)?;
-        let project = crate::detached_pool::DetachedProject {
+        let project = crate::session_transfer::DetachedProject {
             id: self.workspace.projects[pi].id.clone(),
             name: self.workspace.projects[pi].name.clone(),
             path: self.workspace.projects[pi].path.clone(),
@@ -2733,7 +2733,7 @@ impl WindowState {
             DissolveTerminus::None
         };
         Some((
-            crate::detached_pool::DetachedEntry {
+            crate::session_transfer::DetachedEntry {
                 session,
                 ptys,
                 project,
@@ -2743,7 +2743,7 @@ impl WindowState {
     }
 
     /// Tear one pane out of this window as a synthetic
-    /// [`DetachedEntry`](crate::detached_pool::DetachedEntry) that a brand-new OS
+    /// [`DetachedEntry`](crate::session_transfer::DetachedEntry) that a brand-new OS
     /// window adopts (plan §P9). `None` when the extraction refused (an unknown
     /// session / pill / pane, or a Claude pane — see
     /// [`PtyManager::tear_off_pane`](crate::pty_manager::PtyManager::tear_off_pane),
@@ -2782,9 +2782,9 @@ impl WindowState {
         term_window_id: &str,
         pane_id: &str,
         cx: &mut gpui::Context<WindowState>,
-    ) -> Option<(crate::detached_pool::DetachedEntry, DissolveTerminus)> {
+    ) -> Option<(crate::session_transfer::DetachedEntry, DissolveTerminus)> {
         let (pi, _) = self.workspace.project_session_index(session_id)?;
-        let project = crate::detached_pool::DetachedProject {
+        let project = crate::session_transfer::DetachedProject {
             id: self.workspace.projects[pi].id.clone(),
             name: self.workspace.projects[pi].name.clone(),
             path: self.workspace.projects[pi].path.clone(),
@@ -2812,7 +2812,7 @@ impl WindowState {
         cx.notify();
 
         Some((
-            crate::detached_pool::DetachedEntry {
+            crate::session_transfer::DetachedEntry {
                 session,
                 ptys,
                 project,
@@ -2821,7 +2821,7 @@ impl WindowState {
         ))
     }
 
-    /// Adopt a pooled [`DetachedEntry`](crate::detached_pool::DetachedEntry) INTO
+    /// Adopt a pooled [`DetachedEntry`](crate::session_transfer::DetachedEntry) INTO
     /// this window — the inverse of [`detach_session`](Self::detach_session), and
     /// the one adoption primitive behind every door (a sidebar row click, the
     /// context menu, and the ⌃⌘A chord).
@@ -2872,13 +2872,13 @@ impl WindowState {
     #[allow(clippy::result_large_err)]
     pub(crate) fn adopt_entry(
         &mut self,
-        entry: crate::detached_pool::DetachedEntry,
+        entry: crate::session_transfer::DetachedEntry,
         cx: &mut gpui::Context<WindowState>,
-    ) -> Result<(), crate::detached_pool::DetachedEntry> {
+    ) -> Result<(), crate::session_transfer::DetachedEntry> {
         if self.workspace.session_for(&entry.session.id).is_some() {
             return Err(entry);
         }
-        let crate::detached_pool::DetachedEntry {
+        let crate::session_transfer::DetachedEntry {
             mut session,
             ptys,
             project,

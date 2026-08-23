@@ -1,5 +1,16 @@
 # Phase 4 — detach, adopt, tear-off
 
+> **SUPERSEDED (2026-08-22).** The user-facing surface this plan shipped —
+> the app-global detached pool, the sidebar "Detached" section, click/⌃⌘A
+> adopt, and window-less mode — was reworked away after Nick's feel-check
+> ("if you detach a terminal, it is still in the sidebar, but just in a
+> different spot; click it and it moves back — that's weird"). A direct
+> "Move to Window" context-menu verb replaced it, reusing this plan's
+> transfer plumbing (`detach_session`/`adopt_entry`, no respawn) and keeping
+> tear-off unchanged; close/quit reverted to their pre-this-plan behavior.
+> See `docs/tmux-port-roadmap.md` § Phase 4 for the as-shipped shape. This
+> file's body is kept as history below, unedited.
+
 **Status:** READY FOR SIGN-OFF — twice Fable-reviewed. Round 1: 3
 blocking + 7 important + 7 nit, all folded
 (`.claude/handoff/phase-4-plan-review.md`). Round 2: 15/17 folds

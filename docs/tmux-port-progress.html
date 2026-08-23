@@ -271,15 +271,16 @@
 
 <section class="phase" data-phase="4">
   <div class="phase-head">
-    <h2>Phase 4 — detach, adopt, tear-off</h2><span class="effort">M–L</span>
+    <h2>Phase 4 — move sessions between windows, tear-off</h2><span class="effort">M–L</span>
     <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
   </div>
-  <p class="blurb">In-app detach: sessions outlive their window (not the app). Full daemon deliberately deferred.</p>
+  <p class="blurb">A session moves between OS windows and a pane tears off into one of its own — pty moved, not respawned. Shipped first as an app-global detached pool, then reworked after a feel-check into a direct move with no intermediate visible state. Full daemon deliberately deferred.</p>
   <ul class="tasks">
-    <li data-status="todo"><span class="chip">todo</span><span class="t">App-global session registry (pty ownership out of per-window <code>SessionManager</code>)</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Close-window-keeps-sessions option; "detached sessions" sidebar section</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Adopt-into-window</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Revive cross-window pane move / tear-off (<code>extract_pane</code>/<code>insert_pane</code> seams)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Direct "Move to Window" context-menu verb on a sidebar session row: an item per other open window (MRU order) plus "Move to New Window" <span class="note">reworked from click-adopt out of a visible "Detached" pool, which is gone</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Transfer plumbing: <code>detach_session</code>/<code>adopt_entry</code> move a session's live ptys between windows with no respawn, in one synchronous update chain</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Last-session-out closes the emptied source window with no confirmation (nothing died, the session moved)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Tear-off (<kbd>^⌘n</kbd> / File ▸ Tear Off Pane) on the <code>extract_window</code> seam <span class="note">unchanged by the rework</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">⌘W / red-button close and ⌘Q reverted to confirm-then-kill (no window-less mode)</span></li>
   </ul>
 </section>
 
@@ -288,6 +289,7 @@
     <h2>Phase 5 — power features</h2><span class="effort">à la carte</span>
     <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
   </div>
+  <p class="blurb">ON ICE: pane-addressing (the fork-time <code>NICE_SOCKET</code>/<code>NICE_TAB_ID</code> env staleness a moved pane keeps, § Phase 4) is pulled ahead of this list as the next plan; everything below waits on it.</p>
   <ul class="tasks">
     <li data-status="todo"><span class="chip">todo</span><span class="t"><code>nice</code> CLI over the control socket: split, send-keys, new-session, select-pane</span></li>
     <li data-status="todo"><span class="chip">todo</span><span class="t">Synchronize-panes (fan input to all panes in a pill)</span></li>
@@ -306,7 +308,7 @@
       <tr><td><strong>window</strong></td><td><code>Pane</code> — upper-bar pill, one pty (<code>pane.rs</code>)</td><td><code>TermWindow</code></td><td>Decided 2026-08-08 — avoids the <code>gpui::Window</code> collision</td></tr>
       <tr><td><strong>pane</strong></td><td>— (didn't exist before Phase 2)</td><td><code>Pane</code></td><td>Split-tree leaf, introduced in Phase 2 ✓</td></tr>
       <tr><td><strong>client</strong></td><td>OS window (<code>WindowState</code>)</td><td>keep</td><td></td></tr>
-      <tr><td><strong>server</strong></td><td>the app process</td><td>keep</td><td>No daemon; in-app detach is Phase 4</td></tr>
+      <tr><td><strong>server</strong></td><td>the app process</td><td>keep</td><td>No daemon; Phase 4 moves sessions in-app between windows</td></tr>
       <tr><td>—</td><td><code>Project</code> — sidebar section</td><td>keep</td><td>No tmux analogue (session group)</td></tr>
       <tr><td>—</td><td><code>SessionManager</code> etc. (pty-sense "session")</td><td><code>PtyManager</code> (or similar)</td><td>Frees the word "session" for the tmux sense</td></tr>
     </tbody>

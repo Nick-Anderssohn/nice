@@ -1,21 +1,20 @@
-//! Slice-4 tests for tear-off: the window-level extraction that turns a focused
-//! pane into a synthetic [`DetachedEntry`], both §P9 branches, and the hand-off
-//! into a receiving window.
+//! Tests for tear-off: the window-level extraction that turns a focused pane
+//! into a synthetic [`DetachedEntry`](super::DetachedEntry), both §P9 branches,
+//! and the hand-off into a receiving window.
 //!
-//! They live beside the adoption tests because tear-off is adoption's other door:
-//! the entry these mint is the entry [`WindowState::adopt_entry`] lands, so the
-//! round trip here is the same one the real construction path
+//! The entry these mint is the entry
+//! [`WindowState::adopt_entry`](crate::window_state::WindowState::adopt_entry)
+//! lands, so the round trip here is the same one the real construction path
 //! ([`crate::app::open_managed_window_adopting`]) performs — minus `open_window`
 //! itself, which needs a real platform window and is covered by the live
 //! scenario.
-
-use super::*;
 
 use gpui::{AppContext, Entity, TestAppContext};
 use nice_model::{Pane, Project, Session, SplitOrient, TermWindow, TermWindowKind, WorkspaceModel};
 use nice_term_core::SpawnSpec;
 
 use crate::pty_manager::DissolveTerminus;
+use crate::window_state::WindowState;
 
 // ---- fixtures --------------------------------------------------------------
 
@@ -194,16 +193,14 @@ fn tearing_off_an_unsplit_pill_dissolves_the_emptied_source_session(cx: &mut Tes
             handle.read(app).session().try_status().is_none(),
             "the child is still running — a tear-off kills nothing"
         );
-        assert!(entry.has_live(app), "and the entry knows it");
     });
     drop(entry);
 }
 
 // ---- refusals --------------------------------------------------------------
 
-/// The scope guard: a Claude pane never becomes its own window through this door
-/// (a Claude session moves whole through Detach ▸ Open in New Window). Refused
-/// silently — exactly what break-pane does — and with nothing mutated.
+/// The scope guard: a Claude pane never becomes its own window through this door.
+/// Refused silently — exactly what break-pane does — and with nothing mutated.
 #[gpui::test]
 fn tearing_off_a_claude_pane_is_refused(cx: &mut TestAppContext) {
     let source = window_with_one_session(cx);

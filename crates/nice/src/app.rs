@@ -654,16 +654,8 @@ pub(crate) fn run_restore_fan_out(cx: &mut App) -> Result<usize> {
     Ok(restored_ids.len())
 }
 
-/// Total live windows `(claude, terminal)` across every registered window PLUS the
-/// detached pool — the ⌘Q counting rule (Swift
-/// `AppDelegate.applicationShouldTerminate:34-40`), extended by tmux-port Phase 4
-/// §P10.
-///
-/// The pool term is what stops ⌘Q silently SIGHUPing detached children: they have
-/// no window to be counted through, so without it a window-less quit would read
-/// zero and cascade without a word. Only pooled entries with a LIVE child count —
-/// a structural row costs no process, so it must neither inflate the confirmation
-/// nor block the quit.
+/// Total live windows `(claude, terminal)` across every registered window — the ⌘Q
+/// counting rule (Swift `AppDelegate.applicationShouldTerminate:34-40`).
 fn total_live_window_counts(cx: &App) -> (usize, usize) {
     let mut claude = 0;
     let mut terminal = 0;
@@ -672,8 +664,7 @@ fn total_live_window_counts(cx: &App) -> (usize, usize) {
         claude += c;
         terminal += t;
     }
-    let (pool_claude, pool_terminal) = crate::detached_pool::pool_live_window_counts(cx);
-    (claude + pool_claude, terminal + pool_terminal)
+    (claude, terminal)
 }
 
 /// Snapshot + upsert every registered window into the session store, then flush.
@@ -743,92 +734,21 @@ fn resolve_modal_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowSta
     Some((win, state))
 }
 
-/// What ⌘Q should do, as a PURE decision (tmux-port Phase 4, plan review F2).
-///
-/// The presentation itself cannot be unit-tested —
-/// [`WindowState::present_confirmation`](crate::window_state::WindowState::present_confirmation)
-/// panics on the headless test platform, the same split
-/// [`resolve_modal_host`] is already split for — so the decision lives here as
-/// data and the actuation lives in [`request_quit`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuitDecision {
-    /// Nothing live to destroy: cascade with no dialog, exactly as today.
-    QuitNow,
-    /// Present the confirmation on the resolved host window.
-    PresentOnHost,
-    /// Nothing can host the confirmation (no registered window — window-less
-    /// mode, or a Settings-only app) but the pool holds live children. Open a
-    /// window FIRST and present there (plan review B2).
-    OpenWindowThenPresent,
-}
-
-/// The pure ⌘Q decision (plan §P10, review B2/F2).
-///
-/// `live_count` already includes the pool's live term (see
-/// [`total_live_window_counts`]), so a window-less app with a live pooled child
-/// reads nonzero — which is the whole point: without the [`OpenWindowThenPresent`]
-/// arm, ⌘Q in window-less mode would fall through today's `None`-host branch
-/// straight into [`quit_cascade`] and silently SIGHUP the entire live pool, the
-/// exact outcome D5 says must be confirmed.
-///
-/// [`OpenWindowThenPresent`]: QuitDecision::OpenWindowThenPresent
-pub(crate) fn quit_decision(
-    live_count: usize,
-    host_available: bool,
-    pool_live: bool,
-) -> QuitDecision {
-    if live_count == 0 && !pool_live {
-        return QuitDecision::QuitNow;
-    }
-    if host_available {
-        return QuitDecision::PresentOnHost;
-    }
-    if pool_live {
-        return QuitDecision::OpenWindowThenPresent;
-    }
-    // Something is live but no window can host the dialog and nothing pooled is
-    // at risk — today's behaviour: quit rather than drop the modal.
-    QuitDecision::QuitNow
-}
-
-/// ⌘Q / Quit-menu handler. Nothing live ⇒ [`quit_cascade`] with no dialog; else
-/// present the quit confirmation (confirm ⇒ cascade, cancel ⇒ total no-op) on the
-/// window [`resolve_modal_host`] resolves — the registry's MRU window when the key
-/// window is the unregistered Settings window (#4) — or, in window-less mode with
-/// a live pool, on a window opened for the purpose (§P10 / review B2).
-///
-/// **Cancel leaves that recovery window open.** A designed outcome, not a
-/// surprise: it renders the Detached section, which is the right context for the
-/// question that was just asked.
+/// ⌘Q / Quit-menu handler. Zero live windows ⇒ [`quit_cascade`] with no dialog;
+/// else present the quit confirmation in the active window (confirm ⇒ cascade,
+/// cancel ⇒ total no-op). When the key window is the unregistered Settings window
+/// the confirmation is routed to the registry's MRU window (see
+/// [`resolve_modal_host`]) rather than bypassed (#4).
 fn request_quit(cx: &mut App) {
     let (claude, terminal) = total_live_window_counts(cx);
-    let pool_live = crate::detached_pool::pool_has_live(cx);
-    if claude + terminal == 0 && !pool_live {
+    if claude + terminal == 0 {
         quit_cascade(cx);
         return;
     }
-    // Resolve the window + state to host the confirmation (activating it, D2).
-    let host = resolve_modal_host(cx);
-    let host = match quit_decision(claude + terminal, host.is_some(), pool_live) {
-        QuitDecision::QuitNow => {
-            quit_cascade(cx);
-            return;
-        }
-        QuitDecision::PresentOnHost => host,
-        QuitDecision::OpenWindowThenPresent => {
-            // No window exists to ask in, and the pool holds running children.
-            // Open the EMPTY recovery window (never a fresh one — see
-            // `open_window_less_recovery_window`) and host the dialog there.
-            if let Err(e) = open_window_less_recovery_window(cx) {
-                eprintln!("nice: request_quit could not open a window to confirm on: {e:#}");
-                quit_cascade(cx);
-                return;
-            }
-            resolve_modal_host(cx)
-        }
-    };
-    let Some((win, state)) = host else {
-        // The recovery window failed to register — never leave ⌘Q inert.
+    // Resolve the window + state to host the confirmation. `None` ⇒ no Nice window
+    // is registered at all, so quit as today (the zero-live-windows fast path already
+    // returned above).
+    let Some((win, state)) = resolve_modal_host(cx) else {
         quit_cascade(cx);
         return;
     };
@@ -859,29 +779,16 @@ fn request_quit(cx: &mut App) {
     }
 }
 
-/// Open the window-less recovery window: an EMPTY Terminals-only seeded window
-/// (plan §P10, review F1).
+/// The adopting-window seed: a pinned Terminals project holding NO sessions.
 ///
-/// **Empty, never fresh** — this is the blocking half of F1. A fresh
-/// (`seed = None`) window eagerly spawns a live Main shell, which is
-/// detach-eligible, so under D1's no-confirm close every reopen→close cycle would
-/// add one junk "Main" row to the pool: the pool would self-pollute in exactly
-/// the window-less mode this phase exists to enable. A seeded window lazy-spawns
-/// nothing, and an empty Terminals-only window is a shape restore already
-/// represents and the store's prune deliberately keeps.
-///
-/// ⌘N stays a true fresh window — a user asking for a new window plausibly wants
-/// a shell — with the accepted consequence that closing an untouched fresh window
-/// pools its Main.
-fn open_window_less_recovery_window(cx: &mut App) -> Result<()> {
-    open_managed_window_with(cx, Some(empty_terminals_window_seed()), None)?;
-    Ok(())
-}
-
-/// The recovery window's seed: a pinned Terminals project holding NO sessions.
-/// Pure, so the F1 property — a recovery window contributes nothing
-/// detach-eligible, and therefore cannot pollute the pool on its own close — is a
-/// unit test rather than a headless window open.
+/// Every window that adopts a moved session — tear-off's new window and the
+/// Move-to-New-Window leg, both via [`open_managed_window_adopting`] — is built
+/// from this seed. It matters that it is EMPTY: a fresh (`seed = None`) window
+/// eagerly forks a Main shell, so seeding empty is what lets the adopted pane be
+/// the window's only session rather than sitting beside an unasked-for Main. An
+/// empty Terminals-only window is a shape restore already represents and the
+/// store's prune deliberately keeps. Pure, so it needs no headless window open to
+/// exercise.
 fn empty_terminals_window_seed() -> crate::restore::WindowSeed {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     crate::restore::WindowSeed {
@@ -899,22 +806,6 @@ fn empty_terminals_window_seed() -> crate::restore::WindowSeed {
         sidebar_mode: None,
         sidebar_width: None,
         frame: None,
-    }
-}
-
-/// The dock-icon reopen hook (plan §P10): with the app running window-less —
-/// which D5 now allows, because a live pooled session keeps it alive — clicking
-/// the dock icon must bring a window back.
-///
-/// Opens the same EMPTY Terminals-only window the ⌘Q confirm host uses, for the
-/// same F1 reason (a fresh window's eager Main would pool itself on the next
-/// close). A no-op whenever a managed window is already registered.
-fn handle_dock_reopen(cx: &mut App) {
-    if WindowRegistry::count(cx) > 0 {
-        return;
-    }
-    if let Err(e) = open_window_less_recovery_window(cx) {
-        eprintln!("nice: dock reopen could not open a window: {e:#}");
     }
 }
 
@@ -1042,14 +933,6 @@ pub(crate) fn quit_cascade(cx: &mut App) {
     for state in WindowRegistry::all_states(cx) {
         state.update(cx, |ws, _cx| ws.teardown());
     }
-    // tmux-port Phase 4 (§P10): step 4 extends to the detached pool — clean
-    // SIGHUPs for pooled children, matching `PtyManager::teardown`'s semantics.
-    // Safe HERE and not earlier because the pool is write-through (§P6/I5): the
-    // store cache already holds the bucket and the flush above already wrote it,
-    // so the detached ROWS survive the process even though the children do not.
-    if let Some(pool) = crate::detached_pool::pool(cx) {
-        pool.update(cx, |p, pcx| p.clear_live(pcx));
-    }
     cx.quit();
 }
 
@@ -1086,59 +969,16 @@ fn request_close_active_window(cx: &mut App) {
     }
 }
 
-/// What a ⌘W / red-button close should do, as a PURE decision (tmux-port Phase 4,
-/// plan review F2) — the ⌘W twin of [`QuitDecision`], split out for the same
-/// reason (`present_confirmation` panics headless).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WindowCloseDecision {
-    /// D1: move the window's eligible sessions into the pool and close, with NO
-    /// confirmation — nothing is destroyed, so there is nothing to confirm.
-    DetachAndClose,
-    /// The pre-Phase-4 flow: present the confirmation and veto the immediate
-    /// close.
-    Confirm,
-    /// Nothing live to lose: close outright, dropping the disk slot.
-    CloseAndRemove,
-}
-
-/// The pure ⌘W decision (plan §D1/§P5, review F2).
-///
-/// `detach_available` is the caller's fold of "the setting is ON **and** a pool
-/// is installed", and `detach_eligible_count` is 0 whenever it is false — so an
-/// app with no pool (every scenario and `run_selftest`) and a user who turned the
-/// setting off both land on today's two arms, byte for byte.
-///
-/// The zero-live-windows arm is checked FIRST and independently: it is today's
-/// unconditional close, and a window with nothing alive has nothing eligible
-/// either, so the two can never disagree.
-pub(crate) fn window_close_decision(
-    detach_available: bool,
-    live_window_count: usize,
-    detach_eligible_count: usize,
-) -> WindowCloseDecision {
-    if live_window_count == 0 {
-        return WindowCloseDecision::CloseAndRemove;
-    }
-    if detach_available && detach_eligible_count > 0 {
-        WindowCloseDecision::DetachAndClose
-    } else {
-        WindowCloseDecision::Confirm
-    }
-}
-
 /// The shared ⌘W / red-traffic-light close decision (Swift
 /// `CloseConfirmationDelegate.windowShouldClose`). Returns whether the close may
 /// proceed immediately: the `on_window_should_close` gate returns this as its
 /// bool, and `request_close_active_window` calls `remove_window()` when `true`.
 ///
-/// Once quit has begun ([`AppQuitting`]) every close is unconditional. Otherwise
-/// [`window_close_decision`] routes it: no live windows ⇒ close unconditionally
-/// (marking `user_initiated_close` so the slot is dropped from disk); detach ON
-/// with eligible sessions ⇒ the same, with NO confirmation (D1 — the actual move
-/// into the pool happens in
-/// [`WindowRegistry::route_close_disk_fate`](crate::window_registry::WindowRegistry::route_close_disk_fate),
-/// after this returns `true`); else present the confirmation (confirm ⇒ set the
-/// flag + `remove_window()`; cancel ⇒ total no-op) and veto the immediate close.
+/// Once quit has begun ([`AppQuitting`]) every close is unconditional. With no
+/// live windows the close is unconditional too — but marks `user_initiated_close`
+/// so the slot is dropped from disk. With live windows it presents the confirmation
+/// (confirm ⇒ set the flag + `remove_window()`; cancel ⇒ total no-op) and vetoes
+/// the immediate close.
 pub(crate) fn request_window_close(
     state: Entity<WindowState>,
     window: &mut Window,
@@ -1148,18 +988,9 @@ pub(crate) fn request_window_close(
         return true;
     }
     let (claude, terminal) = state.read(cx).live_window_counts();
-    let detach_available = crate::detached_pool::detach_on_close_enabled(cx);
-    let eligible = if detach_available {
-        crate::detached_pool::detach_eligible_session_ids(&state.read(cx).workspace).len()
-    } else {
-        0
-    };
-    match window_close_decision(detach_available, claude + terminal, eligible) {
-        WindowCloseDecision::CloseAndRemove | WindowCloseDecision::DetachAndClose => {
-            state.update(cx, |ws, _cx| ws.set_user_initiated_close(true));
-            return true;
-        }
-        WindowCloseDecision::Confirm => {}
+    if claude + terminal == 0 {
+        state.update(cx, |ws, _cx| ws.set_user_initiated_close(true));
+        return true;
     }
     let copy = crate::lifecycle::close_dialog_copy(claude, terminal);
     let confirm_state = state.clone();
@@ -1292,13 +1123,8 @@ pub fn run() {
     // before any glyph rasterizes, so the bg-luminance curve is the sole text
     // AA shaping (see `platform::disable_font_smoothing`).
     crate::platform::disable_font_smoothing();
-    let application = gpui_platform::application().with_assets(crate::chrome_icons::ChromeIconAssets);
-    // tmux-port Phase 4 (§P10): the dock-icon reopen hook. D5 lets the app run
-    // window-less while a detached session is still alive, so a dock click has to
-    // be able to bring a window back — this is the only way in from there. Wired
-    // on the `Application` (it takes `&self`), before `run` consumes it.
-    application.on_reopen(handle_dock_reopen);
-    application
+    gpui_platform::application()
+        .with_assets(crate::chrome_icons::ChromeIconAssets)
         .run(|cx: &mut App| {
         cx.activate(true);
         // R12: the process-wide window registry + its single close observer
@@ -1445,18 +1271,6 @@ pub fn run() {
         // Swift migration read), so the restore fan-out below sees the saved
         // windows and every later persistence hook goes live. app::run ONLY.
         install_session_store(cx);
-        // tmux-port Phase 4: create + hydrate the app-global detached pool from
-        // the store cache, IMMEDIATELY after the store is installed and BEFORE
-        // the restore fan-out below (plan review F3). Hydration runs the
-        // duplicate-id reconcile — a `detached[]` row whose session id also
-        // appears under `windows[]` is dropped, the attached copy wins — and
-        // writes the reconciled bucket straight back through. The fan-out's own
-        // store mutations (the ghost pre-pass, `prune_empty_windows_keeping`)
-        // only ever drop session-LESS window slots, so they cannot change that
-        // verdict; the argument lives on `detached_pool::install`. app::run
-        // ONLY — `run_selftest` and scenarios install no pool, and every
-        // consumer treats an absent pool as "no detached sessions".
-        crate::detached_pool::install(cx);
         // R19: install the production `WorkspaceOps` seam (open / open-with /
         // reveal / Launch-Services enumeration / Other… chooser) as the process
         // Global — the ONLY place the shipped objc2 workspace calls are reached.
@@ -1887,10 +1701,10 @@ pub(crate) fn open_managed_window_with(
     open_managed_window_inner(cx, seed, projects_root, &mut None)
 }
 
-/// Open a window that already HOLDS a detached session — the adopt variant
+/// Open a window that already HOLDS a transferred session — the adopt variant
 /// [`open_managed_window_with`]'s doc comment has anticipated since R18 (plan §P9).
-/// Both doors into it hand over an entry they have already taken ownership of:
-/// tear-off's synthetic entry, and the pool's "Open in New Window".
+/// The door into it hands over an entry it has already taken ownership of:
+/// tear-off's synthetic entry (and, in Slice 3, the Move-to-New-Window verb).
 ///
 /// The window is built through the SAME construction path as every other one; the
 /// entry simply lands in its [`WindowState`] BEFORE `open_window`, through the one
@@ -1909,14 +1723,13 @@ pub(crate) fn open_managed_window_with(
 ///
 /// **Refusal hands the entry BACK** (`Err(entry)`) rather than dropping it — the
 /// same rule `adopt_entry` follows, for the same reason: dropping a live payload
-/// SIGHUPs a running child. Callers put it back where it came from (the pool head,
-/// or the source window).
+/// SIGHUPs a running child. Callers put it back into the source window.
 // The `Err` variant IS the entry, matching `WindowState::adopt_entry`.
 #[allow(clippy::result_large_err)]
 pub(crate) fn open_managed_window_adopting(
     cx: &mut App,
-    entry: crate::detached_pool::DetachedEntry,
-) -> Result<(), crate::detached_pool::DetachedEntry> {
+    entry: crate::session_transfer::DetachedEntry,
+) -> Result<(), crate::session_transfer::DetachedEntry> {
     let mut adopt = Some(entry);
     match open_managed_window_inner(
         cx,
@@ -1939,7 +1752,7 @@ fn open_managed_window_inner(
     cx: &mut App,
     seed: Option<crate::restore::WindowSeed>,
     projects_root: Option<PathBuf>,
-    adopt: &mut Option<crate::detached_pool::DetachedEntry>,
+    adopt: &mut Option<crate::session_transfer::DetachedEntry>,
 ) -> Result<WindowHandle<crate::app_shell::AppShellView>> {
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let restoring = seed.is_some();
@@ -4520,28 +4333,6 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
-        // tmux-port Phase 4: the detach / adopt / tear-off gate. The ONLY scenario
-        // that installs a `DetachedPool` (so it is the only one where a close
-        // detaches), over a temp store + sandbox HOME, both Globals cleared at
-        // teardown. Drives the shipped doors end to end on one real pty: the REAL
-        // close action detaches with no confirmation and one disk batch, a fresh
-        // window renders the Detached section in this process's AX tree, and
-        // click-adopt / ⌃⌘⇧D / ⌃⌘A / ⌃⌘N move the SAME session handle with its
-        // scrollback. Registered BEFORE `multiwindow`: it registers the
-        // `WindowRegistry` WITHOUT `install` and routes closes through a scoped
-        // `route_close_disk_fate` observer, so quit-when-empty never fires.
-        Scenario {
-            name: "detach-adopt",
-            open: crate::detach_adopt_live::open_detach_adopt_window,
-            gate: Gate::SelfReported {
-                // A real login-shell spawn + two grid-marker polls, two window
-                // opens, an AX poll for the Detached section, four action
-                // dispatches with their settles, and a split's second pty — each
-                // on the real pty / AX clock; generous headroom.
-                budget: Duration::from_secs(120),
-            },
-            activate: true,
-        },
         // R19: the file-explorer shipped-surface gate — drives the SHIPPED window
         // (open_managed_window / build_window_root) with the sidebar in files mode:
         // ⌘⇧B swaps in the tree (AX root + fixture row), single-click expand/
@@ -4736,6 +4527,21 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // rail poll — each on the real socket / pty / AX clock; generous
                 // headroom.
                 budget: Duration::from_secs(90),
+            },
+            activate: true,
+        },
+        // session-move rework: registered BEFORE `multiwindow` — its
+        // `open_managed_window` calls only `register` (no `WindowRegistry::install`),
+        // so its own scoped close observer routes disk fate + teardown without
+        // quit-when-empty, which would otherwise kill the suite the moment its
+        // Move-to-Window leg empties and closes window A.
+        Scenario {
+            name: "move-session",
+            open: crate::move_session_live::open_move_session_window,
+            gate: Gate::SelfReported {
+                // Two real login-shell comes-up polls plus two Move legs, each
+                // with its settle; generous headroom.
+                budget: Duration::from_secs(45),
             },
             activate: true,
         },
@@ -5458,156 +5264,5 @@ mod tests {
         );
 
         teardown_temp_store(dir);
-    }
-}
-
-// ===========================================================================
-// tmux-port Phase 4 — the pure ⌘Q / ⌘W decision seams (plan review F2)
-// ===========================================================================
-//
-// `WindowState::present_confirmation` panics on the headless test platform (its
-// window has no backing NSView), so these matrices drive the DECISIONS only —
-// never the presentation, which the live scenario and the hand gates cover.
-
-#[cfg(test)]
-mod phase4_decision_tests {
-    use super::{
-        empty_terminals_window_seed, quit_decision, window_close_decision, QuitDecision,
-        WindowCloseDecision,
-    };
-    use crate::detached_pool::detach_eligible_session_ids;
-    use crate::window_state::WindowState;
-
-    // ---- ⌘W ---------------------------------------------------------------
-
-    /// Nothing alive ⇒ today's unconditional close, whatever the setting says.
-    /// This arm is checked first and independently, and a window with nothing
-    /// alive has nothing eligible either, so the two inputs can never disagree.
-    #[test]
-    fn close_with_no_live_windows_closes_and_removes() {
-        assert_eq!(
-            window_close_decision(true, 0, 0),
-            WindowCloseDecision::CloseAndRemove
-        );
-        assert_eq!(
-            window_close_decision(false, 0, 0),
-            WindowCloseDecision::CloseAndRemove
-        );
-    }
-
-    /// D1: detach available AND something eligible ⇒ close silently. Nothing is
-    /// destroyed, so there is nothing to confirm.
-    #[test]
-    fn close_with_detach_on_and_eligible_sessions_skips_the_confirm() {
-        assert_eq!(
-            window_close_decision(true, 1, 1),
-            WindowCloseDecision::DetachAndClose
-        );
-        assert_eq!(
-            window_close_decision(true, 3, 2),
-            WindowCloseDecision::DetachAndClose
-        );
-    }
-
-    /// Setting OFF (or no pool installed — the caller folds both into
-    /// `detach_available`) ⇒ the pre-Phase-4 confirm, byte for byte. So does
-    /// detach-on with nothing eligible, which cannot happen from the model but
-    /// must not silently skip the confirm if it ever did.
-    #[test]
-    fn close_falls_back_to_todays_confirm_without_detach() {
-        assert_eq!(
-            window_close_decision(false, 2, 0),
-            WindowCloseDecision::Confirm
-        );
-        assert_eq!(
-            window_close_decision(true, 2, 0),
-            WindowCloseDecision::Confirm
-        );
-    }
-
-    // ---- ⌘Q ---------------------------------------------------------------
-
-    /// Today's fast path, unchanged: nothing live anywhere ⇒ cascade with no
-    /// dialog.
-    #[test]
-    fn quit_with_nothing_live_cascades_without_a_dialog() {
-        assert_eq!(quit_decision(0, true, false), QuitDecision::QuitNow);
-        assert_eq!(quit_decision(0, false, false), QuitDecision::QuitNow);
-    }
-
-    /// A registered window can host the dialog ⇒ present there, pool or no pool.
-    #[test]
-    fn quit_with_a_host_presents_on_it() {
-        assert_eq!(quit_decision(2, true, false), QuitDecision::PresentOnHost);
-        assert_eq!(quit_decision(2, true, true), QuitDecision::PresentOnHost);
-        // Window-less but a live pool, and a host somehow resolved: still present.
-        assert_eq!(quit_decision(1, true, true), QuitDecision::PresentOnHost);
-    }
-
-    /// The B2 case, and the one this seam exists for: window-less ⌘Q with a live
-    /// pool must OPEN a window and ask — never `QuitNow`, which would silently
-    /// SIGHUP the entire live pool. The Settings-only app is the same shape:
-    /// Settings is unregistered, so `resolve_modal_host` returns `None` there too.
-    #[test]
-    fn window_less_quit_with_a_live_pool_opens_a_window_to_confirm_on() {
-        // Window-less: the count is entirely the pool's live term.
-        assert_eq!(
-            quit_decision(1, false, true),
-            QuitDecision::OpenWindowThenPresent,
-            "a live pool with no host must be confirmed, not cascaded"
-        );
-        // Settings-only: same host-less shape, same answer.
-        assert_eq!(
-            quit_decision(2, false, true),
-            QuitDecision::OpenWindowThenPresent
-        );
-        // And never QuitNow while the pool is live, at any count.
-        for count in 0..4 {
-            assert_ne!(
-                quit_decision(count, false, true),
-                QuitDecision::QuitNow,
-                "count {count}: a live pool must never cascade unconfirmed"
-            );
-        }
-    }
-
-    /// No host and nothing pooled at risk ⇒ today's behaviour (quit rather than
-    /// drop the modal on the floor).
-    #[test]
-    fn quit_without_a_host_or_a_live_pool_still_quits() {
-        assert_eq!(quit_decision(2, false, false), QuitDecision::QuitNow);
-    }
-
-    // ---- F1: the recovery window cannot pollute the pool -------------------
-
-    /// The blocking F1 property. A window-less recovery window (dock reopen, or
-    /// the ⌘Q confirm host) is seeded EMPTY, so it contributes NOTHING
-    /// detach-eligible and a reopen→close cycle cannot grow the pool. A FRESH
-    /// window does the opposite — its eagerly-spawned Main is eligible — which is
-    /// exactly the self-pollution the seeded shape avoids, and why ⌘N (which
-    /// stays fresh) carries that accepted consequence instead.
-    #[test]
-    fn the_recovery_window_is_empty_so_reopen_then_close_cannot_grow_the_pool() {
-        let seed = empty_terminals_window_seed();
-        assert_eq!(seed.projects.len(), 1, "one pinned Terminals project");
-        assert_eq!(
-            seed.projects[0].id,
-            nice_model::WorkspaceModel::TERMINALS_PROJECT_ID
-        );
-        assert!(seed.projects[0].sessions.is_empty(), "and it holds no session");
-        assert!(seed.active_session_id.is_none());
-
-        let recovery = WindowState::with_seed(seed);
-        assert!(
-            detach_eligible_session_ids(&recovery.workspace).is_empty(),
-            "closing a recovery window detaches nothing — the pool cannot self-pollute"
-        );
-
-        // The contrast that makes the assertion mean something.
-        let fresh = WindowState::new("/tmp");
-        assert!(
-            !detach_eligible_session_ids(&fresh.workspace).is_empty(),
-            "a FRESH window's eager Main IS eligible — the F1 hazard, kept off this path"
-        );
     }
 }

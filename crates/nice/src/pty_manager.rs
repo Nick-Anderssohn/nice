@@ -277,23 +277,23 @@ impl WindowPty {
     }
 }
 
-/// One detached session's LIVE ptys, moved whole out of a [`PtyManager`] and
-/// parked in the app-global [`DetachedPool`](crate::detached_pool::DetachedPool)
-/// until some window adopts it (tmux-port Phase 4, plan §P3).
+/// One session's LIVE ptys, moved whole out of a [`PtyManager`] so the session
+/// can be transferred to another window (tmux-port Phase 4, plan §P3). Rides
+/// inside a [`DetachedEntry`](crate::session_transfer::DetachedEntry).
 ///
 /// **Opaque by design.** [`WindowPty`] and [`PaneState`] are private to this
 /// module — that is what keeps "a live pty belongs to exactly one manager" a
-/// type-level fact — so the pool stores this payload without ever seeing
-/// inside. Only `pty_manager` builds one (`take_session`) and consumes one
-/// (`insert_session`); both land with the detach slice.
+/// type-level fact — so the transfer payload carries them without ever letting
+/// another module see inside. Only `pty_manager` builds one (`take_session`) and
+/// consumes one (`insert_session`).
 ///
-/// Holding this alive is what makes detach non-destructive: the entities inside
+/// Holding this alive is what makes the move non-destructive: the entities inside
 /// are the same `Entity<TerminalSessionHandle>`s the source window had, so
 /// nothing is dropped, no `SIGHUP` is sent, and the children never notice.
-/// Dropping it is therefore also the pool's `kill`. An EMPTY payload
-/// ([`DetachedPtys::empty`]) is a **structural** entry — a row with no live
-/// process behind it (a never-activated restored session, or the whole pool
-/// after a relaunch), which respawns lazily on adopt-activate.
+/// Dropping it SIGHUPs the child's process group instead. An EMPTY payload
+/// ([`DetachedPtys::empty`]) is a **structural** entry — no live process behind
+/// it (a never-activated restored session), which respawns lazily on
+/// adopt-activate.
 pub(crate) struct DetachedPtys {
     /// `term_window_id -> WindowPty` — exactly the inner map
     /// [`PtyManager::sessions`] holds for one session id.
@@ -324,24 +324,6 @@ impl DetachedPtys {
     /// entry).
     pub(crate) fn is_structural(&self) -> bool {
         self.windows.is_empty()
-    }
-
-    /// Whether ANY pooled pane's child is still running — the poll-style
-    /// liveness read the window-less-quit check needs (plan review N2:
-    /// `TermSession::try_status()` is the ONE liveness primitive; do not invent
-    /// a second).
-    ///
-    /// A pane that has not spawned yet (an armed deferred resume) also reports
-    /// `None` and therefore reads as live. That errs toward keeping the app
-    /// alive rather than silently tearing the pool down, which is the safe
-    /// direction for D5.
-    pub(crate) fn has_live(&self, cx: &App) -> bool {
-        self.windows.values().any(|window| {
-            window
-                .panes
-                .values()
-                .any(|pane| pane.handle.read(cx).session().try_status().is_none())
-        })
     }
 }
 

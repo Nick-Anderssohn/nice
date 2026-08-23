@@ -3503,7 +3503,6 @@ fn take_session_moves_the_live_pty_without_sighup(cx: &mut gpui::TestAppContext)
 
         let payload = mgr.take_session("t1");
         assert!(!payload.is_structural(), "a live session takes a live payload");
-        assert!(payload.has_live(cx), "the taken payload still holds a running child");
         assert!(
             !mgr.has_window("t1", "w1"),
             "the source manager no longer owns the pill"
@@ -3807,7 +3806,11 @@ fn tear_off_moves_the_live_handle_without_respawning(cx: &mut gpui::TestAppConte
         let (session, payload) = mgr
             .tear_off_pane(&mut model, "t1", "p1", "p1")
             .expect("the pill tears off");
-        assert!(payload.has_live(cx), "the payload carries a running child");
+        assert!(!payload.is_structural(), "the payload carries a live pty");
+        assert!(
+            handle.read(cx).session().try_status().is_none(),
+            "the child is still running — a tear-off kills nothing"
+        );
         assert!(
             !mgr.has_window("t1", "p1"),
             "the source manager gave the pill up"
