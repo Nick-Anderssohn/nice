@@ -318,14 +318,10 @@ pub fn make_claude_theme(colors: &ThemeColors, scheme: ColorScheme, accent: Rgb8
     put("rate_limit_fill", a[4]);
     put("rate_limit_empty", blend(a[8], bg, 0.5));
 
-    // Diffs — block tints over the background, word-level on bright
-    // (ClaudeThemeSync.swift:238-243)
-    put("diffAdded", blend(a[2], bg, 0.30));
-    put("diffRemoved", blend(a[1], bg, 0.30));
-    put("diffAddedDimmed", blend(a[2], bg, 0.15));
-    put("diffRemovedDimmed", blend(a[1], bg, 0.15));
-    put("diffAddedWord", blend(a[10], bg, 0.55));
-    put("diffRemovedWord", blend(a[9], bg, 0.55));
+    // Diffs — deliberately NOT overridden. Claude Code's built-in light/dark
+    // themes supply `diffAdded`/`diffRemoved`/`*Dimmed`/`*Word`, and those read
+    // better than an ANSI-over-background blend. (Claude Code ignored these
+    // keys until 2.1.246, so the built-ins are what users always actually saw.)
 
     // Per-agent palette (ClaudeThemeSync.swift:246-253)
     put("red_FOR_SUBAGENTS_ONLY", a[1]);
@@ -789,17 +785,21 @@ mod tests {
         assert_eq!(o["warningShimmer"], t.ansi[11].hex());
         assert_eq!(o["permissionShimmer"], t.ansi[12].hex());
         assert_eq!(o["inactiveShimmer"], t.ansi[15].hex());
-        assert_eq!(o["diffAddedWord"], blend(t.ansi[10], t.background, 0.55).hex());
-        assert_eq!(o["diffRemovedWord"], blend(t.ansi[9], t.background, 0.55).hex());
     }
 
     #[test]
-    fn block_diffs_blend_normal_ansi_over_background() {
-        let t = make_theme(None);
-        let o = overrides(&dark(&t, Rgb8::new(7, 8, 9)));
-        assert_eq!(o["diffAdded"], blend(t.ansi[2], t.background, 0.30).hex());
-        assert_eq!(o["diffRemoved"], blend(t.ansi[1], t.background, 0.30).hex());
-        assert_eq!(o["diffAddedDimmed"], blend(t.ansi[2], t.background, 0.15).hex());
+    fn diff_colors_are_left_to_claude_codes_base_theme() {
+        let o = overrides(&dark(&make_theme(None), Rgb8::new(7, 8, 9)));
+        for key in [
+            "diffAdded",
+            "diffRemoved",
+            "diffAddedDimmed",
+            "diffRemovedDimmed",
+            "diffAddedWord",
+            "diffRemovedWord",
+        ] {
+            assert!(!o.contains_key(key), "{key} must not be overridden");
+        }
     }
 
     #[test]
