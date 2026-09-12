@@ -214,9 +214,10 @@ impl SidebarProbe {
 
     // ---- routing (mirror of SidebarShellView) ------------------------------
 
-    /// Mirror of `SidebarShellView::route_click` (`sidebar_shell.rs:392`): plain
-    /// replaces + activates; ⌘ toggles (only-and-active refused → no reselect);
-    /// ⇧ extends from the sticky anchor. Resets `activated_at` only when the
+    /// Mirror of `SidebarShellView::route_click`: plain replaces + activates; ⌘
+    /// toggles (active unchanged unless the active row is toggled out;
+    /// only-and-active refused); ⇧ extends from the sticky anchor over the
+    /// visible rows (active unchanged). Resets `activated_at` only when the
     /// active session actually changes. The shipped view routes the active-session write
     /// through `ModelSidebarActions::select_session`, a `WorkspaceModel::select_session`
     /// passthrough in R10, so the probe calls the model directly.
@@ -227,9 +228,8 @@ impl SidebarProbe {
                 self.workspace.select_session(&new_active);
             }
         } else if shift {
-            let order = self.workspace.navigable_sidebar_session_ids();
+            let order = self.visible_session_ids();
             self.selection.extend(session_id, &order);
-            self.workspace.select_session(session_id);
         } else {
             self.selection.replace(session_id);
             self.workspace.select_session(session_id);
@@ -254,17 +254,19 @@ impl SidebarProbe {
         self.selection.sync_active_session_id(active.as_deref());
     }
 
-    /// Mirror of `SidebarShellView::handle_title_tap` (`sidebar_shell.rs:420`): a
-    /// plain tap on the already-active row enters rename only past the gate;
-    /// otherwise it routes like a plain select. Reads the simulated clock so a
-    /// test drives the gate with `advance_clock`.
+    /// Mirror of `SidebarShellView::handle_title_tap`: a plain tap on the
+    /// already-active row of a single selection enters rename only past the gate;
+    /// otherwise (including the active row of a multi-selection) it routes like a
+    /// plain select. Reads the simulated clock so a test drives the gate with
+    /// `advance_clock`.
     fn handle_title_tap(&mut self, session_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
         if cmd || shift {
             self.route_click(session_id, cmd, shift, cx);
             return;
         }
         let is_active = self.workspace.active_session_id() == Some(session_id);
-        if is_active {
+        let multi_selected = self.selection.selected_session_ids().len() > 1;
+        if is_active && !multi_selected {
             let now = cx.background_executor().now();
             if InlineRenameClickGate::can_begin_edit(self.activated_at, now, DOUBLE_CLICK_INTERVAL) {
                 self.begin_editing(session_id);
@@ -273,6 +275,26 @@ impl SidebarProbe {
         } else {
             self.route_click(session_id, false, false, cx);
         }
+    }
+
+    /// Mirror of the collapsing half of `SidebarShellView::toggle_disclosure`: hide
+    /// the project's rows and drop them from the selection, keeping the active
+    /// session.
+    fn collapse_project(&mut self, project_id: &str) {
+        self.collapsed_projects.insert(project_id.to_string());
+        let active = self.workspace.active_session_id();
+        let valid: HashSet<String> = self
+            .workspace
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.sessions
+                    .iter()
+                    .filter(move |s| p.id != project_id || active == Some(s.id.as_str()))
+                    .map(|s| s.id.clone())
+            })
+            .collect();
+        self.selection.prune(&valid);
     }
 
     fn begin_editing(&mut self, session_id: &str) {
@@ -633,17 +655,20 @@ fn plain_click_replaces_selection_and_is_consumed_by_the_row(cx: &mut TestAppCon
     );
 }
 
-/// ⌘-click toggles the clicked row in and moves active onto it (most-recently-
-/// clicked rule).
+/// ⌘-click toggles the clicked row in without changing the active session.
 #[gpui::test]
-fn cmd_click_toggles_in_and_moves_active(cx: &mut TestAppContext) {
+fn cmd_click_toggles_in_and_keeps_active(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
 
     vcx.simulate_click(row_bg_point(0), Modifiers::none()); // plain -> "terminals-main"
     vcx.simulate_click(row_bg_point(1), Modifiers::command()); // ⌘ -> add "t1"
 
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
-    assert_eq!(active(&probe, vcx).as_deref(), Some("t1"), "⌘-toggle-in moves active to the toggled id");
+    assert_eq!(
+        active(&probe, vcx).as_deref(),
+        Some("terminals-main"),
+        "⌘-toggle-in must not change the active session"
+    );
     assert_eq!(anchor(&probe, vcx).as_deref(), Some("t1"));
 }
 
@@ -662,7 +687,7 @@ fn cmd_click_only_active_row_is_refused(cx: &mut TestAppContext) {
 
 /// ⇧-click extends the selection from the sticky anchor to the clicked row,
 /// inclusive, and does **not** move the anchor (Finder keeps the original anchor
-/// across range extensions); the clicked row becomes active.
+/// across range extensions) or the active session.
 #[gpui::test]
 fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
@@ -676,12 +701,90 @@ fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
         "⇧-extend spans the anchor..target run inclusive"
     );
     assert_eq!(anchor(&probe, vcx).as_deref(), Some("t1"), "⇧-extend must NOT move the anchor");
-    assert_eq!(active(&probe, vcx).as_deref(), Some("t3"), "the ⇧-clicked row becomes active");
+    assert_eq!(active(&probe, vcx).as_deref(), Some("t1"), "⇧-extend must not change the active session");
 
     // A second ⇧-extend re-uses the SAME anchor (stickiness across extensions).
     vcx.simulate_click(row_bg_point(2), Modifiers::shift()); // ⇧ -> re-extend to "t2"
     assert_eq!(selection(&probe, vcx), ids(&["t1", "t2"]), "re-extend still measured from the sticky anchor");
     assert_eq!(anchor(&probe, vcx).as_deref(), Some("t1"), "anchor stayed put across the second extension");
+    assert_eq!(active(&probe, vcx).as_deref(), Some("t1"));
+}
+
+/// A ⌘-click moves the anchor off the active row; a ⇧-range from that anchor that
+/// doesn't reach the active row still keeps it selected and active.
+#[gpui::test]
+fn shift_click_from_cmd_moved_anchor_keeps_active_selected(cx: &mut TestAppContext) {
+    let (probe, vcx) = mount_probe(cx, seed_flat_model());
+
+    vcx.simulate_click(row_bg_point(3), Modifiers::none()); // plain -> "t3" (active)
+    vcx.simulate_click(row_bg_point(1), Modifiers::command()); // ⌘ + "t1" (anchor)
+    vcx.simulate_click(row_bg_point(0), Modifiers::shift()); // ⇧ -> "terminals-main"
+
+    assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1", "t3"]));
+    assert_eq!(active(&probe, vcx).as_deref(), Some("t3"));
+}
+
+/// A ⇧-range across a collapsed project skips that project's hidden sessions.
+#[gpui::test]
+fn shift_click_across_collapsed_group_skips_hidden_sessions(cx: &mut TestAppContext) {
+    let mut model = seed_projects_model();
+    let pi = model.ensure_project("proj2", "Proj2", "/home/u/proj2");
+    model.projects[pi].sessions.push(Session::new("q0", "Q", "/home/u/proj2"));
+    let (probe, vcx) = mount_probe(cx, model);
+    probe.update(vcx, |p, _| p.collapse_project("proj"));
+    vcx.run_until_parked();
+    assert_eq!(
+        probe.read_with(vcx, |p, _| p.visible_session_ids()),
+        vec!["terminals-main".to_string(), "q0".to_string()]
+    );
+
+    vcx.simulate_click(row_bg_point(0), Modifiers::none()); // plain -> "terminals-main"
+    vcx.simulate_click(row_bg_point(1), Modifiers::shift()); // ⇧ -> "q0"
+
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&["terminals-main", "q0"]),
+        "the collapsed project's p0/p1 must not join the range"
+    );
+}
+
+/// Collapsing a project drops its sessions from the selection, except the active
+/// session.
+#[gpui::test]
+fn collapsing_a_group_drops_its_non_active_sessions_from_selection(cx: &mut TestAppContext) {
+    let (probe, vcx) = mount_probe(cx, seed_projects_model());
+
+    vcx.simulate_click(row_bg_point(2), Modifiers::none()); // plain -> "p1" (active)
+    vcx.simulate_click(row_bg_point(0), Modifiers::shift()); // ⇧ -> {main, p0, p1}
+    assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "p0", "p1"]));
+
+    probe.update(vcx, |p, _| p.collapse_project("proj"));
+
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&["terminals-main", "p1"]),
+        "hidden p0 is dropped; active p1 stays selected"
+    );
+    assert_eq!(active(&probe, vcx).as_deref(), Some("p1"));
+}
+
+/// With 2+ selected, a plain title-tap on the active row collapses the selection to
+/// it instead of beginning a rename — even past the rename gate.
+#[gpui::test]
+fn title_tap_on_active_row_in_multi_selection_collapses_not_renames(cx: &mut TestAppContext) {
+    let (probe, vcx) = mount_probe(cx, seed_flat_model());
+
+    vcx.simulate_click(row_bg_point(1), Modifiers::none()); // plain -> "t1" (active)
+    vcx.simulate_click(row_bg_point(3), Modifiers::shift()); // ⇧ -> {t1, t2, t3}
+    vcx.executor().advance_clock(DOUBLE_CLICK_INTERVAL + Duration::from_millis(10));
+
+    vcx.simulate_click(row_title_point(1), Modifiers::none());
+
+    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "the tap collapses to the active row");
+    assert!(
+        probe.read_with(vcx, |p, _| p.editing_session_id.is_none()),
+        "a tap that collapses a multi-selection must not begin a rename"
+    );
 }
 
 // ============================================================================
@@ -699,18 +802,19 @@ fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
 fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
 
-    // Build a two-row selection: {terminals-main, t1}, active on t1.
-    vcx.simulate_click(row_bg_point(0), Modifiers::none()); // -> {terminals-main}
-    vcx.simulate_click(row_bg_point(1), Modifiers::command()); // + t1 (now active)
-    assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
-    assert_eq!(active(&probe, vcx).as_deref(), Some("t1"));
+    // Build a two-row selection: {terminals-main, t2}, active on t2 — so the next
+    // session (t3) is outside the set.
+    vcx.simulate_click(row_bg_point(2), Modifiers::none()); // -> {t2}
+    vcx.simulate_click(row_bg_point(0), Modifiers::command()); // + terminals-main
+    assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t2"]));
+    assert_eq!(active(&probe, vcx).as_deref(), Some("t2"));
 
     // Keyboard-cycle to the next session: the selection must collapse onto it, dropping
-    // both the prior-active row (t1) and the other set member (terminals-main).
+    // both the prior-active row (t2) and the other set member (terminals-main).
     probe.update(vcx, |p, _| p.route_next_sidebar_session());
 
     let new_active = active(&probe, vcx).expect("a session is active after cycling");
-    assert_ne!(new_active, "t1", "the cycle moved the active session off t1");
+    assert_ne!(new_active, "t2", "the cycle moved the active session off t2");
     assert_eq!(
         selection(&probe, vcx),
         ids(&[new_active.as_str()]),
@@ -729,13 +833,17 @@ fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
 fn empty_area_click_collapses_multi_selection(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
 
-    vcx.simulate_click(row_bg_point(0), Modifiers::none()); // "terminals-main"
-    vcx.simulate_click(row_bg_point(1), Modifiers::command()); // + "t1" (active)
+    vcx.simulate_click(row_bg_point(0), Modifiers::none()); // "terminals-main" (active)
+    vcx.simulate_click(row_bg_point(1), Modifiers::command()); // + "t1"
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
 
     vcx.simulate_click(empty_area_point(4), Modifiers::none());
 
-    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "empty-area click collapses to the active session");
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&["terminals-main"]),
+        "empty-area click collapses to the active session"
+    );
     assert!(
         read_u32(&probe, vcx, |p| p.empty_area_collapses) >= 1,
         "the empty-area press reached the collapse handler"
@@ -761,7 +869,11 @@ fn esc_collapses_only_when_more_than_one_selected(cx: &mut TestAppContext) {
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
 
     vcx.simulate_keystrokes("escape");
-    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "Esc with >1 selected collapses to the active session");
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&["terminals-main"]),
+        "Esc with >1 selected collapses to the active session"
+    );
     assert_eq!(
         read_u32(&probe, vcx, |p| p.esc_reached_terminal),
         0,
@@ -770,7 +882,11 @@ fn esc_collapses_only_when_more_than_one_selected(cx: &mut TestAppContext) {
 
     // ≤1 selected: Esc propagates through to the terminal, selection unchanged.
     vcx.simulate_keystrokes("escape");
-    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "Esc with 1 selected leaves the selection alone");
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&["terminals-main"]),
+        "Esc with 1 selected leaves the selection alone"
+    );
     assert_eq!(
         read_u32(&probe, vcx, |p| p.esc_reached_terminal),
         1,

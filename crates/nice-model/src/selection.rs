@@ -17,9 +17,9 @@
 //!   if the anchor session was removed from the tree.
 //! * `active_session_id` — a local mirror of `WorkspaceModel`'s active session. The R8 model
 //!   is the source of truth; the view layer feeds external active-session changes
-//!   in via [`SidebarSessionSelection::sync_active_session_id`], and the internal
-//!   mutators set it eagerly so they can self-check the invariant without a
-//!   round-trip through `WorkspaceModel`.
+//!   in via [`SidebarSessionSelection::sync_active_session_id`]. Only a plain click
+//!   (or right-click snap) moves it; ⇧- and ⌘-clicks leave it alone, except a
+//!   ⌘-click that toggles the active row itself out of a multi-selection.
 //! * the right-click snap policy ([`SidebarSessionSelection::selection_ids_for_right_click_on`]
 //!   / [`SidebarSessionSelection::snap_if_right_click_outside`]).
 //!
@@ -69,11 +69,13 @@ impl SidebarSessionSelection {
     /// ⌘-click. Toggle `id` in/out, moving the anchor to `id` either direction
     /// (Finder), and re-establish the active-superset invariant.
     ///
+    /// A ⌘-click never changes the active session, except when it toggles the
+    /// active row itself out of a multi-selection — then another selected row
+    /// must take over to keep the invariant.
+    ///
     /// Returns the session id that should now be active, or `None` when the active
-    /// session is unchanged. The view layer calls `WorkspaceModel::select_session` only on a
-    /// `Some` — a `None` for a ⌘-click on the only-and-active selected row keeps
-    /// the model and `WorkspaceModel` in sync without a redundant `select_session` write
-    /// (`SidebarTabSelection.swift:89-127`).
+    /// session is unchanged. The view layer calls `WorkspaceModel::select_session`
+    /// only on a `Some`.
     pub fn toggle(&mut self, id: &str) -> Option<String> {
         if self.selected_session_ids.contains(id) {
             self.last_clicked_session_id = Some(id.to_string());
@@ -104,24 +106,28 @@ impl SidebarSessionSelection {
                 None
             }
         } else {
+            // Toggling in: add the row without making it active.
             self.selected_session_ids.insert(id.to_string());
             self.last_clicked_session_id = Some(id.to_string());
-            self.active_session_id = Some(id.to_string());
-            Some(id.to_string())
+            None
         }
     }
 
-    /// ⇧-click. Extend the selection to span from `last_clicked_session_id` to `id`,
-    /// inclusive, using the given visible row order. With no anchor yet, behaves
-    /// like [`SidebarSessionSelection::replace`]. If either the anchor or the target
-    /// is missing from `visible_order`, falls back to a plain replace so the
-    /// selection still moves. The anchor is **not** updated — Finder keeps the
-    /// original anchor across multiple range extensions.
+    /// ⇧-click. Extend the selection to span from the anchor to `id`, inclusive,
+    /// using the given visible row order. The anchor is `last_clicked_session_id`,
+    /// or the active session when the anchor was pruned away. With neither, behaves
+    /// like [`SidebarSessionSelection::replace`] minus the activation. If the anchor
+    /// or the target is missing from `visible_order`, the selection becomes just
+    /// `id`. The anchor is **not** updated — Finder keeps the original anchor
+    /// across multiple range extensions.
     ///
-    /// `id` always becomes the new active session (`SidebarTabSelection.swift:139-155`).
+    /// A ⇧-click never changes the active session, and the active session always
+    /// stays selected (the invariant), even when it falls outside the range.
     pub fn extend(&mut self, id: &str, visible_order: &[String]) {
-        // The Swift `defer { activeTabId = id }` sets active in every branch.
-        let anchor = self.last_clicked_session_id.clone();
+        let anchor = self
+            .last_clicked_session_id
+            .clone()
+            .or_else(|| self.active_session_id.clone());
         match anchor {
             None => {
                 self.selected_session_ids = once(id);
@@ -139,7 +145,9 @@ impl SidebarSessionSelection {
                 }
             }
         }
-        self.active_session_id = Some(id.to_string());
+        if let Some(active) = &self.active_session_id {
+            self.selected_session_ids.insert(active.clone());
+        }
     }
 
     /// Collapse the selection to just `id` and re-anchor to it. Used by Esc and
@@ -169,9 +177,8 @@ impl SidebarSessionSelection {
     /// `+` buttons. If the new active session isn't in the selection set, collapses
     /// the set to it (the "external nav resets multi-selection" rule).
     ///
-    /// The internal mutators set `active_session_id` themselves, so by the time this
-    /// fires from a tap path the new active id is already in the set and the
-    /// contains-guard short-circuits (`SidebarTabSelection.swift:200-207`).
+    /// Every click mutator keeps the active id in the set, so when this fires from
+    /// a tap path the contains-guard short-circuits (`SidebarTabSelection.swift:200-207`).
     pub fn sync_active_session_id(&mut self, id: Option<&str>) {
         self.active_session_id = id.map(|s| s.to_string());
         let Some(id) = id else { return };
@@ -304,7 +311,7 @@ mod tests {
     // MARK: - toggle
 
     #[test]
-    fn toggle_adds_absent_id_moves_anchor_returns_and_activates_id() {
+    fn toggle_adds_absent_id_moves_anchor_returns_none_keeps_active() {
         let mut s = SidebarSessionSelection::new();
         s.replace("session-1");
 
@@ -314,13 +321,12 @@ mod tests {
         assert_eq!(s.last_clicked_session_id(), Some("session-2"));
         assert_eq!(
             s.active_session_id(),
-            Some("session-2"),
-            "toggling in moves active to the toggled id (most-recently-clicked rule)"
+            Some("session-1"),
+            "toggling a row in must not change the active session"
         );
         assert_eq!(
-            next.as_deref(),
-            Some("session-2"),
-            "view layer needs the new active id to mirror to WorkspaceModel::select_session"
+            next, None,
+            "no active change → return None so the view layer skips select_session"
         );
     }
 
@@ -328,20 +334,20 @@ mod tests {
     fn toggle_removes_non_active_id_moves_anchor_returns_none_keeps_active() {
         let mut s = SidebarSessionSelection::new();
         s.replace("session-1"); // active = session-1
-        s.toggle("session-2"); // active = session-2
-        s.toggle("session-3"); // active = session-3, set = {1,2,3}
+        s.toggle("session-2");
+        s.toggle("session-3"); // set = {1,2,3}, active still session-1
 
-        let next = s.toggle("session-1"); // remove non-active
+        let next = s.toggle("session-2"); // remove non-active
 
-        assert_eq!(s.selected_session_ids(), &ids(&["session-2", "session-3"]));
+        assert_eq!(s.selected_session_ids(), &ids(&["session-1", "session-3"]));
         assert_eq!(
             s.last_clicked_session_id(),
-            Some("session-1"),
+            Some("session-2"),
             "anchor moves even when toggling out a non-active row (Finder)"
         );
         assert_eq!(
             s.active_session_id(),
-            Some("session-3"),
+            Some("session-1"),
             "active is unchanged when toggling out a non-active row"
         );
         assert_eq!(
@@ -354,20 +360,20 @@ mod tests {
     fn toggle_removes_active_with_others_promotes_first_returns_promoted() {
         let mut s = SidebarSessionSelection::new();
         s.replace("session-1"); // active = session-1
-        s.toggle("session-2"); // active = session-2, set = {1,2}
+        s.toggle("session-2"); // set = {1,2}, active still session-1
 
-        let next = s.toggle("session-2"); // remove active, others remain
+        let next = s.toggle("session-1"); // remove active, others remain
 
-        assert_eq!(s.selected_session_ids(), &ids(&["session-1"]));
-        assert_eq!(s.last_clicked_session_id(), Some("session-2"));
+        assert_eq!(s.selected_session_ids(), &ids(&["session-2"]));
+        assert_eq!(s.last_clicked_session_id(), Some("session-1"));
         assert_eq!(
             s.active_session_id(),
-            Some("session-1"),
+            Some("session-2"),
             "toggling out the active session while others remain promotes one of them to active"
         );
         assert_eq!(
             next.as_deref(),
-            Some("session-1"),
+            Some("session-2"),
             "view layer needs the promoted id to mirror to WorkspaceModel::select_session"
         );
     }
@@ -408,7 +414,7 @@ mod tests {
     // MARK: - extend
 
     #[test]
-    fn extend_inclusive_between_anchor_and_current_moves_active_to_target() {
+    fn extend_inclusive_between_anchor_and_current_keeps_active() {
         let order = order(&["a", "b", "c", "d", "e"]);
         let mut s = SidebarSessionSelection::new();
         s.replace("b");
@@ -423,8 +429,8 @@ mod tests {
         );
         assert_eq!(
             s.active_session_id(),
-            Some("d"),
-            "shift-clicked session becomes active"
+            Some("b"),
+            "shift-extend must not change the active session"
         );
     }
 
@@ -437,30 +443,60 @@ mod tests {
         s.extend("b", &order);
 
         assert_eq!(s.selected_session_ids(), &ids(&["b", "c", "d"]));
-        assert_eq!(s.active_session_id(), Some("b"));
+        assert_eq!(s.active_session_id(), Some("d"));
     }
 
     #[test]
     fn extend_empty_anchor_treats_as_replace() {
         let mut s = SidebarSessionSelection::new();
-        // No prior click — anchor is None.
+        // No prior click and no active session — anchor is None.
 
         s.extend("c", &order(&["a", "b", "c"]));
 
         assert_eq!(s.selected_session_ids(), &ids(&["c"]));
         assert_eq!(s.last_clicked_session_id(), Some("c"));
-        assert_eq!(s.active_session_id(), Some("c"));
+        assert_eq!(s.active_session_id(), None, "extend never activates");
     }
 
     #[test]
-    fn extend_target_missing_from_order_falls_back_to_replace() {
+    fn extend_target_missing_from_order_keeps_active_selected() {
         let mut s = SidebarSessionSelection::new();
         s.replace("a");
 
         s.extend("z", &order(&["a", "b"]));
 
-        assert_eq!(s.selected_session_ids(), &ids(&["z"]));
-        assert_eq!(s.active_session_id(), Some("z"));
+        assert_eq!(s.selected_session_ids(), &ids(&["a", "z"]));
+        assert_eq!(s.active_session_id(), Some("a"));
+    }
+
+    /// A ⌘-click can move the anchor off the active row; a later ⇧-range that
+    /// doesn't reach the active row must still keep it selected (the invariant).
+    #[test]
+    fn extend_keeps_active_in_set_when_outside_range() {
+        let order = order(&["a", "b", "c", "d", "e"]);
+        let mut s = SidebarSessionSelection::new();
+        s.replace("a");
+        s.toggle("c"); // anchor = c, active = a
+
+        s.extend("e", &order);
+
+        assert_eq!(s.selected_session_ids(), &ids(&["a", "c", "d", "e"]));
+        assert_eq!(s.active_session_id(), Some("a"));
+    }
+
+    /// Closing the anchor's session prunes the anchor; the next ⇧-range then runs
+    /// from the active session instead of leaving two disconnected islands.
+    #[test]
+    fn extend_with_pruned_anchor_ranges_from_active() {
+        let mut s = SidebarSessionSelection::new();
+        s.replace("b");
+        s.toggle("c"); // anchor = c, active = b
+        s.prune(&ids(&["a", "b", "d", "e"])); // anchor cleared, set = {b}
+
+        s.extend("e", &order(&["a", "b", "d", "e"]));
+
+        assert_eq!(s.selected_session_ids(), &ids(&["b", "d", "e"]));
+        assert_eq!(s.active_session_id(), Some("b"));
     }
 
     /// `navigable_sidebar_session_ids` is a flat array spanning Terminals + every
@@ -626,9 +662,9 @@ mod tests {
     fn sync_active_session_id_in_selection_is_no_op_for_set_but_updates_active() {
         let mut s = SidebarSessionSelection::new();
         s.replace("a");
-        s.toggle("b"); // set = {a, b}, active = b
+        s.toggle("b"); // set = {a, b}, active = a
 
-        s.sync_active_session_id(Some("a"));
+        s.sync_active_session_id(Some("b"));
 
         assert_eq!(
             s.selected_session_ids(),
@@ -637,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             s.active_session_id(),
-            Some("a"),
+            Some("b"),
             "active mirror always updates"
         );
     }
@@ -650,7 +686,7 @@ mod tests {
         // sync_active_session_id, and the set collapses to it.
         let mut s = SidebarSessionSelection::new();
         s.replace("a");
-        s.toggle("b"); // set = {a, b}, active = b
+        s.toggle("b"); // set = {a, b}, active = a
 
         s.sync_active_session_id(Some("c"));
 
@@ -702,7 +738,7 @@ mod tests {
         s.replace("a");
         s.toggle("b");
         s.toggle("c");
-        // anchor is now "c", active is "c"
+        // anchor is now "c", active is "a"
 
         s.prune(&ids(&["a", "c"]));
 
@@ -714,7 +750,7 @@ mod tests {
         );
         assert_eq!(
             s.active_session_id(),
-            Some("c"),
+            Some("a"),
             "valid active must not be cleared"
         );
     }
@@ -744,12 +780,12 @@ mod tests {
         // here lets the subsequent sync_active_session_id re-seed the invariant
         // cleanly with the newly-promoted active id.
         let mut s = SidebarSessionSelection::new();
-        s.replace("a");
-        s.toggle("b"); // active = b
+        s.replace("a"); // active = a
+        s.toggle("b");
 
-        s.prune(&ids(&["a"]));
+        s.prune(&ids(&["b"]));
 
-        assert_eq!(s.selected_session_ids(), &ids(&["a"]));
+        assert_eq!(s.selected_session_ids(), &ids(&["b"]));
         assert_eq!(s.active_session_id(), None);
     }
 

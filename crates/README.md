@@ -1833,8 +1833,9 @@ dissolve cascade):
 
 - `selection` — `SidebarSessionSelection`, the Finder-style multi-select model and
   the "selection ⊇ {active_session_id}" invariant (⌘-click on the only-and-active
-  row refused; ⇧ keeps the original anchor; the right-click snap policy; prune
-  on removal).
+  row refused; ⇧ keeps the original anchor; ⇧/⌘ clicks never change the active
+  session except ⌘-toggling the active row out; the right-click snap policy;
+  prune on removal).
 - `rename_gate` — `InlineRenameClickGate`, the injected-clock click-to-rename
   time gate (edit iff `now − activated_at ≥ interval`, `>=` boundary).
 - `key_hint` — `KeyHintModel` (Phase 1, D5): the one-flag, NEVER-persisted

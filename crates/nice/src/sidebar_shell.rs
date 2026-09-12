@@ -369,6 +369,18 @@ fn glass_fill_rgba(scheme: ColorScheme) -> Rgba {
     srgba_to_rgba(glass_fill(scheme))
 }
 
+/// How strong a session row's hover fill is relative to its selection fill.
+/// Fainter so a hovered row never reads as selected — e.g. the row just
+/// ⌘-clicked out of a multi-selection while the pointer still rests on it.
+const ROW_HOVER_FILL_FACTOR: f32 = 0.5;
+
+/// The session row's hover fill: [`glass_fill_rgba`] at
+/// [`ROW_HOVER_FILL_FACTOR`] of its alpha.
+fn glass_hover_rgba(scheme: ColorScheme) -> Rgba {
+    let fill = glass_fill(scheme);
+    srgba_to_rgba(srgba_with_alpha(fill, fill.a * ROW_HOVER_FILL_FACTOR))
+}
+
 /// The elevated peek-overlay drop shadow — the last surviving sidebar panel
 /// shadow after the docked card flattened (`AppShellView.swift:838`; plan
 /// `docs/plans/restyle/02-sidebar-flatten.md` keeps the peek elevated for
@@ -400,6 +412,13 @@ fn selection_tint(accent: Srgba, factor: f32) -> Rgba {
     srgba_to_rgba(srgba_with_alpha(accent, SEL_ALPHA_DARK * factor))
 }
 
+/// Whether a row shows the persistent selection fill: every selected row, the
+/// active one included, but only once 2+ rows are selected. A lone active row is
+/// marked by its accent text alone.
+fn row_has_selection_fill(is_selected: bool, selected_count: usize) -> bool {
+    is_selected && selected_count > 1
+}
+
 // ---- View-model snapshot (decouples rendering from model borrows) -----------
 
 /// A per-render snapshot of one session row.
@@ -413,7 +432,7 @@ struct SessionVm {
     status: SessionStatus,
     waiting_ack: bool,
     is_active: bool,
-    is_selected: bool,
+    has_selection_fill: bool,
     is_editing: bool,
 }
 
@@ -764,6 +783,7 @@ impl SidebarShellView {
     fn snapshot_groups(&self, cx: &mut Context<Self>) -> Vec<GroupVm> {
         let ws = self.state.read(cx);
         let active = ws.workspace.active_session_id().map(|s| s.to_string());
+        let selected_count = ws.selection.selected_session_ids().len();
         ws.workspace
             .projects
             .iter()
@@ -785,7 +805,10 @@ impl SidebarShellView {
                             status: s.status(),
                             waiting_ack: s.waiting_acknowledged(),
                             is_active: active.as_deref() == Some(s.id.as_str()),
-                            is_selected: ws.selection.contains(&s.id),
+                            has_selection_fill: row_has_selection_fill(
+                                ws.selection.contains(&s.id),
+                                selected_count,
+                            ),
                             is_editing: self.editing_session_id.as_deref() == Some(s.id.as_str()),
                         })
                         .collect()
@@ -807,11 +830,13 @@ impl SidebarShellView {
     // MARK: - Selection routing / active tracking
 
     /// Route a modifier-aware row click. Plain collapses to `{id}` + activates;
-    /// ⌘ toggles (most-recently-clicked stays active, only-and-active refused);
-    /// ⇧ extends from the sticky anchor. Resets `activated_at` only when the
+    /// ⌘ toggles (active unchanged unless the active row is toggled out;
+    /// only-and-active refused); ⇧ extends from the sticky anchor over the
+    /// visible rows (active unchanged). Resets `activated_at` only when the
     /// active session actually changes (so a click on the already-active row keeps
     /// the rename gate armed — `SidebarView.swift`'s `onChange(of: isActive)`).
     fn route_click(&mut self, session_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
+        let collapsed = &self.collapsed_projects;
         let changed = self.state.update(cx, |ws, _| {
             let before = ws.workspace.active_session_id().map(|s| s.to_string());
             if cmd {
@@ -819,17 +844,23 @@ impl SidebarShellView {
                     ws.sidebar_actions.select_session(&mut ws.workspace, &new_active);
                 }
             } else if shift {
-                let order = ws.workspace.navigable_sidebar_session_ids();
+                // Range over the rows actually shown: a collapsed group's hidden
+                // sessions must never join the selection.
+                let order: Vec<String> = ws
+                    .workspace
+                    .projects
+                    .iter()
+                    .filter(|p| !collapsed.contains(&p.id))
+                    .flat_map(|p| p.sessions.iter().map(|s| s.id.clone()))
+                    .collect();
                 ws.selection.extend(session_id, &order);
-                ws.sidebar_actions.select_session(&mut ws.workspace, session_id);
             } else {
                 ws.selection.replace(session_id);
                 ws.sidebar_actions.select_session(&mut ws.workspace, session_id);
             }
             let after = ws.workspace.active_session_id().map(|s| s.to_string());
             // Reconcile the selection's active mirror with the model (a no-op on
-            // the tap paths since the mutators already set it; keeps the invariant
-            // if a toggle refused).
+            // the tap paths since every mutator keeps the active id selected).
             let active = ws.workspace.active_session_id().map(|s| s.to_string());
             ws.selection.sync_active_session_id(active.as_deref());
             before != after
@@ -840,8 +871,9 @@ impl SidebarShellView {
     }
 
     /// Plain title tap: modified clicks route like a row; on the already-active
-    /// row a plain tap enters rename only past the gate; otherwise it's a plain
-    /// select (`SidebarView.swift:569-586`).
+    /// row of a single selection a plain tap enters rename only past the gate;
+    /// otherwise (including the active row of a multi-selection, which collapses
+    /// to it) it's a plain select (`SidebarView.swift:569-586`).
     fn handle_title_tap(
         &mut self,
         session_id: &str,
@@ -854,8 +886,10 @@ impl SidebarShellView {
             self.route_click(session_id, cmd, shift, cx);
             return;
         }
-        let is_active = self.state.read(cx).workspace.active_session_id() == Some(session_id);
-        if is_active {
+        let ws = self.state.read(cx);
+        let is_active = ws.workspace.active_session_id() == Some(session_id);
+        let multi_selected = ws.selection.selected_session_ids().len() > 1;
+        if is_active && !multi_selected {
             if InlineRenameClickGate::can_begin_edit(
                 self.activated_at,
                 Instant::now(),
@@ -1080,7 +1114,26 @@ impl SidebarShellView {
     }
 
     fn toggle_disclosure(&mut self, group_id: &str, cx: &mut Context<Self>) {
-        if !self.collapsed_projects.insert(group_id.to_string()) {
+        if self.collapsed_projects.insert(group_id.to_string()) {
+            // Collapsing hides the group's rows: drop them from the selection so
+            // "Close N Sessions" can't act on sessions the user can't see. The
+            // active session stays (the "selection ⊇ {active}" invariant).
+            self.state.update(cx, |ws, _| {
+                let active = ws.workspace.active_session_id();
+                let valid: HashSet<String> = ws
+                    .workspace
+                    .projects
+                    .iter()
+                    .flat_map(|p| {
+                        p.sessions
+                            .iter()
+                            .filter(move |s| p.id != group_id || active == Some(s.id.as_str()))
+                            .map(|s| s.id.clone())
+                    })
+                    .collect();
+                ws.selection.prune(&valid);
+            });
+        } else {
             self.collapsed_projects.remove(group_id);
         }
         cx.notify();
@@ -1868,6 +1921,7 @@ impl SidebarShellView {
         // Hover / multi-select fill: the over-glass faint fill (replacing the old
         // accent `selection_tint`), on the flat shared surface.
         let glass = glass_fill_rgba(scheme);
+        let glass_hover = glass_hover_rgba(scheme);
         let indent = row_indent(t.indented);
 
         // Leading icon: the status dot for a Claude session, else the `terminal`
@@ -1995,7 +2049,7 @@ impl SidebarShellView {
         let tid_click = t.id.clone();
         let tid_menu = t.id.clone();
         let is_active = t.is_active;
-        let is_selected = t.is_selected;
+        let has_selection_fill = t.has_selection_fill;
 
         // Row-frame probe: an absolute inset-0 canvas recording this row's
         // painted vertical extent in window coords each paint — the Swift
@@ -2051,12 +2105,13 @@ impl SidebarShellView {
             .pr(px(10.0))
             .py(px(4.0))
             .rounded(px(4.0))
-            // Active row has NO fill (accent text is its marker). A multi-selected
-            // non-active row keeps a persistent faint over-glass fill; a plain
-            // non-active row shows the same fill only on hover.
-            .when(!is_active && is_selected, |el| el.bg(glass))
-            .when(!is_active && !is_selected, |el| {
-                el.hover(move |st| st.bg(glass))
+            // In a 2+ multi-selection every selected row, the active one
+            // included, keeps a persistent faint over-glass fill. Otherwise the
+            // active row has NO fill (accent text is its marker), and any other
+            // row shows a fainter fill on hover, so hover never reads as selected.
+            .when(has_selection_fill, |el| el.bg(glass))
+            .when(!is_active && !has_selection_fill, |el| {
+                el.hover(move |st| st.bg(glass_hover))
             })
             .child(frame_probe)
             .child(leading)
@@ -2552,6 +2607,13 @@ mod tests {
     }
 
     #[test]
+    fn row_has_selection_fill_only_in_multi_selection() {
+        assert!(!row_has_selection_fill(true, 1), "a lone selected row has no fill");
+        assert!(row_has_selection_fill(true, 3), "every selected row fills in a multi-selection");
+        assert!(!row_has_selection_fill(false, 3), "unselected rows never fill");
+    }
+
+    #[test]
     fn disclosure_icon_swaps_on_open() {
         assert_eq!(disclosure_icon(true), (SF_CHEVRON_OPEN, ICON_CHEVRON_OPEN));
         assert_eq!(
@@ -2692,6 +2754,17 @@ mod tests {
         assert_eq!(dimmed.a, SEL_ALPHA_DARK * 0.5);
         // Same hue, different alpha (rgb carried straight from the accent).
         assert_eq!((active.r, active.g, active.b), (dimmed.r, dimmed.g, dimmed.b));
+    }
+
+    #[test]
+    fn row_hover_fill_is_fainter_than_selection_fill() {
+        for scheme in [ColorScheme::Dark, ColorScheme::Light] {
+            let fill = glass_fill_rgba(scheme);
+            let hover = glass_hover_rgba(scheme);
+            assert_eq!((hover.r, hover.g, hover.b), (fill.r, fill.g, fill.b), "same color");
+            assert_eq!(hover.a, fill.a * ROW_HOVER_FILL_FACTOR);
+            assert!(hover.a < fill.a, "hover must be fainter than selection");
+        }
     }
 
     #[test]
