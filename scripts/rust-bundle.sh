@@ -128,6 +128,53 @@ log "ensuring vendored zed is present + at the pin (scripts/vendor-zed.sh)"
 [[ -d "$REPO_ROOT/vendor/zed/crates/gpui" ]] \
     || fail "vendor/zed still missing after vendor-zed.sh"
 
+# ── stale workspace crates in a shared target dir ───────────────────────
+# Cargo names workspace-crate artifacts by the crate's path RELATIVE to the
+# workspace root, so every worktree sharing this target dir writes to the same
+# libnice_*-<hash>.rlib. Freshness is mtime-only: if another tree built more
+# recently than this tree's sources were touched, cargo reuses that tree's
+# artifact (e.g. main linking the tmux branch's nice-model → E0004 on a
+# ShortcutAction variant main never had). Stamp each profile dir with a
+# fingerprint of the crates/ source that last built it; on a mismatch, evict
+# only the workspace crates (gpui + registry deps stay warm).
+#
+# Only guards this script's builds — a plain `cargo build` in another tree can
+# still pick up a stale artifact; the fix there is the same `cargo clean -p`.
+WORKSPACE_CRATES=()
+for manifest in "$REPO_ROOT"/crates/*/Cargo.toml; do
+    WORKSPACE_CRATES+=("$(awk -F'"' '/^name = /{print $2; exit}' "$manifest")")
+done
+
+crates_source_fingerprint() {
+    {
+        git rev-parse HEAD:crates
+        git diff HEAD -- crates
+        git ls-files --others --exclude-standard -z crates | xargs -0 shasum 2>/dev/null
+    } | shasum | cut -d' ' -f1
+}
+SOURCE_FINGERPRINT="$(crates_source_fingerprint)"
+
+# $1 = profile dir under TARGET_DIR (release or <triple>/release); rest = extra
+# cargo clean args (--target <triple>).
+evict_stale_workspace_crates() {
+    local profile_dir="$TARGET_DIR/$1"; shift
+    local stamp="$profile_dir/.nice-source-fingerprint"
+    if [[ -f "$stamp" && "$(cat "$stamp")" == "$SOURCE_FINGERPRINT" ]]; then
+        return
+    fi
+    if [[ -d "$profile_dir" ]]; then
+        log "crates/ source differs from the tree that last built ${profile_dir#$TARGET_DIR/} — evicting workspace crates"
+        local specs=()
+        for c in "${WORKSPACE_CRATES[@]}"; do specs+=(-p "$c"); done
+        cargo clean --release "$@" "${specs[@]}" || fail "cargo clean of workspace crates failed"
+    fi
+}
+
+# Written only after a successful build, so a failed build re-evicts next time.
+write_source_stamp() {
+    printf '%s\n' "$SOURCE_FINGERPRINT" > "$TARGET_DIR/$1/.nice-source-fingerprint"
+}
+
 # ── 1. build release ────────────────────────────────────────────────────
 # Deliberately WITHOUT the `selftest` feature: enabling it turns on gpui
 # test-support, which flips CAMetalLayer.framebufferOnly = false PROCESS-
@@ -150,8 +197,11 @@ if [[ "$UNIVERSAL" -eq 1 ]]; then
         fi
     done
     log "building nice (release, universal: $ARM_TARGET + $X86_TARGET)"
-    cargo build --release -p nice --target "$ARM_TARGET"
-    cargo build --release -p nice --target "$X86_TARGET"
+    for t in "$ARM_TARGET" "$X86_TARGET"; do
+        evict_stale_workspace_crates "$t/release" --target "$t"
+        cargo build --release -p nice --target "$t"
+        write_source_stamp "$t/release"
+    done
     ARM_BIN="$TARGET_DIR/$ARM_TARGET/release/nice"
     X86_BIN="$TARGET_DIR/$X86_TARGET/release/nice"
     [[ -x "$ARM_BIN" ]] || fail "arm64 build finished but $ARM_BIN not found"
@@ -162,7 +212,9 @@ if [[ "$UNIVERSAL" -eq 1 ]]; then
     log "lipo -archs: $(lipo -archs "$SRC_BIN")"
 else
     log "building nice (release, host arch)"
+    evict_stale_workspace_crates release
     cargo build --release -p nice
+    write_source_stamp release
     # Single cargo binary; copied to a per-variant exec name below.
     SRC_BIN="$TARGET_DIR/release/nice"
 fi
