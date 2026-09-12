@@ -104,7 +104,7 @@ pub use element::{
 };
 pub use font::{
     cell_metrics, clamp_line_height, clamp_px, default_font_chain, resolve_family,
-    snap_metrics_to_scale, FontSettings, FontZoom, DEFAULT_TERMINAL_FONT_PX,
+    snap_metrics_to_scale, FontSettings, DEFAULT_TERMINAL_FONT_PX,
     DEFAULT_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_FONT_PX, MAX_TERMINAL_LINE_HEIGHT,
     MIN_TERMINAL_FONT_PX, MIN_TERMINAL_LINE_HEIGHT,
 };

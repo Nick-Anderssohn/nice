@@ -20,10 +20,12 @@
 //!   per the plan's Validation split.)
 //! * **(c) a Font slider fans out.** Driving the Font pane's terminal-size handler
 //!   ([`apply_terminal_px`](crate::settings::font_pane::apply_terminal_px)) changes
-//!   the shared [`FontSettings`](nice_term_view::FontSettings) px + re-metrics; a
-//!   subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity
-//!   (no desync), and the `fonts` section on the temp `ui_settings.json` reflects
-//!   the change (persistence).
+//!   the shared [`FontSettings`](nice_term_view::FontSettings) px + re-metrics and
+//!   leaves the sidebar size alone; a subsequent ⌘=
+//!   ([`zoom_shared_font`](crate::keymap::zoom_shared_font)) continues from the
+//!   slider value on the SAME entity (no desync) and steps the sidebar by 1pt, and
+//!   the `fonts` section on the temp `ui_settings.json` reflects both sizes
+//!   (persistence).
 //! * **(d) Import through the fake picker.** Scripting the injected
 //!   [`RecordingFilePicker`](crate::settings::file_picker) to a temp fixture and
 //!   driving the Import… handler runs R22's `import_theme` through the seam
@@ -284,6 +286,8 @@ async fn leg_c_font_slider(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         before_px + 3.0
     };
 
+    let sidebar_before = cx.update(|app| crate::settings::sidebar_font::current_sidebar_px(app));
+
     // Drive the Font-pane terminal-size handler (the stepper/slider wire).
     cx.update(|app| crate::settings::font_pane::apply_terminal_px(app, target));
     settle(cx, 150).await;
@@ -292,6 +296,13 @@ async fn leg_c_font_slider(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     if after_px != target {
         failures.push(format!(
             "the terminal-size slider did not fan out: FontSettings.px() {after_px} != {target}"
+        ));
+    }
+    // The terminal stepper must not move the sidebar size.
+    let sidebar_after = cx.update(|app| crate::settings::sidebar_font::current_sidebar_px(app));
+    if sidebar_after != sidebar_before {
+        failures.push(format!(
+            "the terminal-size stepper moved the sidebar size: {sidebar_before} → {sidebar_after}"
         ));
     }
     // The cell metrics re-derive off the new size (a main-window terminal cell
@@ -303,7 +314,7 @@ async fn leg_c_font_slider(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 
     // A subsequent ⌘= observes the SAME entity — it continues from the slider
     // value (target + 1), proving no desync between the slider and the zoom action.
-    cx.update(|app| font.update(app, |f, cx| f.zoom_by(1, cx)));
+    cx.update(|app| crate::keymap::zoom_shared_font(app, 1));
     settle(cx, 100).await;
     let after_zoom = cx.update(|app| font.read(app).px());
     if after_zoom != target + 1.0 {
@@ -314,21 +325,31 @@ async fn leg_c_font_slider(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     }
 
     // Persistence (plan leg e): the `fonts` section on disk reflects the slider
-    // change — poll the temp `ui_settings.json` the run_selftest store points at.
+    // change plus the ⌘= step on both sizes — read the temp `ui_settings.json` the
+    // run_selftest store points at.
     let path = cx.update(|app| {
         app.try_global::<crate::settings::prefs_store::SettingsPrefsStore>()
             .map(|s| s.path().to_path_buf())
     });
     match path {
         Some(path) => {
-            let on_disk = std::fs::read(&path).ok().and_then(|bytes| {
-                serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|v| v["fonts"]["terminal_font_size"].as_f64())
-            });
-            if on_disk != Some(target as f64) {
+            let fonts = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .map(|v| v["fonts"].clone());
+            let field = |key: &str| fonts.as_ref().and_then(|f| f[key].as_f64());
+            let want_terminal = (target + 1.0) as f64;
+            let want_sidebar = (sidebar_before + 1.0) as f64;
+            if field("terminal_font_size") != Some(want_terminal) {
                 failures.push(format!(
-                    "the fonts section on disk did not reflect the slider change: {on_disk:?} != {target}"
+                    "the terminal size on disk did not reflect slider + ⌘=: {:?} != {want_terminal}",
+                    field("terminal_font_size")
+                ));
+            }
+            if field("sidebar_font_size") != Some(want_sidebar) {
+                failures.push(format!(
+                    "the sidebar size on disk did not reflect ⌘=: {:?} != {want_sidebar}",
+                    field("sidebar_font_size")
                 ));
             }
         }

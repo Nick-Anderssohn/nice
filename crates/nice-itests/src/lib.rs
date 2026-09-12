@@ -105,8 +105,7 @@ mod multiwindow;
 mod theme_setters;
 
 // R23 shared-`FontSettings` mutator probe — libtest `#[gpui::test]` cases on the
-// mocked context. Exercises the boundary-legal `set_px` (clamp + FontZoom +
-// notify) / `set_family` (re-resolve) / `reset_to_defaults` mutators the Font pane
+// mocked context. Exercises the boundary-legal `set_px` (clamp + notify) / `set_family` (re-resolve) / `reset_to_defaults` mutators the Font pane
 // drives. Lives here (not `nice-term-view`) because that crate has no test harness.
 #[cfg(test)]
 mod font_mutators;

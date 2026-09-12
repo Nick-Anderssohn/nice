@@ -195,8 +195,7 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
     // R23: seed the shared terminal font from the persisted `fonts` section (loaded
     // into `SettingsPrefsStore` before this in `app::run`; a defaults+temp store in
     // `run_selftest`). Values are copied out first so the store borrow ends before
-    // `cx.new`. Applying them inside the constructor (before any subscriber exists)
-    // means the seed emits no observable `FontZoom` to the sidebar.
+    // `cx.new`.
     let (seed_px, seed_family, seed_sidebar_px, seed_line_height) =
         match cx.try_global::<crate::settings::prefs_store::SettingsPrefsStore>() {
             Some(store) => (
@@ -224,21 +223,13 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
     });
     cx.set_global(SharedFontSettings(font.clone()));
 
-    // R23 (D3): the app-level sidebar-font entity, coupled to the terminal
-    // `FontZoom` for the proportional rescale, seeded from the persisted sidebar
-    // size. Installed alongside the terminal font so the sidebar chrome + the Font
-    // pane can always read it.
-    let terminal_px = font.read(cx).px();
+    // R23 (D3): the app-level sidebar-font entity, seeded from the persisted
+    // sidebar size. Installed alongside the terminal font so the sidebar chrome +
+    // the Font pane can always read it.
     let sidebar_px =
         seed_sidebar_px.unwrap_or(crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX);
-    let sidebar = cx.new(|cx| {
-        crate::settings::sidebar_font::SharedSidebarFontSettings::new(
-            sidebar_px,
-            terminal_px,
-            &font,
-            cx,
-        )
-    });
+    let sidebar =
+        cx.new(|_| crate::settings::sidebar_font::SharedSidebarFontSettings::new(sidebar_px));
     cx.set_global(crate::settings::sidebar_font::SharedSidebarFont(sidebar));
 
     register_app_level_actions(cx);
@@ -1071,18 +1062,28 @@ fn dispatch_file_history(cx: &mut App, undo: bool) {
     crate::file_browser::focus_route::drive_pending(cx);
 }
 
-fn zoom_shared_font(cx: &mut App, delta: i32) {
-    let Some(font) = cx.try_global::<SharedFontSettings>().map(|g| g.0.clone()) else {
-        return;
-    };
-    font.update(cx, |f, cx| f.zoom_by(delta, cx));
+/// ⌘= / ⌘− — step the terminal and sidebar sizes by `delta` points each. Each
+/// clamps independently and persists (through the Font pane's apply helpers).
+pub(crate) fn zoom_shared_font(cx: &mut App, delta: i32) {
+    let delta = delta as f32;
+    if let Some(font) = try_shared_font_settings(cx) {
+        let px = font.read(cx).px();
+        crate::settings::font_pane::apply_terminal_px(cx, px + delta);
+    }
+    if let Some(sidebar) = crate::settings::sidebar_font::shared_sidebar_font(cx) {
+        let px = sidebar.read(cx).px();
+        crate::settings::font_pane::apply_sidebar_px(cx, px + delta);
+    }
 }
 
-fn reset_shared_font(cx: &mut App) {
-    let Some(font) = cx.try_global::<SharedFontSettings>().map(|g| g.0.clone()) else {
-        return;
-    };
-    font.update(cx, |f, cx| f.reset(cx));
+/// ⌘0 — reset the terminal and sidebar sizes to their defaults and persist them.
+/// Family and line height are untouched (that is the Font pane's full reset).
+pub(crate) fn reset_shared_font(cx: &mut App) {
+    crate::settings::font_pane::apply_terminal_px(cx, nice_term_view::DEFAULT_TERMINAL_FONT_PX);
+    crate::settings::font_pane::apply_sidebar_px(
+        cx,
+        crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX,
+    );
 }
 
 // -- bindings ----------------------------------------------------------------
@@ -2280,5 +2281,145 @@ mod tests {
         // A pane that is not in the tree cannot be measured, so it is not
         // refused here — the split itself declines it.
         assert!(split_fits(&layout, "zzz", SplitOrient::Beside, content(10.0, 10.0)));
+    }
+
+    // -- font zoom --------------------------------------------------------------
+
+    use crate::settings::font_pane::{apply_sidebar_px, apply_terminal_px, reset_fonts};
+    use crate::settings::prefs_store::SettingsPrefsStore;
+    use crate::settings::sidebar_font::{
+        SharedSidebarFont, SharedSidebarFontSettings, DEFAULT_SIDEBAR_FONT_PX,
+    };
+    use nice_term_view::DEFAULT_TERMINAL_FONT_PX;
+
+    /// Install the prefs store (at a temp path) and the shared terminal + sidebar
+    /// font globals at their defaults. Returns the store path and both entities.
+    fn install_fonts(
+        cx: &mut gpui::TestAppContext,
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        Entity<FontSettings>,
+        Entity<SharedSidebarFontSettings>,
+    ) {
+        let path = unique_temp_ui_settings(tag);
+        let (font, sidebar) = cx.update(|app| {
+            app.set_global(SettingsPrefsStore::load(path.clone()));
+            let font = app.new(FontSettings::resolved_default);
+            app.set_global(SharedFontSettings(font.clone()));
+            let sidebar =
+                app.new(|_| SharedSidebarFontSettings::new(DEFAULT_SIDEBAR_FONT_PX));
+            app.set_global(SharedSidebarFont(sidebar.clone()));
+            (font, sidebar)
+        });
+        cx.run_until_parked();
+        (path, font, sidebar)
+    }
+
+    /// Read `(terminal px, sidebar px)` in a fresh update, after pending effects flush.
+    fn sizes(
+        cx: &mut gpui::TestAppContext,
+        font: &Entity<FontSettings>,
+        sidebar: &Entity<SharedSidebarFontSettings>,
+    ) -> (f32, f32) {
+        cx.run_until_parked();
+        cx.update(|app| (font.read(app).px(), sidebar.read(app).px()))
+    }
+
+    /// The reported bug: the Font pane's terminal "+" must not move the sidebar,
+    /// including right after "Reset to defaults".
+    #[gpui::test]
+    fn pane_terminal_stepper_leaves_the_sidebar_alone(cx: &mut gpui::TestAppContext) {
+        let (_path, font, sidebar) = install_fonts(cx, "pane-step");
+
+        cx.update(|app| apply_terminal_px(app, 14.0));
+        assert_eq!(sizes(cx, &font, &sidebar), (14.0, 12.0));
+        cx.update(|app| apply_terminal_px(app, 15.0));
+        assert_eq!(sizes(cx, &font, &sidebar), (15.0, 12.0));
+
+        cx.update(|app| reset_fonts(app));
+        assert_eq!(sizes(cx, &font, &sidebar), (13.0, 12.0));
+        cx.update(|app| apply_terminal_px(app, 14.0));
+        assert_eq!(sizes(cx, &font, &sidebar), (14.0, 12.0));
+    }
+
+    /// The persisted `(terminal, sidebar)` sizes in the installed store.
+    fn stored(cx: &mut gpui::TestAppContext) -> (Option<f32>, Option<f32>) {
+        cx.update(|app| {
+            let s = app.global::<SettingsPrefsStore>();
+            (s.terminal_font_px(), s.sidebar_font_px())
+        })
+    }
+
+    /// ⌘= / ⌘− step both sizes by exactly 1pt and persist both.
+    #[gpui::test]
+    fn keyboard_zoom_steps_both_sizes_and_persists(cx: &mut gpui::TestAppContext) {
+        let (path, font, sidebar) = install_fonts(cx, "zoom-step");
+
+        cx.update(|app| zoom_shared_font(app, 1));
+        assert_eq!(sizes(cx, &font, &sidebar), (14.0, 13.0));
+        assert_eq!(stored(cx), (Some(14.0), Some(13.0)));
+
+        cx.update(|app| zoom_shared_font(app, -1));
+        cx.update(|app| zoom_shared_font(app, -1));
+        assert_eq!(sizes(cx, &font, &sidebar), (12.0, 11.0));
+        assert_eq!(stored(cx), (Some(12.0), Some(11.0)));
+
+        // The write reached disk.
+        let reloaded = SettingsPrefsStore::load(path);
+        assert_eq!(reloaded.terminal_font_px(), Some(12.0));
+        assert_eq!(reloaded.sidebar_font_px(), Some(11.0));
+    }
+
+    /// Each size clamps on its own; the 1pt gap closes at a bound.
+    #[gpui::test]
+    fn keyboard_zoom_clamps_each_size_independently(cx: &mut gpui::TestAppContext) {
+        let (_path, font, sidebar) = install_fonts(cx, "zoom-clamp");
+
+        cx.update(|app| {
+            apply_terminal_px(app, 32.0);
+            apply_sidebar_px(app, 31.0);
+        });
+        cx.update(|app| zoom_shared_font(app, 1));
+        assert_eq!(sizes(cx, &font, &sidebar), (32.0, 32.0));
+
+        cx.update(|app| {
+            apply_terminal_px(app, 9.0);
+            apply_sidebar_px(app, 8.0);
+        });
+        cx.update(|app| zoom_shared_font(app, -1));
+        assert_eq!(sizes(cx, &font, &sidebar), (8.0, 8.0));
+    }
+
+    /// ⌘0 resets both sizes and persists them, leaving family + line height alone.
+    #[gpui::test]
+    fn keyboard_reset_restores_both_sizes_only(cx: &mut gpui::TestAppContext) {
+        let (_path, font, sidebar) = install_fonts(cx, "zoom-reset");
+
+        cx.update(|app| {
+            apply_terminal_px(app, 20.0);
+            apply_sidebar_px(app, 17.0);
+            font.update(app, |f, cx| {
+                f.set_family(Some("Menlo".into()), cx);
+                f.set_line_height(1.5, cx);
+            });
+        });
+        cx.run_until_parked();
+        let line_height = cx.update(|app| font.read(app).line_height());
+
+        cx.update(|app| reset_shared_font(app));
+        assert_eq!(
+            sizes(cx, &font, &sidebar),
+            (DEFAULT_TERMINAL_FONT_PX, DEFAULT_SIDEBAR_FONT_PX)
+        );
+        assert_eq!(
+            stored(cx),
+            (Some(DEFAULT_TERMINAL_FONT_PX), Some(DEFAULT_SIDEBAR_FONT_PX))
+        );
+        cx.update(|app| {
+            let f = font.read(app);
+            assert_eq!(f.chain(), &[gpui::SharedString::from("Menlo")]);
+            assert_eq!(f.line_height(), line_height);
+        });
     }
 }

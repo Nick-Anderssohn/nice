@@ -7,19 +7,13 @@
 //! Global idiom (`keymap.rs`). It holds the sidebar base point size + the ported
 //! [`sidebar_size`] proportional-scale helper the sidebar chrome reads.
 //!
-//! ## Coupled to terminal zoom (Swift parity)
-//! The entity SUBSCRIBES to the shared terminal [`FontSettings`]' [`FontZoom`]
-//! event (the surface `font.rs` emits expressly for this proportional subscriber):
-//! on a terminal zoom (⌘=/⌘−/⌘0 or the Font-pane size slider) it ratio-preserving
-//! rescales the sidebar px (`clamp(round(sidebar_px × new_px / old_px))`), matching
-//! Swift's `⌘=`/`⌘−`/`⌘0` scaling BOTH sizes (`FontSettings.swift:91-105`). The
-//! Font-pane's "Reset to defaults" resets the sidebar explicitly via [`reset`]
-//! (which is why `FontSettings::reset_to_defaults` does NOT emit `FontZoom` — a
-//! proportional rescale off it would fight the explicit reset).
+//! ## Independent of the terminal size
+//! The sidebar size changes only through its own Font-pane stepper, the Font
+//! pane's "Reset to defaults", and the keyboard zoom (⌘=/⌘−/⌘0), which steps the
+//! terminal and sidebar sizes by 1pt each (`keymap.rs` `zoom_shared_font`). There
+//! is no ratio coupling: a terminal-size change never moves the sidebar.
 
-use gpui::{App, Context, Entity, Global, Subscription};
-
-use nice_term_view::{FontSettings, FontZoom};
+use gpui::{App, Context, Entity, Global};
 
 /// The sidebar default point size (the 12pt anchor, `FontSettings.swift:38-51`).
 pub const DEFAULT_SIDEBAR_FONT_PX: f32 = 12.0;
@@ -42,37 +36,18 @@ pub fn sidebar_size(sidebar_px: f32, default_pt: f32) -> f32 {
         .max(1.0)
 }
 
-/// The app-level sidebar-font state: the sidebar base px + the tracked terminal px
-/// (the ratio reference for the proportional [`FontZoom`] rescale). Constructed via
+/// The app-level sidebar-font state: the sidebar base px. Constructed via
 /// [`SharedSidebarFontSettings::new`] inside `cx.new(...)`.
 pub struct SharedSidebarFontSettings {
     /// The sidebar base point size (default 12), clamped to `[MIN, MAX]`.
     px: f32,
-    /// The terminal px last seen through the [`FontZoom`] subscription — the
-    /// denominator of the proportional rescale ratio.
-    last_terminal_px: f32,
-    /// The terminal-zoom subscription (proportional rescale). Held so it lives as
-    /// long as the entity.
-    _zoom_sub: Subscription,
 }
 
 impl SharedSidebarFontSettings {
-    /// A sidebar-font state at `px`, coupled to `font`'s [`FontZoom`] with
-    /// `terminal_px` as the initial ratio reference (the terminal's px at
-    /// construction). Call inside `cx.new(|cx| SharedSidebarFontSettings::new(...))`.
-    pub fn new(
-        px: f32,
-        terminal_px: f32,
-        font: &Entity<FontSettings>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let sub = cx.subscribe(font, |this, _font, ev: &FontZoom, cx| {
-            this.on_terminal_zoom(ev.px, cx);
-        });
+    /// A sidebar-font state at `px` (clamped).
+    pub fn new(px: f32) -> Self {
         Self {
             px: clamp_sidebar_px(px),
-            last_terminal_px: terminal_px,
-            _zoom_sub: sub,
         }
     }
 
@@ -81,8 +56,8 @@ impl SharedSidebarFontSettings {
         self.px
     }
 
-    /// Set the sidebar base px (the Font-pane sidebar-size slider). Clamped; a
-    /// size that does not move is a no-op (no `notify`).
+    /// Set the sidebar base px (the Font-pane sidebar stepper + the keyboard zoom).
+    /// Clamped; a size that does not move is a no-op (no `notify`).
     pub fn set_px(&mut self, px: f32, cx: &mut Context<Self>) {
         let new = clamp_sidebar_px(px);
         if new != self.px {
@@ -93,26 +68,7 @@ impl SharedSidebarFontSettings {
 
     /// Reset the sidebar to its 12pt default (the Font-pane "Reset to defaults").
     pub fn reset(&mut self, cx: &mut Context<Self>) {
-        if self.px != DEFAULT_SIDEBAR_FONT_PX {
-            self.px = DEFAULT_SIDEBAR_FONT_PX;
-            cx.notify();
-        }
-    }
-
-    /// Proportionally rescale off a terminal zoom to `new_terminal_px`
-    /// (`clamp(round(sidebar_px × new / old))`), then advance the ratio reference.
-    fn on_terminal_zoom(&mut self, new_terminal_px: f32, cx: &mut Context<Self>) {
-        if self.last_terminal_px <= 0.0 {
-            self.last_terminal_px = new_terminal_px;
-            return;
-        }
-        let ratio = new_terminal_px / self.last_terminal_px;
-        self.last_terminal_px = new_terminal_px;
-        let scaled = clamp_sidebar_px((self.px * ratio).round());
-        if scaled != self.px {
-            self.px = scaled;
-            cx.notify();
-        }
+        self.set_px(DEFAULT_SIDEBAR_FONT_PX, cx);
     }
 }
 
@@ -168,23 +124,17 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Entity-level `#[gpui::test]`s on the MOCKED `TestAppContext` (no Metal,
-    // no pixels; parallel-safe) — the stateful D3 coupling the pure helpers
-    // above cannot reach: the terminal-zoom proportional rescale
-    // (`on_terminal_zoom`), the sidebar-slider `set_px`, and `reset`.
-    //
-    // These live IN THIS CRATE (not `nice-itests`) because `SharedSidebarFontSettings`
-    // is app-shaped and a dev/test crate cannot import this binary crate — the
-    // same constraint the R9 `chrome_band` / R10 `sidebar_multiselect` probes
-    // have. `nice`'s `gpui/test-support` dev-dep compiles `#[gpui::test]` here.
+    // Entity-level `#[gpui::test]` on the MOCKED `TestAppContext` (no Metal, no
+    // pixels; parallel-safe): `set_px` clamping / notify-only-on-change and
+    // `reset`. Lives IN THIS CRATE because `SharedSidebarFontSettings` is
+    // app-shaped and a dev/test crate cannot import this binary crate.
     use gpui::{AppContext as _, TestAppContext};
-    use nice_term_view::DEFAULT_TERMINAL_FONT_PX;
     use std::cell::Cell;
     use std::rc::Rc;
 
     /// Wire an observer that counts `cx.notify()`s on the sidebar entity, parked
-    /// once so the deferred subscription activations are live before the first
-    /// emitting mutation (the `font_mutators` idiom).
+    /// once so the deferred subscription activation is live before the first
+    /// mutation (the `font_mutators` idiom).
     fn observe_notifies(
         cx: &mut TestAppContext,
         sidebar: &Entity<SharedSidebarFontSettings>,
@@ -199,129 +149,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn terminal_zoom_rescales_the_sidebar_proportionally(cx: &mut TestAppContext) {
-        let font = cx.new(FontSettings::resolved_default); // terminal px = 13
-        let sidebar = cx.new(|cx| {
-            SharedSidebarFontSettings::new(DEFAULT_SIDEBAR_FONT_PX, DEFAULT_TERMINAL_FONT_PX, &font, cx)
-        });
-        let (notifies, _sub) = observe_notifies(cx, &sidebar);
-
-        // Doubling the terminal px doubles the sidebar px (ratio 26/13 = 2 → 12*2).
-        let before = notifies.get();
-        font.update(cx, |f, cx| f.set_px(26.0, cx));
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar.read(app).px(),
-                24.0,
-                "a terminal zoom to 2× rescales the sidebar to 2× (12 → 24)"
-            );
-        });
-        assert!(notifies.get() > before, "a rescale that moves the size notifies");
-
-        // Halving the reference (26 → 13) halves the sidebar back (24 → 12); the
-        // reference advanced on the previous zoom, so this ratio is 13/26 = 0.5.
-        font.update(cx, |f, cx| f.set_px(13.0, cx));
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar.read(app).px(),
-                12.0,
-                "the ratio reference advanced: a return to 13 restores 12"
-            );
-        });
-
-        // A FontZoom that does NOT move the terminal px (a family change emits
-        // `FontZoom { px: self.px }`, px unchanged) is a proportional no-op: ratio
-        // 1 leaves the sidebar at 12 and fires NO notify (notify-only-if-changed).
-        let steady = notifies.get();
-        font.update(cx, |f, cx| f.set_family(Some("JetBrains Mono".into()), cx));
-        cx.run_until_parked();
-        cx.update(|app| assert_eq!(sidebar.read(app).px(), 12.0));
-        assert_eq!(
-            notifies.get(),
-            steady,
-            "a same-size FontZoom rescales to the same px and does not notify"
-        );
-    }
-
-    #[gpui::test]
-    fn terminal_zoom_clamps_the_rescaled_sidebar(cx: &mut TestAppContext) {
-        let font = cx.new(FontSettings::resolved_default);
-        // A reference of 8 with a sidebar base of 20 forces the clamp: a zoom to 26
-        // is ratio 26/8 = 3.25 → 20*3.25 = 65, clamped to MAX (32).
-        let sidebar = cx.new(|cx| SharedSidebarFontSettings::new(20.0, 8.0, &font, cx));
-        let (_notifies, _sub) = observe_notifies(cx, &sidebar);
-
-        font.update(cx, |f, cx| f.set_px(26.0, cx));
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar.read(app).px(),
-                MAX_SIDEBAR_FONT_PX,
-                "an over-max rescale clamps the sidebar to MAX (32)"
-            );
-        });
-
-        // A ratio that would drive it below MIN clamps to MIN: reference 26,
-        // sidebar 32 → a zoom to 8 is ratio 8/26 ≈ 0.31 → 32*0.31 ≈ 9.8 → 10... use
-        // a fresh, lower base to reach the floor deterministically.
-        let sidebar2 = cx.new(|cx| SharedSidebarFontSettings::new(9.0, 26.0, &font, cx));
-        let (_n2, _s2) = observe_notifies(cx, &sidebar2);
-        // font is currently at 26 (from the clamp step). Drive it to 8: ratio 8/26,
-        // 9*8/26 ≈ 2.77 → round 3 → clamp MIN (8).
-        font.update(cx, |f, cx| f.set_px(8.0, cx));
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar2.read(app).px(),
-                MIN_SIDEBAR_FONT_PX,
-                "a below-min rescale clamps the sidebar to MIN (8)"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn zero_reference_guard_advances_without_rescaling(cx: &mut TestAppContext) {
-        let font = cx.new(FontSettings::resolved_default); // px = 13
-        // A non-positive reference (the `last_terminal_px <= 0.0` guard, line 105):
-        // the first zoom must ONLY adopt the incoming px as the reference — never
-        // divide by it — leaving the sidebar untouched.
-        let sidebar = cx.new(|cx| SharedSidebarFontSettings::new(DEFAULT_SIDEBAR_FONT_PX, 0.0, &font, cx));
-        let (notifies, _sub) = observe_notifies(cx, &sidebar);
-
-        let before = notifies.get();
-        font.update(cx, |f, cx| f.set_px(26.0, cx)); // FontZoom { px: 26 }
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar.read(app).px(),
-                DEFAULT_SIDEBAR_FONT_PX,
-                "the zero-reference guard leaves the sidebar unchanged on the first zoom"
-            );
-        });
-        assert_eq!(notifies.get(), before, "the guard path does not notify");
-
-        // The reference is now 26 (adopted). A subsequent zoom back to 13 rescales
-        // proportionally (13/26 = 0.5 → 12*0.5 = 6 → clamped to MIN 8), proving the
-        // reference was advanced by the guard rather than the zoom being lost.
-        font.update(cx, |f, cx| f.set_px(13.0, cx));
-        cx.run_until_parked();
-        cx.update(|app| {
-            assert_eq!(
-                sidebar.read(app).px(),
-                MIN_SIDEBAR_FONT_PX,
-                "after the guard adopted 26, a zoom to 13 rescales (and clamps to MIN)"
-            );
-        });
-    }
-
-    #[gpui::test]
     fn set_px_clamps_no_ops_and_reset_restores_the_default(cx: &mut TestAppContext) {
-        let font = cx.new(FontSettings::resolved_default);
-        let sidebar = cx.new(|cx| {
-            SharedSidebarFontSettings::new(DEFAULT_SIDEBAR_FONT_PX, DEFAULT_TERMINAL_FONT_PX, &font, cx)
-        });
+        let sidebar = cx.new(|_| SharedSidebarFontSettings::new(DEFAULT_SIDEBAR_FONT_PX));
         let (notifies, _sub) = observe_notifies(cx, &sidebar);
 
         // set_px clamps above MAX / below MIN and notifies on a real move.

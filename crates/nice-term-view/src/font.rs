@@ -6,9 +6,8 @@
 //! gpui **entity** so the view can `cx.observe` it and the ⌘+/⌘−/⌘0 zoom
 //! keybindings can mutate it; a single mutation fans out to every pane, which is
 //! exactly the process-wide behavior Nice ships today (`FontSettings.swift` +
-//! `TabPtySession.applyTerminalFont`). Stage 2's proportional sidebar scale
-//! (R10) subscribes to the same [`FontZoom`] event surface, so it needs no
-//! refactor of this entity.
+//! `TabPtySession.applyTerminalFont`). The sidebar size is separate app-level
+//! state in `crates/nice`; the keyboard zoom steps both.
 //!
 //! ## Why the type lives here, not in `crates/nice`
 //!
@@ -34,7 +33,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    px, Context, EventEmitter, Font, FontFeatures, FontStyle, FontWeight, SharedString, TextSystem,
+    px, Context, Font, FontFeatures, FontStyle, FontWeight, SharedString, TextSystem,
 };
 
 use crate::element::TerminalMetrics;
@@ -74,16 +73,6 @@ pub fn default_font_chain() -> Vec<SharedString> {
     ]
 }
 
-/// Emitted on every zoom / reset that actually changes the size. Carries the new
-/// point size so a subscriber can scale off it. This is the event surface R10's
-/// proportional sidebar scale subscribes to (`cx.subscribe(&font, …)`); the
-/// terminal views themselves ride the entity's `notify` via `cx.observe`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FontZoom {
-    /// The new terminal point size after the change.
-    pub px: f32,
-}
-
 /// How a [`FontSettings`]' cell metrics are produced.
 #[derive(Clone, Copy, Debug)]
 enum MetricsMode {
@@ -118,8 +107,6 @@ pub struct FontSettings {
     metrics: TerminalMetrics,
     mode: MetricsMode,
 }
-
-impl EventEmitter<FontZoom> for FontSettings {}
 
 impl FontSettings {
     /// The shipped default: the [`default_font_chain`] resolved through GPUI's
@@ -190,25 +177,11 @@ impl FontSettings {
         self.metrics
     }
 
-    /// Zoom by `delta` points (⌘+ is `+1`, ⌘− is `-1`), clamped to `[MIN, MAX]`.
-    /// A no-op at the clamp bound (never emits / notifies for a size that did not
-    /// move). Mirrors `FontSettings.swift`'s `zoom(by:)` (terminal is the anchor;
-    /// the sidebar scale it also drives is R10, off the [`FontZoom`] event).
-    pub fn zoom_by(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.set_px(self.px + delta as f32, cx);
-    }
-
-    /// ⌘0 — snap back to the default size exactly. A no-op if already at default.
-    pub fn reset(&mut self, cx: &mut Context<Self>) {
-        self.set_px(DEFAULT_TERMINAL_FONT_PX, cx);
-    }
-
-    /// Set the terminal point size (R23's Font-pane size slider + the ⌘±/⌘0 zoom).
+    /// Set the terminal point size (the Font-pane size stepper + the ⌘±/⌘0 zoom).
     /// The input is **clamped** to `[MIN, MAX]` ([`clamp_px`]); a size that does not
-    /// actually move is a no-op (never emits / notifies). On a real change: recompute
-    /// metrics, emit the typed [`FontZoom`] (the sidebar's proportional subscriber +
-    /// R10's surface), and `notify` (the views' `cx.observe` re-metric). Takes plain
-    /// `f32` only — boundary-legal (a terminal size IS a terminal concept).
+    /// actually move is a no-op (never notifies). On a real change: recompute
+    /// metrics and `notify` (the views' `cx.observe` re-metric). Takes plain `f32`
+    /// only — boundary-legal (a terminal size IS a terminal concept).
     pub fn set_px(&mut self, px: f32, cx: &mut Context<Self>) {
         let new_px = clamp_px(px);
         if new_px == self.px {
@@ -216,7 +189,6 @@ impl FontSettings {
         }
         self.px = new_px;
         self.recompute_metrics(cx);
-        cx.emit(FontZoom { px: new_px });
         cx.notify();
     }
 
@@ -225,9 +197,7 @@ impl FontSettings {
     /// MAX_TERMINAL_LINE_HEIGHT]` ([`clamp_line_height`]); a value that does not
     /// actually move is a no-op (never notifies). On a real change: recompute the
     /// cell metrics (only the cell HEIGHT changes) and `notify` so every view
-    /// re-metrics its grid. Deliberately does NOT emit [`FontZoom`] — the point
-    /// size is unchanged, so the sidebar's proportional subscriber must not
-    /// rescale off a line-height change.
+    /// re-metrics its grid.
     pub fn set_line_height(&mut self, multiplier: f32, cx: &mut Context<Self>) {
         let new_lh = clamp_line_height(multiplier);
         if new_lh == self.line_height {
@@ -241,11 +211,9 @@ impl FontSettings {
     /// Override the terminal font family (R23's Font-pane family picker). `Some(f)`
     /// makes `f` the sole chain entry (resolved through the text system, GPUI
     /// substituting a system font if it is unavailable); `None` restores the shipped
-    /// [`default_font_chain`]. Re-resolves the family, re-metrics, emits [`FontZoom`]
-    /// (so the sidebar's subscriber sees a change event — the point size is
-    /// unchanged, so it is a proportional no-op), and `notify`s every view to
-    /// re-metric. Takes `Option<SharedString>` only — boundary-legal (a terminal
-    /// family IS a terminal concept).
+    /// [`default_font_chain`]. Re-resolves the family, re-metrics, and `notify`s
+    /// every view to re-metric. Takes `Option<SharedString>` only — boundary-legal
+    /// (a terminal family IS a terminal concept).
     pub fn set_family(&mut self, family: Option<SharedString>, cx: &mut Context<Self>) {
         self.chain = match family {
             Some(f) => vec![f],
@@ -254,15 +222,12 @@ impl FontSettings {
         let ts = cx.text_system().clone();
         self.family = resolve_family(&ts, &self.chain);
         self.recompute_metrics(cx);
-        cx.emit(FontZoom { px: self.px });
         cx.notify();
     }
 
     /// Reset the terminal font to the shipped defaults (R23's Font-pane "Reset to
-    /// defaults"): the [`default_font_chain`] at [`DEFAULT_TERMINAL_FONT_PX`]. Unlike
-    /// [`set_px`](Self::set_px) this does NOT emit [`FontZoom`] — the sidebar's own
-    /// reset is driven explicitly by the Font-pane handler, so a proportional rescale
-    /// off this reset would fight it. Re-resolves + re-metrics and `notify`s the views.
+    /// defaults"): the [`default_font_chain`] at [`DEFAULT_TERMINAL_FONT_PX`].
+    /// Re-resolves + re-metrics and `notify`s the views.
     pub fn reset_to_defaults(&mut self, cx: &mut Context<Self>) {
         self.chain = default_font_chain();
         let ts = cx.text_system().clone();

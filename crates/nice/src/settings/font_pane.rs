@@ -60,8 +60,7 @@ fn persist(cx: &mut App, apply: impl FnOnce(&mut SettingsPrefsStore) -> std::io:
 }
 
 /// Apply a terminal font size LIVE (fan out through the shared `FontSettings`) and
-/// persist the clamped value. The sidebar rescales proportionally via its own
-/// `FontZoom` subscription (Swift parity).
+/// persist the clamped value. Touches only the terminal size.
 pub(crate) fn apply_terminal_px(cx: &mut App, px: f32) {
     let Some(font) = crate::keymap::try_shared_font_settings(cx) else {
         return;
@@ -116,9 +115,8 @@ pub(crate) fn apply_sidebar_px(cx: &mut App, px: f32) {
 }
 
 /// Reset to shipped defaults: terminal → 13 + default chain, sidebar → 12
-/// (`FontSettings.swift:102-105`). Both entities reset explicitly (the terminal's
-/// `reset_to_defaults` deliberately does NOT emit `FontZoom`, so it does not fight
-/// the explicit sidebar reset), and all three keys persist.
+/// (`FontSettings.swift:102-105`), line height → default. Both entities reset
+/// explicitly and all four keys persist.
 pub(crate) fn reset_fonts(cx: &mut App) {
     if let Some(font) = crate::keymap::try_shared_font_settings(cx) {
         font.update(cx, |f, cx| f.reset_to_defaults(cx));
