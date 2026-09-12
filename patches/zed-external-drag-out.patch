@@ -1,4 +1,5 @@
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index bd24e60c6c..616525897b 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
 @@ -649,6 +649,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
@@ -18,6 +19,7 @@ diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
      fn zoom(&self);
      fn toggle_fullscreen(&self);
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 16cc13afcf..ce56bcabfc 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
 @@ -2386,6 +2386,22 @@ impl Window {
@@ -44,6 +46,7 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
      pub fn set_window_edited(&mut self, edited: bool) {
          self.platform_window.set_edited(edited);
 diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index b5b7973c18..e03e5711dc 100644
 --- a/crates/gpui_macos/src/window.rs
 +++ b/crates/gpui_macos/src/window.rs
 @@ -108,6 +108,20 @@ type NSDragOperation = NSUInteger;
@@ -87,7 +90,7 @@ diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
              decl.register()
          };
          BLURRED_VIEW_CLASS = {
-@@ -1592,6 +1619,30 @@ impl PlatformWindow for MacWindow {
+@@ -1592,6 +1619,39 @@ impl PlatformWindow for MacWindow {
          }
      }
  
@@ -107,18 +110,27 @@ diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
 +            return false;
 +        }
 +        let native_view = self.0.as_ref().lock().native_view.as_ptr();
-+        unsafe {
++        let began = unsafe {
 +            let pool = NSAutoreleasePool::new(nil);
 +            let began = begin_external_paths_drag_on_view(native_view, paths);
 +            let _: () = msg_send![pool, release];
 +            began
++        };
++        if began {
++            // AppKit now owns mouse tracking until the session ends, so the view
++            // never receives this gesture's mouse-up. Without this bump the
++            // synthetic_drag loop spawned by the arming mouse-move replays that
++            // stale held-button move every 16ms after the drop, fighting real
++            // hover until the next click.
++            self.0.as_ref().lock().synthetic_drag_counter += 1;
 +        }
++        began
 +    }
 +
      fn background_appearance(&self) -> WindowBackgroundAppearance {
          self.0.as_ref().lock().background_appearance
      }
-@@ -2922,6 +2973,96 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
+@@ -2922,6 +2982,96 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
      point(px(window_x as f32), px(window_y as f32))
  }
  

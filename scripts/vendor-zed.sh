@@ -59,7 +59,9 @@
 #          (copy outside the app, copy+generic inside so our own drop targets
 #          still decide move-vs-copy). The triggering `NSEvent` comes from
 #          `[NSApp currentEvent]`, so it only starts from inside synchronous
-#          mouse-event dispatch; it refuses instead of raising otherwise.
+#          mouse-event dispatch; it refuses instead of raising otherwise. A
+#          started session also ends gpui's `synthetic_drag` replay loop, since
+#          AppKit swallows the gesture's mouse-up that would normally stop it.
 #        - zed-1x-crisp-text.patch: crisp text on low-density (1x) displays.
 #          In paint_glyph, when scale_factor < 1.5: snap glyph origins to
 #          whole device pixels (no quarter-pixel x variants), skip the

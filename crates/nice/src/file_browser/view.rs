@@ -69,6 +69,7 @@ use crate::file_browser::pasteboard::{FilePasteboardGlobal, Intent};
 use crate::file_browser::sort_settings_store::SortSettingsStore;
 use crate::file_browser::watcher::DirectoryWatcherHub;
 use crate::file_browser::workspace_ops::{open_with_entries, WorkspaceOpsGlobal};
+use crate::settings::sidebar_font::{sidebar_size, DEFAULT_SIDEBAR_FONT_PX};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::window_state::WindowState;
@@ -190,6 +191,9 @@ pub(crate) struct FileBrowserView {
     accent: Srgba,
     /// The window backing scale (re-sampled each render for the SF-symbol cache).
     window_scale: f32,
+    /// The sidebar font base size (re-read each render). Row geometry and text
+    /// scale off it through [`sidebar_size`], like the sessions-mode rows.
+    sidebar_px: f32,
     /// R20 (F8): a one-shot rename request set by the context-menu "Rename"
     /// handler, the Return trigger, and the slow-second-click deferral. Consumed
     /// by the next render (which has the `Window` [`begin_rename`](Self::begin_rename)
@@ -307,6 +311,7 @@ impl FileBrowserView {
             focus_handle: cx.focus_handle(),
             accent,
             window_scale: 2.0,
+            sidebar_px: DEFAULT_SIDEBAR_FONT_PX,
             pending_rename_path: None,
             pending_scroll_path: None,
             rename: None,
@@ -1544,10 +1549,15 @@ impl FileBrowserView {
 
     // MARK: - Rendering
 
+    /// `base` scaled by the sidebar font size (the shell's `sidebar_pt`).
+    fn pt(&self, base: f32) -> f32 {
+        sidebar_size(self.sidebar_px, base)
+    }
+
     fn build_header(&self, snap: &Snapshot, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         // The flat restyle renders sidebar text in the terminal mono family (the
-        // same seam the sessions-mode rows / project headers use); only the family
-        // changes — the size stays `NAME_SIZE`.
+        // same seam the sessions-mode rows / project headers use); the size scales
+        // off `NAME_SIZE` with the sidebar font.
         let family = crate::sidebar_shell::resolved_mono_family(cx);
         div()
             .id("file-browser.header")
@@ -1555,7 +1565,7 @@ impl FileBrowserView {
             .px(px(14.0))
             .pt(px(6.0))
             .pb(px(2.0))
-            .text_size(px(NAME_SIZE))
+            .text_size(px(self.pt(NAME_SIZE)))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(slot_to_rgba(s.ink))
             .when_some(family, |el, fam| el.font_family(fam))
@@ -1735,9 +1745,10 @@ impl FileBrowserView {
             caret: srgba_to_rgba(self.accent),
         };
         // The flat restyle renders row names in the terminal mono family (same
-        // seam as the sessions-mode rows); only the family changes — size stays
-        // `NAME_SIZE`.
+        // seam as the sessions-mode rows); row geometry and text scale with the
+        // sidebar font.
         let family = crate::sidebar_shell::resolved_mono_family(cx);
+        let sidebar_px = self.sidebar_px;
         let count = rows.len();
         let weak = cx.weak_entity();
         let rename_focus = self.rename_focus.clone();
@@ -1750,6 +1761,7 @@ impl FileBrowserView {
                         weak.clone(),
                         colors,
                         scale,
+                        sidebar_px,
                         family.clone(),
                         &rename_focus,
                         probe.clone(),
@@ -1781,13 +1793,13 @@ impl FileBrowserView {
             })
             .child(
                 div()
-                    .text_size(px(22.0))
+                    .text_size(px(self.pt(22.0)))
                     .text_color(slot_to_rgba(s.ink2))
                     .child(SharedString::from("\u{25A2}")),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(self.pt(12.0)))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(slot_to_rgba(s.ink))
                     .child(SharedString::from("Folder not found")),
@@ -1795,7 +1807,7 @@ impl FileBrowserView {
             .child(
                 div()
                     .px(px(12.0))
-                    .text_size(px(10.0))
+                    .text_size(px(self.pt(10.0)))
                     .text_color(slot_to_rgba(s.ink2))
                     .child(SharedString::from(snap.root.clone())),
             )
@@ -1809,7 +1821,7 @@ impl FileBrowserView {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(12.0))
+            .text_size(px(self.pt(12.0)))
             .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
                 d.font_family(fam)
             })
@@ -2108,10 +2120,12 @@ impl FileBrowserView {
     /// probe's discipline — geometry that was not drawn is not a target).
     ///
     /// The list is a [`uniform_list`], so item `ix` is painted at
-    /// `viewport.top + scroll_offset.y + ix * ROW_HEIGHT` (every row pins its own
-    /// height to `ROW_HEIGHT`), and the tracked scroll handle carries both the
-    /// viewport bounds and the live offset.
+    /// `viewport.top + scroll_offset.y + ix * row_height` (every row pins its own
+    /// height to `ROW_HEIGHT` scaled by the last-rendered sidebar font size), and
+    /// the tracked scroll handle carries both the viewport bounds and the live
+    /// offset.
     pub(crate) fn scenario_row_center(&self, path: &str) -> Option<(f32, f32)> {
+        let row_height = self.pt(ROW_HEIGHT);
         let ix = self.rendered_paths.iter().position(|p| p == path)?;
         let (viewport, offset_y) = {
             let st = self.scroll.0.borrow();
@@ -2125,14 +2139,15 @@ impl FileBrowserView {
         if vp_w <= 0.0 || vp_h <= 0.0 {
             return None; // never laid out
         }
-        let top = vp_top + offset_y + ix as f32 * ROW_HEIGHT;
-        if top < vp_top || top + ROW_HEIGHT > vp_top + vp_h {
+        let top = vp_top + offset_y + ix as f32 * row_height;
+        if top < vp_top || top + row_height > vp_top + vp_h {
             return None; // scrolled out of the painted viewport
         }
         // Horizontally: inside the name run for every indent level the fixture
-        // trees reach, clamped to the viewport for a very narrow sidebar.
-        let x = vp_left + ROW_PRESS_INSET.min(vp_w / 2.0);
-        Some((x, top + ROW_HEIGHT / 2.0))
+        // trees reach (the inset scales with the indent and icons), clamped to the
+        // viewport for a very narrow sidebar.
+        let x = vp_left + self.pt(ROW_PRESS_INSET).min(vp_w / 2.0);
+        Some((x, top + row_height / 2.0))
     }
 
     /// Scroll `path`'s row into view (centred) so a live scenario can aim real
@@ -2158,6 +2173,9 @@ impl Focusable for FileBrowserView {
 impl gpui::Render for FileBrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_scale = window.scale_factor();
+        // A sidebar font change refreshes every window, so re-reading here is
+        // enough to repaint at the new size.
+        self.sidebar_px = crate::settings::sidebar_font::current_sidebar_px(cx);
         let s = chrome_slots(cx);
 
         // Deferred Open With ▸ second stage: open it now (render has the Window
@@ -2301,12 +2319,14 @@ fn render_row(
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
     scale: f32,
+    sidebar_px: f32,
     family: Option<SharedString>,
     rename_focus: &FocusHandle,
     probe: FieldProbeCell,
     app: &mut App,
 ) -> AnyElement {
-    let indent = row.depth as f32 * INDENT_PER_LEVEL;
+    let pt = |base: f32| sidebar_size(sidebar_px, base);
+    let indent = row.depth as f32 * pt(INDENT_PER_LEVEL);
     let icon_color = if row.is_dir { c.ink2 } else { c.ink3 };
     let path_for_click = row.path.clone();
     let path_for_menu = row.path.clone();
@@ -2318,7 +2338,7 @@ fn render_row(
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ROW_HEIGHT))
+        .h(px(pt(ROW_HEIGHT)))
         .w_full()
         .pl(px(6.0 + indent))
         .pr(px(6.0))
@@ -2342,7 +2362,7 @@ fn render_row(
     // SF Symbol chevron.right at 10pt semibold, 0.7 opacity, rotated 90° when
     // expanded — rendered here as a chevron.right/chevron.down glyph swap,
     // matching this file's existing chevron idiom.
-    let mut disclosure = div().w(px(DISCLOSURE_SLOT)).flex().justify_center();
+    let mut disclosure = div().w(px(pt(DISCLOSURE_SLOT))).flex().justify_center();
     if is_dir {
         let (symbol, fallback) = if row.is_expanded {
             ("chevron.down", CHEVRON_OPEN)
@@ -2352,7 +2372,7 @@ fn render_row(
         disclosure = disclosure.opacity(0.7).child(sf_symbol_icon(
             symbol,
             fallback,
-            10.0,
+            pt(10.0),
             SymbolWeight::Semibold,
             c.ink2,
             scale,
@@ -2363,13 +2383,13 @@ fn render_row(
         .child(disclosure)
         .child(
             div()
-                .w(px(ICON_FRAME))
+                .w(px(pt(ICON_FRAME)))
                 .flex()
                 .justify_center()
                 .child(sf_symbol_icon(
                     row.icon_symbol,
                     row.icon_glyph,
-                    ICON_SIZE,
+                    pt(ICON_SIZE),
                     SymbolWeight::Regular,
                     icon_color,
                     scale,
@@ -2378,7 +2398,14 @@ fn render_row(
         )
         .child(match &row.editing {
             Some(text) => {
-                render_rename_field(text, rename_focus, weak.clone(), c, probe.clone())
+                render_rename_field(
+                    text,
+                    rename_focus,
+                    weak.clone(),
+                    c,
+                    pt(NAME_SIZE),
+                    probe.clone(),
+                )
             }
             // min_w_0 lets the flex item shrink below the name's intrinsic
             // width; middle truncation matches prod
@@ -2389,7 +2416,7 @@ fn render_row(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis_middle()
-                .text_size(px(NAME_SIZE))
+                .text_size(px(pt(NAME_SIZE)))
                 .text_color(c.ink)
                 .when_some(family, |el, fam| el.font_family(fam))
                 .child(SharedString::from(row.name.clone()))
@@ -2526,6 +2553,7 @@ fn render_rename_field(
     rename_focus: &FocusHandle,
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
+    text_size: f32,
     probe: FieldProbeCell,
 ) -> AnyElement {
     let colors = FieldColors {
@@ -2542,7 +2570,7 @@ fn render_rename_field(
         text,
         "FileBrowserRename",
         colors,
-        NAME_SIZE,
+        text_size,
         probe,
         move |e: &KeyDownEvent, window, app| {
             let _ = weak_key.update(app, |this, cx| this.on_rename_key(e, window, cx));
@@ -2728,6 +2756,34 @@ mod tests {
         let accent = Srgba::rgb(0.2, 0.4, 0.9);
         let window = cx.add_window(|_window, cx| FileBrowserView::new(state, accent, cx));
         (window, ops)
+    }
+
+    /// The reported bug: the sidebar font setting did not resize the file browser.
+    /// Rows must be LAID OUT at the scaled height, so two adjacent rows' painted
+    /// centres sit `sidebar_size(18, ROW_HEIGHT)` apart (the fixed 22 before the fix).
+    #[gpui::test]
+    fn rows_are_laid_out_at_the_sidebar_font_size(cx: &mut gpui::TestAppContext) {
+        use crate::settings::sidebar_font::{
+            sidebar_size, SharedSidebarFont, SharedSidebarFontSettings,
+        };
+        // Installed before `mount`: the test window draws inside `add_window`.
+        cx.update(|app| {
+            let sidebar = app.new(|_| SharedSidebarFontSettings::new(18.0));
+            app.set_global(SharedSidebarFont(sidebar));
+        });
+        let fx = DropFixture::new("sidebar-font");
+        let (window, _ops) = mount(cx, &fx);
+
+        window
+            .update(cx, |view, _window, _cx| {
+                let first = view.rendered_paths.first().cloned().expect("rows rendered");
+                let second = view.rendered_paths.get(1).cloned().expect("two rows rendered");
+                let (_, y0) = view.scenario_row_center(&first).expect("first row painted");
+                let (_, y1) = view.scenario_row_center(&second).expect("second row painted");
+                assert_eq!(y1 - y0, sidebar_size(18.0, ROW_HEIGHT));
+                assert_eq!(view.sidebar_px, 18.0, "render reads the sidebar font size");
+            })
+            .unwrap();
     }
 
     /// The live selection, sorted — these tests assert membership, not the visible
