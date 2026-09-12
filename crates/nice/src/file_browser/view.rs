@@ -255,6 +255,11 @@ pub(crate) struct FileBrowserView {
     /// press never armed a drag" (benign platform limitation → defer) from
     /// "the drag armed and the drop was lost" (a real regression → fail).
     drag_arm_count: usize,
+    /// A slow-second-click rename the last click qualified for, waiting for that
+    /// click's release to arm it. Arming at mouse-down let a press that turned
+    /// into a drag enter rename; gpui fires no release click after a drag arms, so
+    /// arming on the release rules that out. Cleared by a new press or a drag.
+    pending_slow_rename: Option<String>,
 }
 
 /// The active inline-rename edit session (F8): the pure editing model plus the
@@ -325,6 +330,7 @@ impl FileBrowserView {
             pending_press: None,
             option_probe: Arc::new(|| false),
             drag_arm_count: 0,
+            pending_slow_rename: None,
         }
     }
 
@@ -544,6 +550,7 @@ impl FileBrowserView {
         // MouseUp capture arm), so a deferral can outlive its gesture; resetting
         // here keeps a stale one from ever routing on a later, unrelated click.
         self.pending_press = None;
+        self.pending_slow_rename = None;
         let selection = self.ordered_selection(cx);
         let is_selected = selection.iter().any(|p| p == path);
         match press_disposition(modifier, is_selected, selection.len()) {
@@ -552,7 +559,7 @@ impl FileBrowserView {
         }
     }
 
-    /// Route a row's left mouse-UP for a press that deferred.
+    /// Route a row's left mouse-UP.
     ///
     /// Driven by gpui's `on_click`, which is the correct "release without a
     /// drag" hook: arming a drag calls `pending_mouse_down.take()` and an active
@@ -566,24 +573,34 @@ impl FileBrowserView {
     /// [`FileBrowserClickRouter::route`], so inlining the arm would leave the
     /// deferred press unrouted and a double-click on a multi-selected row would
     /// need a third click to open the file.
+    ///
+    /// It is also where a slow-second-click rename arms (see
+    /// [`pending_slow_rename`](Self::pending_slow_rename)), for immediate and
+    /// deferred presses alike.
     fn on_row_release(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.pending_press.as_deref() != Some(path) {
-            return; // an immediate press already routed at mouse-down
+        if self.pending_press.as_deref() == Some(path) {
+            self.pending_press = None;
+            self.on_row_click(path, ClickModifier::Plain, cx);
         }
-        self.pending_press = None;
-        self.on_row_click(path, ClickModifier::Plain, cx);
+        if self.pending_slow_rename.as_deref() == Some(path) {
+            self.pending_slow_rename = None;
+            self.arm_slow_rename(path.to_string(), cx);
+        }
     }
 
-    /// Drop a deferred press without routing it — the gesture turned into
-    /// something else (a drag armed, or a right press opened the row menu).
+    /// Drop a deferred press without routing it, and any slow-second-click rename
+    /// waiting for its release — the gesture turned into something else (a drag
+    /// armed, or a right press opened the row menu).
     fn clear_pending_press(&mut self) {
         self.pending_press = None;
+        self.pending_slow_rename = None;
     }
 
     /// Route a row click through the 280 ms detector and apply its effect. Any
     /// click first cancels a pending slow-second-click deferral (bumps the
-    /// generation); a slow second click on an already-sole-selected FILE re-arms
-    /// it. Folders keep their single-click expand/collapse (a folder's slow second
+    /// generation); a slow second click on an already-sole-selected FILE queues a
+    /// new one for its release to arm ([`on_row_release`](Self::on_row_release)).
+    /// Folders keep their single-click expand/collapse (a folder's slow second
     /// click is claimed by expand/collapse, so folder rename stays on the menu /
     /// Return triggers — a documented divergence that keeps R19's expand/collapse
     /// contract intact).
@@ -626,7 +643,8 @@ impl FileBrowserView {
                     && was_sole
                     && InlineRenameClickGate::can_begin_edit(activated_at, now, DOUBLE_CLICK_WINDOW)
                 {
-                    self.arm_slow_rename(path.clone(), cx);
+                    // Armed by this click's release, not here — a drag gets none.
+                    self.pending_slow_rename = Some(path.clone());
                 } else {
                     // Newly sole-selected — stamp the activation clock.
                     self.sole_activated = Some((path.clone(), now));
@@ -1550,7 +1568,7 @@ impl FileBrowserView {
     // MARK: - Rendering
 
     /// `base` scaled by the sidebar font size (the shell's `sidebar_pt`).
-    fn pt(&self, base: f32) -> f32 {
+    fn sidebar_pt(&self, base: f32) -> f32 {
         sidebar_size(self.sidebar_px, base)
     }
 
@@ -1565,7 +1583,7 @@ impl FileBrowserView {
             .px(px(14.0))
             .pt(px(6.0))
             .pb(px(2.0))
-            .text_size(px(self.pt(NAME_SIZE)))
+            .text_size(px(self.sidebar_pt(NAME_SIZE)))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(slot_to_rgba(s.ink))
             .when_some(family, |el, fam| el.font_family(fam))
@@ -1793,13 +1811,13 @@ impl FileBrowserView {
             })
             .child(
                 div()
-                    .text_size(px(self.pt(22.0)))
+                    .text_size(px(self.sidebar_pt(22.0)))
                     .text_color(slot_to_rgba(s.ink2))
                     .child(SharedString::from("\u{25A2}")),
             )
             .child(
                 div()
-                    .text_size(px(self.pt(12.0)))
+                    .text_size(px(self.sidebar_pt(12.0)))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(slot_to_rgba(s.ink))
                     .child(SharedString::from("Folder not found")),
@@ -1807,7 +1825,7 @@ impl FileBrowserView {
             .child(
                 div()
                     .px(px(12.0))
-                    .text_size(px(self.pt(10.0)))
+                    .text_size(px(self.sidebar_pt(10.0)))
                     .text_color(slot_to_rgba(s.ink2))
                     .child(SharedString::from(snap.root.clone())),
             )
@@ -1821,7 +1839,7 @@ impl FileBrowserView {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(self.pt(12.0)))
+            .text_size(px(self.sidebar_pt(12.0)))
             .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
                 d.font_family(fam)
             })
@@ -1867,15 +1885,17 @@ impl FileBrowserView {
             .unwrap_or(false)
     }
 
-    /// Drive a plain single click on `path` (the real router path).
+    /// Drive a plain single click on `path` (the real router path: the click, then
+    /// its release).
     pub(crate) fn drive_single_click(&mut self, path: &str, cx: &mut Context<Self>) {
         self.on_row_click(path, ClickModifier::Plain, cx);
+        self.on_row_release(path, cx);
     }
 
     /// Drive a double click on `path` (two plain clicks within the window).
     pub(crate) fn drive_double_click(&mut self, path: &str, cx: &mut Context<Self>) {
-        self.on_row_click(path, ClickModifier::Plain, cx);
-        self.on_row_click(path, ClickModifier::Plain, cx);
+        self.drive_single_click(path, cx);
+        self.drive_single_click(path, cx);
     }
 
     /// Open the row context menu for `path` (the real right-click path).
@@ -2125,7 +2145,7 @@ impl FileBrowserView {
     /// the tracked scroll handle carries both the viewport bounds and the live
     /// offset.
     pub(crate) fn scenario_row_center(&self, path: &str) -> Option<(f32, f32)> {
-        let row_height = self.pt(ROW_HEIGHT);
+        let row_height = self.sidebar_pt(ROW_HEIGHT);
         let ix = self.rendered_paths.iter().position(|p| p == path)?;
         let (viewport, offset_y) = {
             let st = self.scroll.0.borrow();
@@ -2146,7 +2166,7 @@ impl FileBrowserView {
         // Horizontally: inside the name run for every indent level the fixture
         // trees reach (the inset scales with the indent and icons), clamped to the
         // viewport for a very narrow sidebar.
-        let x = vp_left + self.pt(ROW_PRESS_INSET).min(vp_w / 2.0);
+        let x = vp_left + self.sidebar_pt(ROW_PRESS_INSET).min(vp_w / 2.0);
         Some((x, top + row_height / 2.0))
     }
 
@@ -2451,8 +2471,9 @@ fn render_row(
             move |paths: &ExternalPaths, _offset, window, app| {
                 // The press became a drag: drop its deferred collapse so the
                 // multi-selection survives the drag (Finder parity), successful
-                // or abandoned. gpui already suppresses the click here, so this
-                // is belt-and-braces against a stuck pending state.
+                // or abandoned, and drop any slow-second-click rename it queued.
+                // gpui already suppresses the click here, so this is
+                // belt-and-braces against a stuck pending state.
                 let _ = weak_drag.update(app, |this, _cx| {
                     this.clear_pending_press();
                     // Scenario observable: the drag ARMED (whatever happens next).
@@ -2520,12 +2541,12 @@ fn render_row(
             cx.stop_propagation();
         });
     })
-    // The release half of a deferred press. gpui records its own pending
-    // mouse-down in a listener registered AFTER the row's (bubble dispatch runs
-    // registration order reversed), so the `stop_propagation` above does not
-    // suppress it — and gpui drops that pending down when a drag arms, so this
-    // fires only on a release WITHOUT a drag. A press that already routed at
-    // mouse-down leaves no pending path and this is a no-op.
+    // The release half of a press: routes a deferred press and arms a queued
+    // slow-second-click rename. gpui records its own pending mouse-down in a
+    // listener registered AFTER the row's (bubble dispatch runs registration
+    // order reversed), so the `stop_propagation` above does not suppress it — and
+    // gpui drops that pending down when a drag arms, so this fires only on a
+    // release WITHOUT a drag. With nothing deferred or queued it is a no-op.
     .on_click(move |_e, _window, app| {
         let p = path_for_release.clone();
         let _ = weak_release.update(app, |this, cx| this.on_row_release(&p, cx));
@@ -2782,6 +2803,72 @@ mod tests {
                 let (_, y1) = view.scenario_row_center(&second).expect("second row painted");
                 assert_eq!(y1 - y0, sidebar_size(18.0, ROW_HEIGHT));
                 assert_eq!(view.sidebar_px, 18.0, "render reads the sidebar font size");
+            })
+            .unwrap();
+    }
+
+    /// Make `path` the sole selection with an activation stamp old enough that the
+    /// next plain click on it passes the slow-second-click rename gate.
+    fn sole_select_long_ago(view: &mut FileBrowserView, path: &str, cx: &mut Context<FileBrowserView>) {
+        view.drive_select(path, cx);
+        view.sole_activated = Some((path.to_string(), Instant::now() - Duration::from_secs(1)));
+    }
+
+    /// The reported bug: pressing an already-selected file and dragging it entered
+    /// inline rename. A press that turns into a drag gets no release click, so it
+    /// must never arm the slow-second-click rename.
+    #[gpui::test]
+    fn a_press_that_becomes_a_drag_never_enters_rename(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("drag-no-rename");
+        let (window, _ops) = mount(cx, &fx);
+        let a = fx.p("A.txt");
+
+        window
+            .update(cx, |view, _window, cx| {
+                sole_select_long_ago(view, &a, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+                // The drag arms (what the row's `on_drag` closure does).
+                view.clear_pending_press();
+            })
+            .unwrap();
+        cx.executor().advance_clock(DOUBLE_CLICK_WINDOW * 2);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(
+                    view.pending_rename_path.is_none() && !view.scenario_is_renaming(),
+                    "a drag must not enter inline rename"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The slow-second-click rename still works: a press on the sole-selected file
+    /// released without a drag enters rename after the double-click window.
+    #[gpui::test]
+    fn a_slow_second_click_release_enters_rename(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("slow-click-rename");
+        let (window, _ops) = mount(cx, &fx);
+        let a = fx.p("A.txt");
+
+        window
+            .update(cx, |view, _window, cx| {
+                sole_select_long_ago(view, &a, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+                view.on_row_release(&a, cx);
+            })
+            .unwrap();
+        cx.executor().advance_clock(DOUBLE_CLICK_WINDOW * 2);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(
+                    view.pending_rename_path.as_deref() == Some(a.as_str())
+                        || view.scenario_is_renaming(),
+                    "a slow second click must enter inline rename"
+                );
             })
             .unwrap();
     }

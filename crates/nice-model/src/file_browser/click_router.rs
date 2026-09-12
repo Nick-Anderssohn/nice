@@ -86,12 +86,11 @@ pub enum PressDisposition {
 /// `selection_count` is the size of the live selection the row belongs to (the
 /// same on-screen-ordered set the drag payload is built from).
 ///
-/// **Invariant the rename gate depends on:** a plain press on a SOLE-selected
-/// row stays [`PressDisposition::Immediate`]. The slow-second-click rename gate
-/// keys off "this row was already the sole selection" plus the activation
-/// stamps, and `DeferToRelease` requires `selection_count > 1`, which makes
-/// "was sole" false by construction — so deferral can never reach the rename
-/// gate. `sole_selected_plain_press_stays_immediate` pins this.
+/// **Invariant:** a plain press on a SOLE-selected row stays
+/// [`PressDisposition::Immediate`], so it selects and (for a folder) expands or
+/// collapses at mouse-down, not at mouse-up. The slow-second-click rename is
+/// unaffected either way: the view arms it on the release for every press.
+/// `sole_selected_plain_press_stays_immediate` pins this.
 pub fn press_disposition(
     modifier: ClickModifier,
     is_selected: bool,
@@ -340,16 +339,14 @@ mod tests {
 
     #[test]
     fn sole_selected_plain_press_stays_immediate() {
-        // The slow-second-click rename gate keys off `was_sole` + the activation
-        // stamp, and it is only reachable from the IMMEDIATE path. Deferral
-        // requires `selection_count > 1`, which makes `was_sole` false by
-        // construction — so the rename gate is untouched by the deferred path.
-        // This is the invariant that pins that reasoning.
+        // Deferral is only for a press inside a multi-selection. A press on the
+        // sole selection must keep selecting and expanding/collapsing at
+        // mouse-down.
         assert_eq!(
             press_disposition(ClickModifier::Plain, true, 1),
             PressDisposition::Immediate,
-            "a plain press on the sole selection MUST route at mouse-down, or the \
-             slow-second-click rename gate stops arming"
+            "a plain press on the sole selection MUST route at mouse-down, so \
+             select and folder expand/collapse don't wait for mouse-up"
         );
     }
 

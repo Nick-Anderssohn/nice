@@ -1,6 +1,6 @@
 # File explorer sidebar: font size + post-drag hover flicker
 
-Status: IMPLEMENTED 2026-09-12 (uncommitted) — Fable-reviewed; new gpui test red before (22) and green after (33); `file_browser::view` tests + workspace build pass; Nice Dev installed. Awaiting Nick's hands-on check of the drag and font behavior.
+Status: IMPLEMENTED 2026-09-12 — Fable-reviewed plan and code; new gpui tests red before and green after; `file_browser::view` tests + workspace build pass. Awaiting Nick's hands-on check.
 
 Two bugs in the sidebar's file explorer (Files) mode.
 
@@ -185,6 +185,34 @@ gpui rebuild in the shared target dir.
 No automated test. `gpui_macos` has no test harness, and the bug needs a real
 `NSDraggingSession`, which synthetic in-process events can't create. Validate
 black-box (below).
+
+## Bug 3 (found in feel-check): dragging a selected file entered rename
+
+Not in the original plan. Pressing a file that was already the sole selection and
+dragging it entered inline rename.
+
+### Cause
+
+A plain press on the sole selection routes at mouse-down (`press_disposition`), so
+`on_row_click` armed the 280ms slow-second-click rename timer (`arm_slow_rename`) at
+mouse-down. Arming a drag never cancelled it.
+
+### Change
+
+- `on_row_click` records the candidate in `pending_slow_rename` instead of arming.
+- `on_row_release` (gpui `on_click`, which never fires once a drag arms) arms it.
+- `clear_pending_press` (drag arm, right press) and each new press clear it.
+- `drive_single_click` / `drive_double_click` also call `on_row_release`, like a
+  real click.
+
+Chosen over deferring the press: that would move select and folder expand/collapse
+to mouse-up. Arming on release also covers a press held past 280ms before the drag,
+which cancelling the timer at drag arm would miss. Matches Finder.
+
+### Tests
+
+- `a_press_that_becomes_a_drag_never_enters_rename`: red before, green after.
+- `a_slow_second_click_release_enters_rename`: regression guard.
 
 ## Validation
 
