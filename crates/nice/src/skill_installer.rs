@@ -336,8 +336,10 @@ Run the helper with five arguments:
 1. The **worktree name** from step 1.
 2. The **absolute path** to the task file you just wrote.
 3. **Instructions** — what the dispatched session should do after
-   reading the task file. Pass an empty string unless the user explicitly
-   said what the session should do next — see "Addressing the dispatched
+   reading the task file. This is almost always an empty string. Asking
+   you to dispatch a task is NOT asking the dispatched session to start
+   it: `/nice-dispatch add a hello.txt file` passes `""`, and that session
+   reads the brief and waits for the user. See "Addressing the dispatched
    session" below.
 4. **Model** — a per-dispatch override, empty unless the user explicitly
    asked for one (e.g. "dispatch this on opus").
@@ -355,9 +357,15 @@ empty, the dispatched session reads the task file and then waits for the
 user to say how to proceed — it does not start working on its own. A
 non-empty instruction REPLACES that default: it is read by the dispatched
 session as its own instruction for what to do after reading the file.
-Pass one only when the user explicitly said what the session should do
-next (e.g. "dispatch X and have it start right away" → "Start working on
-the task it describes."). Preserve the user's meaning, but write it as a
+Pass one only when the user SEPARATELY said what the session should do
+after reading the brief, beyond naming the task. For example:
+
+- "dispatch: add a hello.txt file" → `""` (the session waits).
+- "dispatch: add a hello.txt file, and have it start right away" →
+  `Start working on the task it describes.`
+
+Do not pass a start instruction because the task seems simple, urgent, or
+obvious — only the user's explicit words count. Preserve the user's meaning, but write it as a
 direct instruction the dispatched session can execute: strip any
 "dispatch…" framing, or the session will try to dispatch AGAIN instead
 of doing the work. Do not editorialize or add instructions of your own.
