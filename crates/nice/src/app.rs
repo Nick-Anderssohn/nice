@@ -1088,6 +1088,9 @@ pub fn run() {
     // before any glyph rasterizes, so the bg-luminance curve is the sole text
     // AA shaping (see `platform::disable_font_smoothing`).
     crate::platform::disable_font_smoothing();
+    // GH #6: the bundled symbol font must be known to CoreText before any
+    // terminal font resolves its fallback cascade.
+    crate::platform::register_bundled_fonts();
     gpui_platform::application()
         .with_assets(crate::chrome_icons::ChromeIconAssets)
         .run(|cx: &mut App| {
@@ -4426,6 +4429,7 @@ pub fn run_selftest(selector: String) {
     // scenario's bg-luminance ENGAGES check depends on the CoreGraphics
     // smoothing dilation being off so the curve is the only AA shaping.
     crate::platform::disable_font_smoothing();
+    crate::platform::register_bundled_fonts();
     let scenarios = selftest_scenarios();
     gpui_platform::application()
         .with_assets(crate::chrome_icons::ChromeIconAssets)

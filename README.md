@@ -127,3 +127,5 @@ Nice is a native Rust app rendered on a single Metal stack:
 - [alacritty_terminal](https://github.com/alacritty/alacritty) — the VT engine (grid, scrollback, damage tracking, and VTE parsing) behind Nice's terminal windows.
 
 Terminal themes are compatible with [Ghostty](https://ghostty.org)'s theme file format.
+
+Nice bundles Symbols Nerd Font Mono from [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) (MIT) so powerline and Nerd Font icons render with any terminal font. The icon sets inside it carry their own licenses; see [`crates/nice/assets/fonts/`](crates/nice/assets/fonts/).

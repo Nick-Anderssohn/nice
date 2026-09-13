@@ -85,12 +85,13 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor}
 use gpui::{
     canvas, fill, point, prelude::*, px, rgb, size, App, Bounds, Canvas, ContentMask, Entity,
     FocusHandle, Font, FontFeatures, FontStyle, FontWeight, Hsla, PathBuilder, Pixels, Rgba,
-    SharedString, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window,
+    ShapedLine, SharedString, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window,
 };
 
 use nice_theme::Srgba;
 
 use crate::boxdraw::{self, apple_approx_coverage, Prim, Segment};
+use crate::font::{cell_fallbacks, is_symbol_char};
 use crate::color::{resolve_color, smart_cursor_colors};
 use crate::input::TermInputHandler;
 use crate::search::VIEWPORT_MATCH_MARGIN;
@@ -1403,7 +1404,7 @@ impl TerminalElement {
                         wavy: false,
                     })
                 };
-                let font = cell_font(font_family.clone(), false, false);
+                let font = cell_font(font_family.clone(), false, false, false);
                 let seg = |len: usize, thick: bool| TextRun {
                     len,
                     font: font.clone(),
@@ -1580,6 +1581,8 @@ fn paint_glyph_run(
 ) {
     let decoration = Some(rgb(run.style.fg).into());
     let effective_bg = run.style.bg.unwrap_or(default_bg);
+    // Symbol cells are always isolated single-cell runs (see `plan_row`).
+    let symbol = run.cells == 1 && run.text.chars().next().is_some_and(is_symbol_char);
     let text_run = TextRun {
         len: run.text.len(),
         font: Font {
@@ -1595,7 +1598,7 @@ fn paint_glyph_run(
             } else {
                 FontStyle::Normal
             },
-            fallbacks: None,
+            fallbacks: cell_fallbacks(symbol),
         },
         color: rgb(run.style.fg).into(),
         background_color: Some(rgb(effective_bg).into()),
@@ -1610,9 +1613,7 @@ fn paint_glyph_run(
         }),
     };
     let text: SharedString = SharedString::from(run.text.clone());
-    let shaped = window
-        .text_system()
-        .shape_line(text, px(font_px), &[text_run], Some(px(cw)));
+    let shaped = shape_cell_text(window, text, &text_run, font_px, cw, symbol);
     let x = ox + px(run.start_col as f32 * cw);
     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
 }
@@ -1657,17 +1658,16 @@ fn paint_cursor_glyph(
     }
     let mut buf = [0u8; 4];
     let text: SharedString = SharedString::from(cell.ch.encode_utf8(&mut buf).to_string());
+    let symbol = is_symbol_char(cell.ch);
     let text_run = TextRun {
         len: text.len(),
-        font: cell_font(font_family.clone(), cell.bold, cell.italic),
+        font: cell_font(font_family.clone(), cell.bold, cell.italic, symbol),
         color: rgb(glyph_color).into(),
         background_color: Some(rgb(block_color).into()),
         underline: None,
         strikethrough: None,
     };
-    let shaped = window
-        .text_system()
-        .shape_line(text, px(font_px), &[text_run], Some(px(cw)));
+    let shaped = shape_cell_text(window, text, &text_run, font_px, cw, symbol);
     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
 }
 
@@ -1718,8 +1718,35 @@ fn paint_hollow_cursor(window: &mut Window, x: Pixels, y: Pixels, cw: f32, ch: f
     ));
 }
 
+/// Shape a cell run at the terminal font size, with one exception (GH #6): a
+/// symbol cell whose glyph the base font lacks. CoreText then draws it from the
+/// bundled symbol font, whose icons advance a full 1 em (~1.6× a monospace
+/// cell), so it is shaped at the cell WIDTH instead and the icon fits one cell.
+/// Icons the base font carries itself (a patched Nerd Font) keep their designed
+/// size. The base-font check is `advance`, which looks the glyph up in that font
+/// alone — never its fallback cascade. The layout cache keys on size, so this is
+/// one extra entry per distinct icon, not a per-frame cost.
+fn shape_cell_text(
+    window: &Window,
+    text: SharedString,
+    run: &TextRun,
+    font_px: f32,
+    cw: f32,
+    symbol: bool,
+) -> ShapedLine {
+    let ts = window.text_system();
+    let from_fallback = symbol
+        && text.chars().next().is_some_and(|ch| {
+            let base = ts.resolve_font(&run.font);
+            ts.advance(base, px(font_px), ch).is_err()
+        });
+    let size = if from_fallback { cw } else { font_px };
+    ts.shape_line(text, px(size), std::slice::from_ref(run), Some(px(cw)))
+}
+
 /// The monospace font for a cell run, honouring the bold / italic attributes.
-fn cell_font(family: SharedString, bold: bool, italic: bool) -> Font {
+/// `symbol` adds the bundled symbol-font fallback (see [`is_symbol_char`]).
+fn cell_font(family: SharedString, bold: bool, italic: bool, symbol: bool) -> Font {
     Font {
         family,
         features: FontFeatures::default(),
@@ -1733,7 +1760,7 @@ fn cell_font(family: SharedString, bold: bool, italic: bool) -> Font {
         } else {
             FontStyle::Normal
         },
-        fallbacks: None,
+        fallbacks: cell_fallbacks(symbol),
     }
 }
 
