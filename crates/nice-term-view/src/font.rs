@@ -33,7 +33,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    px, Context, Font, FontFeatures, FontStyle, FontWeight, SharedString, TextSystem,
+    px, Context, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString,
+    TextSystem,
 };
 
 use crate::element::TerminalMetrics;
@@ -71,6 +72,30 @@ pub fn default_font_chain() -> Vec<SharedString> {
         SharedString::from("JetBrains Mono NL"),
         SharedString::from("Menlo"),
     ]
+}
+
+/// The family of the symbols font `crates/nice` embeds and registers with
+/// CoreText at launch (`platform::register_bundled_fonts`). Named as a cascade
+/// fallback for symbol cells so powerline / Nerd Font icons render with any
+/// terminal font (GH #6). This crate only names it; it never owns the bytes.
+pub const SYMBOL_FALLBACK_FAMILY: &str = "Symbols Nerd Font Mono";
+
+/// Is `ch` in a Unicode Private Use Area — where powerline and Nerd Font icons
+/// live? Only these cells get the symbol fallback. The bundled font also maps a
+/// few non-PUA symbols (e.g. U+26A1 ⚡, U+2665 ♥); those are deliberately left to
+/// the system cascade so emoji keep their color presentation.
+pub(crate) fn is_symbol_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0xE000..=0xF8FF | 0xF_0000..=0xF_FFFD | 0x10_0000..=0x10_FFFD
+    )
+}
+
+/// The `Font::fallbacks` for a terminal cell: the bundled symbol font for
+/// symbol cells, none for everything else (so ordinary text shaping is
+/// untouched).
+pub(crate) fn cell_fallbacks(symbol: bool) -> Option<FontFallbacks> {
+    symbol.then(|| FontFallbacks::from_fonts(vec![SYMBOL_FALLBACK_FAMILY.to_string()]))
 }
 
 /// How a [`FontSettings`]' cell metrics are produced.
@@ -470,6 +495,19 @@ mod tests {
             pick_available(&chain, &names(&["SF Mono Bold", "Menlo"])),
             s("Menlo")
         );
+    }
+
+    #[test]
+    fn symbol_chars_are_private_use_only() {
+        // PUA boundaries (BMP + both supplementary planes).
+        for ch in ['\u{E000}', '\u{E0B0}', '\u{F8FF}', '\u{F0000}', '\u{FFFFD}', '\u{100000}', '\u{10FFFD}'] {
+            assert!(is_symbol_char(ch), "{:X} should be a symbol cell", ch as u32);
+        }
+        // Just outside the ranges, ordinary text, box drawing, and the non-PUA
+        // symbols the bundled font also maps (left to the system cascade).
+        for ch in ['\u{D7FF}', '\u{F900}', '\u{EFFFF}', 'M', ' ', '\u{2500}', '\u{26A1}', '\u{2665}'] {
+            assert!(!is_symbol_char(ch), "{:X} should not be a symbol cell", ch as u32);
+        }
     }
 
     #[test]

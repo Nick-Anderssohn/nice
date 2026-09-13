@@ -106,6 +106,91 @@ pub fn disable_font_smoothing() {
     }
 }
 
+/// Register Nice's embedded fonts with CoreText for this process. Today that is
+/// Symbols Nerd Font Mono (Nerd Fonts v3.5.1, `assets/fonts/`), which the
+/// terminal names as a cascade fallback for Private Use Area cells so powerline /
+/// Nerd Font icons render with any terminal font (GH #6).
+///
+/// Why not gpui's `add_fonts`: it only feeds font_kit's in-memory source, and the
+/// cascade list gpui builds is matched by CoreText by family name, so CoreText
+/// must know the font.
+///
+/// Why a file: `CTFontManagerRegisterGraphicsFont` (in-memory) is deprecated since
+/// macOS 15, and its suggested replacement's descriptors are not available to
+/// descriptor matching. So the embedded bytes are written once to
+/// `$TMPDIR/nice-fonts/` (rewritten if purged) and registered by URL with process
+/// scope. Nothing is installed system-wide.
+///
+/// Fails soft: an "already registered" / "duplicate name" result (the user has
+/// the font installed) counts as success; any other failure logs once and the
+/// terminal renders PUA cells as before. Call once, before `Application::run`.
+pub fn register_bundled_fonts() {
+    if let Err(err) = register_symbols_font() {
+        eprintln!("nice: bundled symbol font unavailable: {err}");
+    }
+}
+
+#[link(name = "CoreText", kind = "framework")]
+extern "C" {
+    /// `bool CTFontManagerRegisterFontsForURL(CFURLRef fontURL,
+    /// CTFontManagerScope scope, CFErrorRef *error)` — `error` is +1 on failure.
+    fn CTFontManagerRegisterFontsForURL(
+        font_url: core_foundation_sys::url::CFURLRef,
+        scope: u32,
+        error: *mut core_foundation_sys::error::CFErrorRef,
+    ) -> u8;
+}
+
+/// `kCTFontManagerScopeProcess`.
+const CT_FONT_MANAGER_SCOPE_PROCESS: u32 = 1;
+/// `kCTFontManagerErrorAlreadyRegistered` / `kCTFontManagerErrorDuplicatedName`.
+const CT_FONT_MANAGER_ERROR_ALREADY_REGISTERED: isize = 105;
+const CT_FONT_MANAGER_ERROR_DUPLICATED_NAME: isize = 305;
+
+fn register_symbols_font() -> Result<(), String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::url::CFURL;
+    use core_foundation_sys::error::CFErrorGetCode;
+
+    const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
+    let dir = std::env::temp_dir().join("nice-fonts");
+    let path = dir.join("SymbolsNerdFontMono-Regular-v3.5.1.ttf");
+    let present = std::fs::metadata(&path).is_ok_and(|m| m.len() == SYMBOLS_FONT.len() as u64);
+    if !present {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        // Write a per-process temp name, then rename into place: the rename is
+        // atomic, so a concurrent Nice / Nice Dev launch never reads a partial file.
+        let tmp = dir.join(format!(".symbols-{}.tmp", std::process::id()));
+        std::fs::write(&tmp, SYMBOLS_FONT).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    }
+
+    let url = CFURL::from_path(&path, false).ok_or_else(|| format!("no CFURL for {}", path.display()))?;
+    let mut error: core_foundation_sys::error::CFErrorRef = std::ptr::null_mut();
+    // SAFETY: `url` is a live CFURL for the call; `error` is a valid out-pointer
+    // that CoreText fills with a +1 CFError only on failure, released below.
+    let ok = unsafe {
+        CTFontManagerRegisterFontsForURL(url.as_concrete_TypeRef(), CT_FONT_MANAGER_SCOPE_PROCESS, &mut error)
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    if error.is_null() {
+        return Err("CTFontManagerRegisterFontsForURL failed".to_string());
+    }
+    // SAFETY: `error` is the +1 CFError CoreText returned; read, then release once.
+    let code = unsafe {
+        let code = CFErrorGetCode(error);
+        CFRelease(error as *const c_void);
+        code
+    };
+    match code {
+        CT_FONT_MANAGER_ERROR_ALREADY_REGISTERED | CT_FONT_MANAGER_ERROR_DUPLICATED_NAME => Ok(()),
+        _ => Err(format!("CTFontManager error {code}")),
+    }
+}
+
 /// Read a boolean from this app's own CFPreferences domain — the same
 /// `kCFPreferencesCurrentApplication` domain [`disable_font_smoothing`] writes and
 /// gpui's smoothing reader consults. Returns `default` when the key is absent or
