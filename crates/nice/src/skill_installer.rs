@@ -23,9 +23,9 @@
 //! (prod `Nice` / dev `Nice Dev`, having replaced the Swift app), so it installs
 //! the SAME `~/.claude/skills/nice-handoff/` + `~/.nice/nice-handoff.sh` /
 //! `name: nice-handoff` / `/nice-handoff` the retired Swift `Nice` installed — an
-//! upgrading user keeps the exact same skill with no visible change. The handoff
-//! `SKILL.md` + helper bytes are byte-identical to the Swift literals, so a launch
-//! over a Swift-installed copy is a no-op (write-only-if-changed). Consequently
+//! upgrading user keeps the same skill. The handoff `SKILL.md` + helper were
+//! ported from the Swift literals and have since evolved (the wire schema stays
+//! frozen); write-only-if-changed rewrites an older installed copy once. Consequently
 //! this installer DELIBERATELY owns the prod skill paths: toggle-off / uninstall
 //! `rm -rf`s `~/.claude/skills/<skill-name>/` for every pair. That is correct for
 //! the single-identity world (there is no other Nice to clobber); the earlier
@@ -57,14 +57,15 @@ use std::path::{Path, PathBuf};
 use crate::atomic_file::write_atomic;
 
 /// The `SKILL.md` skill definition written to `<skill_dir>/SKILL.md` (via
-/// `write_atomic(_, _, None)`). Byte-identical to the Swift `skillMarkdown`
-/// literal (`name: nice-handoff`, `~/.nice/nice-handoff.sh`, `/nice-handoff`) —
-/// verified equal to the retired Swift build's literal — with NO trailing
-/// newline, so the write-only-if-changed byte compare is exact and a launch over
-/// a Swift-installed copy is a no-op.
+/// `write_atomic(_, _, None)`). Ported from the retired Swift `skillMarkdown`
+/// literal (`name: nice-handoff`, `~/.nice/nice-handoff.sh`, `/nice-handoff`),
+/// with NO trailing
+/// newline, so the write-only-if-changed byte compare is exact. The later
+/// `argument-hint` line means a launch over an older installed copy rewrites it once.
 pub const SKILL_MARKDOWN: &str = r#"---
 name: nice-handoff
 description: Hand off the current work to a fresh Claude session in a new Nice session. Use when the context window is getting full, or when the user asks to hand off / continue work in a clean session. Writes a handoff file capturing the current state and opens a new nested session that picks up where this one left off.
+argument-hint: "[on <model>] [at <effort>] [what the new session should do after reading the handoff notes]  (default: same model/effort, it waits for you)"
 ---
 
 Follow these steps exactly to hand off to a fresh session:
@@ -101,28 +102,34 @@ Include all of:
 
 ## 2. Open the handoff session
 
-Run the helper, passing three arguments:
+Run the helper, passing four arguments:
 
 1. The **absolute path** to the handoff file you just wrote.
 2. The instruction the NEW session should follow after reading the
    handoff file, built from the user's arguments (or an empty string
    `""` when the user provided none) — see "Addressing the new
    session" below.
-3. Your **exact current model id** — the precise `claude-…` identifier
-   you are running as right now (e.g. `claude-opus-4-8`), so the fresh
-   session continues on the same model. If you are not certain of your
-   exact model id, pass an empty string `""` rather than guessing; the
-   new session then falls back to the default model.
+3. **Model** — if the user explicitly asked for a model (e.g. "hand off
+   on sonnet"), pass their string verbatim, whether it is an alias like
+   `sonnet` or a full model id. Otherwise pass your **exact current
+   model id** — the precise `claude-…` identifier you are running as
+   right now (e.g. `claude-opus-4-8`), so the fresh session continues on
+   the same model. If you are not certain of your exact model id, pass
+   an empty string `""` rather than guessing; the new session then falls
+   back to the default model.
+4. **Effort** — if the user explicitly asked for an effort level (e.g.
+   "at high effort"), pass it verbatim (`low`, `medium`, `high`,
+   `xhigh`, or `max`). Otherwise pass an empty string `""`; the helper
+   then forwards your current effort level automatically.
 
 ```
-~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "$ARGUMENTS" "<your exact model id>"
+~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "<instructions>" "<model>" "<effort>"
 ```
 
-If the user provided no arguments to this skill, pass an empty string
-for the second argument:
+If the user provided no arguments to this skill, the common case is:
 
 ```
-~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "" "<your exact model id>"
+~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "" "<your exact model id>" ""
 ```
 
 The second argument lets the user customise what the new session does
@@ -142,12 +149,15 @@ arguments as "hand off <task> to a fresh session", pass only "<task>":
 e.g. arguments of "Hand off a new task to a fresh session: fix the
 frame-restore bug" MUST be forwarded as "Fix the frame-restore bug".
 A forwarded string that still says "hand off…" makes the new session
-try to hand off AGAIN instead of doing the work. Beyond stripping that
+try to hand off AGAIN instead of doing the work. Likewise drop any model
+or effort request (e.g. "on sonnet", "at high effort") from this string —
+those go in the third and fourth arguments. Beyond stripping that
 framing, do not editorialize or add instructions of your own.
 
-The third argument carries your model id so the new session launches on the
-same model. Your effort level is forwarded automatically by the helper
-(it reads `CLAUDE_EFFORT` from the environment), so you do not pass it.
+The third and fourth arguments are how the new session's model and effort
+are chosen. By default it launches on your model and inherits your effort
+level (the helper reads `CLAUDE_EFFORT` from the environment when the
+fourth argument is empty). Override either only when the user asked.
 
 ## 3. Report back
 
@@ -156,8 +166,9 @@ helper printed to stderr). Keep it brief — one or two sentences."#;
 
 /// The bash helper written to `<helper_dir>/nice-handoff.sh` (via
 /// `write_atomic(_, _, Some(0o755))`). Ported from the Swift `helperScript`
-/// literal (`SkillInstaller.swift:267-352`) — byte-identical, including the
-/// `"action":"handoff"` FROZEN wire protocol. NO trailing newline (Swift-literal
+/// literal (`SkillInstaller.swift:267-352`), keeping the `"action":"handoff"`
+/// FROZEN wire protocol; since then it gained an optional `$4` effort override
+/// that falls back to `CLAUDE_EFFORT`. NO trailing newline (Swift-literal
 /// parity).
 ///
 /// The `_nice_esc` tab-`sed` (`s/<TAB>/\t/g`) carries a LITERAL horizontal-tab
@@ -171,7 +182,8 @@ pub const HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Args: $1 = absolute path to handoff file (required)
 #       $2 = continuation instructions (optional)
 #       $3 = model id to launch the new session with (optional)
-# The effort level is NOT an argument: it is read from the CLAUDE_EFFORT
+#       $4 = effort tier override (optional)
+# When $4 is empty the effort level is read from the CLAUDE_EFFORT
 # environment variable Claude Code exports into the window, so the new
 # session inherits the current effort tier automatically. CLAUDE_EFFORT
 # already holds the literal `claude --effort` token (low/medium/high/
@@ -187,16 +199,16 @@ fi
 
 HANDOFF_FILE="${1:-}"
 if [ -z "$HANDOFF_FILE" ]; then
-  printf 'usage: nice-handoff.sh <absolute-path-to-handoff-file> [instructions] [model]\n' >&2
+  printf 'usage: nice-handoff.sh <absolute-path-to-handoff-file> [instructions] [model] [effort]\n' >&2
   exit 1
 fi
 
 INSTRUCTIONS="${2:-}"
 MODEL="${3:-}"
-# Effort tier is read from the environment, not passed as an argument:
-# Claude Code exports CLAUDE_EFFORT (e.g. "xhigh") into the window. Empty
-# when the user is at the implicit default — Nice then omits --effort.
-EFFORT="${CLAUDE_EFFORT:-}"
+# An explicit $4 wins; otherwise inherit CLAUDE_EFFORT (e.g. "xhigh") from
+# the window. Both empty when the user is at the implicit default — Nice
+# then omits --effort.
+EFFORT="${4:-${CLAUDE_EFFORT:-}}"
 
 # JSON-escape a single string value (without surrounding quotes).
 # Passes in order:
@@ -262,6 +274,7 @@ esac"#;
 pub const DISPATCH_SKILL_MARKDOWN: &str = r#"---
 name: nice-dispatch
 description: Dispatch a task to a fresh Claude session working in its own git worktree, in a new background Nice session. Use when the user asks to dispatch, farm out, or parallelise a task into its own worktree. Writes a task brief and opens a nested session running `claude --worktree <name>` on it, without stealing focus from the current session.
+argument-hint: "<task description> [worktree name] [on <model>] [at <effort>] [then <what to do after reading the brief>]  (default: it waits for you)"
 ---
 
 Follow these steps exactly to dispatch a task to a new worktree session.
@@ -296,11 +309,11 @@ day, hyphen, hour, minute, second — all in UTC, zero-padded). Example:
 `sidebar-perf-20240315-143022.md`.
 
 The brief must be thorough enough that a fresh Claude session with **no
-prior context** can start working immediately, without asking clarifying
+prior context** can carry out the task without asking clarifying
 questions. Include all of:
 
 - **The goal** — what the dispatched session must build, fix, or
-  investigate, stated as something it can start on right away.
+  investigate, stated concretely enough to act on.
 - **Context and why** — the background it cannot infer from the code.
 - **Constraints** — what it must not change, conventions to follow, and
   decisions already made that are not up for re-litigation.
@@ -322,8 +335,10 @@ Run the helper with five arguments:
 
 1. The **worktree name** from step 1.
 2. The **absolute path** to the task file you just wrote.
-3. **Instructions** — any extra steer appended to the dispatched
-   session's opening prompt. Pass an empty string when there is none.
+3. **Instructions** — what the dispatched session should do after
+   reading the task file. Pass an empty string unless the user explicitly
+   said what the session should do next — see "Addressing the dispatched
+   session" below.
 4. **Model** — a per-dispatch override, empty unless the user explicitly
    asked for one (e.g. "dispatch this on opus").
 5. **Effort** — a per-dispatch override too, empty unless the user
@@ -334,6 +349,18 @@ session launches on the user's configured defaults. Do NOT forward your
 own model or effort — unlike `/nice-handoff`, a dispatch deliberately
 does not inherit them. When the user does ask for one, pass their string
 verbatim, whether it is an alias like `opus` or a full model id.
+
+**Addressing the dispatched session.** When the instructions argument is
+empty, the dispatched session reads the task file and then waits for the
+user to say how to proceed — it does not start working on its own. A
+non-empty instruction REPLACES that default: it is read by the dispatched
+session as its own instruction for what to do after reading the file.
+Pass one only when the user explicitly said what the session should do
+next (e.g. "dispatch X and have it start right away" → "Start working on
+the task it describes."). Preserve the user's meaning, but write it as a
+direct instruction the dispatched session can execute: strip any
+"dispatch…" framing, or the session will try to dispatch AGAIN instead
+of doing the work. Do not editorialize or add instructions of your own.
 
 So the common case, with no instructions and no overrides, is:
 
@@ -720,6 +747,10 @@ mod tests {
                 r#"{"action":"handoff","cwd":"%s","handoffFile":"%s","tabId":"%s","paneId":"%s","instructions":"%s","model":"%s","effort":"%s"}"#
             ),
             "helper must carry the frozen handoff wire schema"
+        );
+        assert!(
+            HELPER_SCRIPT.contains(r#"EFFORT="${4:-${CLAUDE_EFFORT:-}}""#),
+            "an empty $4 must fall back to CLAUDE_EFFORT, or 3-arg handoffs lose effort inheritance"
         );
         assert!(
             HELPER_SCRIPT.contains(r#"/usr/bin/nc -U -w 2 "$NICE_SOCKET""#),

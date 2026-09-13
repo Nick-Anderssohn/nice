@@ -2913,33 +2913,32 @@ fn dispatch_title_blank_name_falls_back_to_session() {
     assert_eq!(dispatch_title("   "), "[D] Session");
 }
 
-// dispatch_prompt — always points at the task file and tells the child to START
-// (the opposite of handoff's read-and-wait); instructions append when non-blank.
+// dispatch_prompt — always points at the task file; blank instructions get the
+// default read-and-wait directive, custom instructions override it (as handoff).
 
 #[test]
-fn dispatch_prompt_empty_instructions_is_the_read_and_start_directive() {
+fn dispatch_prompt_empty_instructions_uses_default_directive() {
     assert_eq!(
         dispatch_prompt("/repo/.claude/dispatch/w-1.md", ""),
-        "Read the dispatch task file at /repo/.claude/dispatch/w-1.md, then start \
-         working on the task it describes."
+        "Read the dispatch task file at /repo/.claude/dispatch/w-1.md. Do not start \
+         working yet — once you have read it, wait for the user to tell you how to proceed."
     );
 }
 
 #[test]
-fn dispatch_prompt_appends_non_empty_instructions() {
+fn dispatch_prompt_custom_instructions_override_the_default() {
     assert_eq!(
-        dispatch_prompt("/t/w.md", "Only touch the parser."),
-        "Read the dispatch task file at /t/w.md, then start working on the task it \
-         describes. Only touch the parser."
+        dispatch_prompt("/t/w.md", "Start working on the task."),
+        "Read the dispatch task file at /t/w.md. Start working on the task."
     );
 }
 
 #[test]
-fn dispatch_prompt_whitespace_only_instructions_are_dropped() {
+fn dispatch_prompt_whitespace_only_instructions_fall_back_to_default() {
     assert_eq!(
         dispatch_prompt("/t/w.md", "  \n\t "),
-        "Read the dispatch task file at /t/w.md, then start working on the task it \
-         describes."
+        "Read the dispatch task file at /t/w.md. Do not start working yet — once you \
+         have read it, wait for the user to tell you how to proceed."
     );
 }
 

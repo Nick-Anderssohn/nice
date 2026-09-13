@@ -3437,21 +3437,19 @@ pub(crate) fn dispatch_title(worktree_name: &str) -> String {
     format!("{DISPATCH_TITLE_PREFIX}{base}")
 }
 
-/// Build the initial prompt seeded into a dispatched session. Unlike
-/// [`handoff_prompt`] (which lands the fresh session read-and-WAIT), a dispatch
-/// child is meant to start working immediately from the task file the dispatcher
-/// wrote. Extra `instructions` are appended as a second sentence when non-blank,
-/// same concatenation style as [`handoff_prompt`].
+/// Build the initial prompt seeded into a dispatched session — same shape as
+/// [`handoff_prompt`]. Always points Claude at the task file; the continuation is
+/// the caller's `instructions` when non-blank, which REPLACE the default rather
+/// than follow it, else the same read-and-wait directive handoff uses (a
+/// dispatched session waits for the user's go-ahead unless told to start).
 pub(crate) fn dispatch_prompt(task_file: &str, instructions: &str) -> String {
-    let base = format!(
-        "Read the dispatch task file at {task_file}, then start working on the task it describes."
-    );
     let trimmed = instructions.trim();
-    if trimmed.is_empty() {
-        base
+    let directive = if trimmed.is_empty() {
+        "Do not start working yet — once you have read it, wait for the user to tell you how to proceed."
     } else {
-        format!("{base} {trimmed}")
-    }
+        trimmed
+    };
+    format!("Read the dispatch task file at {task_file}. {directive}")
 }
 
 /// Build the `extra_claude_args` for a dispatched session. **The argument order

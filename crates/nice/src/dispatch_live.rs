@@ -339,10 +339,7 @@ async fn run_dispatch(
             &format!("{work}/briefs"),
             "fix-drag-crash",
             Some(("claude-opus-4-8", "xhigh")),
-            &format!(
-                "Read the dispatch task file at {task_a}, then start working on the task it \
-                 describes. keep it on the branch"
-            ),
+            &format!("Read the dispatch task file at {task_a}. keep it on the branch"),
             "a",
             &mut failures,
         ),
@@ -460,10 +457,7 @@ async fn real_helper_leg(
             &dispatch_dir.to_string_lossy(),
             "sidebar-perf",
             None,
-            &format!(
-                "Read the dispatch task file at {task_file}, then start working on the task it \
-                 describes. report back when done"
-            ),
+            &format!("Read the dispatch task file at {task_file}. report back when done"),
             "b",
             failures,
         ),

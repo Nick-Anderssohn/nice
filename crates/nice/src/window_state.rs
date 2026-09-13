@@ -2256,8 +2256,8 @@ impl WindowState {
 
     /// Handle a `dispatch` request from the `/nice-dispatch` skill's helper: open
     /// a fresh Claude session that creates + enters a git worktree
-    /// (`claude --worktree <name>`) and starts working from the task file the
-    /// dispatcher wrote. Modelled on [`handle_handoff`](Self::handle_handoff) —
+    /// (`claude --worktree <name>`), seeded with a prompt pointing at the task file
+    /// the dispatcher wrote (read-and-wait unless `instructions` says otherwise). Modelled on [`handle_handoff`](Self::handle_handoff) —
     /// nested one indent under the originating session, opened UNSELECTED, ALWAYS
     /// replying `ok` — with two deliberate deltas:
     ///

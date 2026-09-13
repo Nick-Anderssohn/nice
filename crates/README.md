@@ -1438,9 +1438,11 @@ The GPUI application. Structure (grows over later cycles):
     helper filename + bytes (mode 0755, perms reset only on a (re)write); adding a
     pair to the table is the whole job, since `install_with` / `uninstall_with`
     iterate it and stay symmetric by construction. Both helpers post one JSON line to
-    the window's control socket via `nc -U -w 2`; the handoff consts are the Swift
-    literals transcribed verbatim (the load-bearing literal horizontal-tab byte in the
-    `_nice_esc` sed pass, the frozen `"action":"handoff"` wire schema), and the
+    the window's control socket via `nc -U -w 2`; the handoff consts were ported from the
+    Swift literals and have since evolved (an `argument-hint`, an optional `$4` effort
+    override falling back to `CLAUDE_EFFORT`), keeping the load-bearing literal
+    horizontal-tab byte in the `_nice_esc` sed pass and the frozen
+    `"action":"handoff"` wire schema, and the
     dispatch helper is shaped on them with two deliberate deltas — no `CLAUDE_EFFORT`
     inheritance (an empty effort means "omit the flag", the child runs on the user's
     default) and it resolves the MAIN checkout root itself (`git rev-parse
@@ -1458,7 +1460,7 @@ The GPUI application. Structure (grows over later cycles):
     and must survive. All entry points log-and-swallow. **Identity is the unsuffixed
     prod name** (Swift parity): this build IS Nice, so it installs the same
     `nice-handoff` skill dir / `name:` / `/nice-handoff` / helper the retired Swift
-    build did (byte-identical, so a launch over a Swift-installed copy is a no-op) and
+    build did (write-only-if-changed rewrites an older installed copy once) and
     deliberately owns those paths on toggle-off; the earlier `-rs`-suffixed isolation
     (Binding decision D2) is retired. **Two CFPref flags**
     (siblings of R17's `syncClaudeTheme`, via `platform::{read,write}_bool_pref`,
