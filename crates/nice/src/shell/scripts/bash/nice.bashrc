@@ -159,6 +159,27 @@ claude() {
     esac
 }
 
+# Typing the LAUNCHER's own name (`cl …`) must reach the shadow above: bash
+# finds no function named `cl`, runs the executable, and Nice never hears the
+# handshake — so the session would land in this pane instead of a new tab.
+# Define a forwarder named after the launcher's basename. No recursion is
+# possible: claude()'s `exec`/`command` sites both bypass functions, and the
+# wrapper's own `exec claude` runs in a child that cannot see shell functions.
+if [[ -n "${NICE_CLAUDE_LAUNCHER:-}" ]]; then
+    _nice_launcher_name="${NICE_CLAUDE_LAUNCHER##*/}"
+    # `^[A-Za-z0-9_.-]+$` spelled as bash 3.2 `case` globs: skip the empty
+    # basename, skip `claude` (that name is already the shadow), and skip
+    # anything holding a character outside the set.
+    case "$_nice_launcher_name" in
+        ''|claude|*[!A-Za-z0-9_.-]*)
+            ;;
+        *)
+            eval "${_nice_launcher_name}() { claude \"\$@\"; }"
+            ;;
+    esac
+    unset _nice_launcher_name
+fi
+
 # --- OSC 7 cwd reporting -----------------------------------------------------
 _nice_emit_cwd_osc7() {
     # Minimal URL encoding: % first (so the %20 below isn't double-encoded),

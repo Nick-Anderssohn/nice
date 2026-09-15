@@ -960,6 +960,45 @@ mod tests {
         }
     }
 
+    /// Typing the LAUNCHER's own name (`cl …`) must reach the shadow too — a
+    /// user who sets the launcher types `cl` for everything, and bash would
+    /// otherwise find no function and run the executable behind Nice's back. The
+    /// script defines a forwarder named after the launcher's basename whose body
+    /// is `claude "$@"`, guarded so an unset launcher defines nothing.
+    #[test]
+    fn nice_bashrc_defines_a_forwarder_for_the_launchers_own_name() {
+        let body = NICE_BASHRC_BODY;
+        let start = body
+            .find(r#"if [[ -n "${NICE_CLAUDE_LAUNCHER:-}" ]]; then"#)
+            .expect("the forwarder block must be guarded on NICE_CLAUDE_LAUNCHER");
+        let block = &body[start..];
+        assert!(
+            block.contains(r#"_nice_launcher_name="${NICE_CLAUDE_LAUNCHER##*/}""#),
+            "the basename must use the bash 3.2 suffix-strip, not zsh's `:t`"
+        );
+        assert!(
+            block.contains("''|claude|*[!A-Za-z0-9_.-]*)"),
+            "`claude` and anything but a plain command name must be skipped"
+        );
+        assert!(
+            block.contains(r#"eval "${_nice_launcher_name}() { claude \"\$@\"; }""#),
+            "the forwarder body must be exactly `claude \"$@\"`"
+        );
+        assert!(
+            block.contains("unset _nice_launcher_name"),
+            "the scratch global must not leak into the user's shell"
+        );
+        // Between the shadow it forwards to and the OSC 7 section.
+        assert!(
+            start > at("claude() {"),
+            "the forwarder must be defined after the claude() shadow"
+        );
+        assert!(
+            start < at("# --- OSC 7 cwd reporting"),
+            "the forwarder must sit ahead of the OSC 7 section"
+        );
+    }
+
     /// `${sid:0:8}` — bash substring. zsh's `${sid[1,8]}` expands to the WHOLE
     /// string in bash, which was inventory finding 3's concrete bug.
     #[test]
@@ -1966,6 +2005,73 @@ zpty -d n 2>/dev/null
         );
     }
 
+    /// Typing the LAUNCHER's own name is the point of the whole setting, so it
+    /// must behave exactly like typing `claude`: the forwarder hands `cl …` to
+    /// the shadow, which handshakes with Nice and then execs the launcher.
+    #[test]
+    fn launcher_own_name_typed_directly_reaches_the_shadow_e2e() {
+        let launcher = &[("NICE_CLAUDE_LAUNCHER", "cl")][..];
+
+        // newtab: the handshake carries the typed args and nothing runs here.
+        let newtab = run_claude_shadow_e2e("newtab", 0, "cl --resume abc", launcher);
+        let payload = newtab.payloads.first().unwrap_or_else(|| {
+            panic!(
+                "typing the launcher's own name must handshake. pty: <{}>",
+                newtab.transcript
+            )
+        });
+        assert!(
+            payload.contains(r#""args":["--resume","abc"]"#),
+            "the handshake must carry the typed args. Got: <{payload}>"
+        );
+        assert!(
+            newtab.launcher_execs.is_empty() && newtab.execs.is_empty(),
+            "newtab execs nothing. launcher: {:?}, claude: {:?}, pty: <{}>",
+            newtab.launcher_execs,
+            newtab.execs,
+            newtab.transcript
+        );
+
+        // inplace with no sid and no settings: the launcher gets the args verbatim.
+        let inplace = run_claude_shadow_e2e("inplace - ", 0, "cl --resume abc", launcher);
+        assert_eq!(
+            inplace.launcher_execs,
+            vec!["--resume abc".to_string()],
+            "inplace must exec the LAUNCHER with the typed args. pty: <{}>",
+            inplace.transcript
+        );
+        assert!(
+            inplace.execs.is_empty(),
+            "the real claude must NOT run when a launcher is set. execs: {:?}",
+            inplace.execs
+        );
+    }
+
+    /// With the setting UNSET the forwarder block defines nothing, so `cl` is
+    /// just a program on PATH: it runs directly and Nice never hears a
+    /// handshake. This is the "behavior with the setting unset is unchanged"
+    /// half of the contract.
+    #[test]
+    fn no_forwarder_exists_when_the_launcher_is_unset_e2e() {
+        let run = run_claude_shadow_e2e("newtab", 0, "cl --resume abc", &[]);
+        assert_eq!(
+            run.launcher_execs,
+            vec!["--resume abc".to_string()],
+            "`cl` must run as a plain executable. pty: <{}>",
+            run.transcript
+        );
+        assert!(
+            run.payloads.is_empty(),
+            "an unset launcher defines no forwarder, so nothing handshakes. payloads: {:?}",
+            run.payloads
+        );
+        assert!(
+            run.execs.is_empty(),
+            "the real claude must not run either. execs: {:?}",
+            run.execs
+        );
+    }
+
     // ---- OSC 7 cwd reporting ------------------------------------------------
 
     /// The startup fire, in a real bash: one clean `file://` payload for the
@@ -2612,7 +2718,7 @@ zpty -d n 2>/dev/null
     fn nice_bashrc_body_sha256_frozen() {
         assert_eq!(
             sha256_hex(NICE_BASHRC_BODY.as_bytes()),
-            "a9193043128938e9eeee95b49af56c73b374d8f5f1673068971f6bc0531f76e4",
+            "a37b1d5f59cc26c735ec9c9ad1875bff012736991a5b207296174dfde69f2ea0",
             "nice.bashrc bytes changed"
         );
     }

@@ -32,7 +32,8 @@ const CLAUDE_LAUNCHER_DROPDOWN_ID: &str = "settings.advanced.claudeLauncher";
 /// The Claude-launcher row's ⓘ hover text.
 const CLAUDE_LAUNCHER_ROW_INFO: &str = "Runs this program instead of claude for \
 every Claude session Nice opens — new sessions, handoff, dispatch, and claude \
-typed in a terminal — with the same arguments. It must accept claude's \
+typed in a terminal — with the same arguments. Typing the launcher's own name \
+at a Nice prompt works the same as typing claude. It must accept claude's \
 arguments. New sessions only; a missing launcher fails the session visibly \
 rather than silently running claude.";
 

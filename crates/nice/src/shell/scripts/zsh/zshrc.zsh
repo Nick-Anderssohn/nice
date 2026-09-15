@@ -192,6 +192,24 @@ claude() {
     esac
 }
 
+# Typing the LAUNCHER's own name (`cl …`) must reach the shadow above: zsh
+# finds no function named `cl`, runs the executable, and Nice never hears the
+# handshake — so the session would land in this pane instead of a new tab.
+# Define a forwarder named after the launcher's basename. No recursion is
+# possible: every exec site inside claude() goes through `command`, which
+# bypasses functions.
+if [[ -n "${NICE_CLAUDE_LAUNCHER:-}" ]]; then
+    _nice_launcher_name="${NICE_CLAUDE_LAUNCHER:t}"
+    # `^[A-Za-z0-9_.-]+$` spelled as a plain glob (no extendedglob needed):
+    # non-empty and holding no character outside the set. `claude` itself is
+    # excluded — that name is already the shadow.
+    if [[ -n "$_nice_launcher_name" && "$_nice_launcher_name" != claude \
+          && "$_nice_launcher_name" != *[^A-Za-z0-9_.-]* ]]; then
+        eval "${_nice_launcher_name}() { claude \"\$@\"; }"
+    fi
+    unset _nice_launcher_name
+fi
+
 # Nice: emit OSC 7 (current working directory) on every cd so the
 # host terminal can capture and persist it. Format:
 #   ESC ] 7 ; file://hostname/path BEL
