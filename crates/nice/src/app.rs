@@ -1462,6 +1462,30 @@ pub(crate) fn refresh_window_inject_env(cx: &mut App) {
     }
 }
 
+/// Rewrite every live window's `NICE_CLAUDE_LAUNCHER` value to `launcher`, after
+/// a Settings ▸ Advanced ▸ Claude launcher pick changed the setting — the twin
+/// of [`refresh_window_inject_env`]. Only that one field is rewritten;
+/// `socket_path` / `inject_pairs` / `compose_conf` were minted per window and
+/// stay exactly as armed.
+///
+/// New terminals only: panes already running keep the launcher they forked with
+/// (the Shell row's "new terminals only" promise — the ⓘ says so). A window that
+/// never armed a socket (`window_shell_env == None`) is left alone.
+pub(crate) fn refresh_window_claude_launcher(cx: &mut App, launcher: Option<String>) {
+    for state in WindowRegistry::all_states(cx) {
+        state.update(cx, |ws, _cx| {
+            let Some(existing) = ws.ptys.window_shell_env() else {
+                return;
+            };
+            let refreshed = crate::pty_manager::WindowShellEnv {
+                claude_launcher: launcher.clone(),
+                ..existing.clone()
+            };
+            ws.ptys.set_window_shell_env(refreshed);
+        });
+    }
+}
+
 /// The C11 claude-binary probe (Swift `NiceServices.bootstrap`'s
 /// `resolvedClaudePath` resolution, `NiceServices.swift:331-346`). Runs from
 /// [`run`]'s bootstrap ONLY. `NICE_CLAUDE_OVERRIDE` wins **synchronously** (the
@@ -1551,7 +1575,8 @@ fn run_which_claude(argv: &[String]) -> Option<String> {
 ///
 /// Bind failure is NON-fatal — logged; `NICE_SOCKET` still points at the
 /// (unbound) path so shells' `nc … -w 2` fails fast and falls back to direct
-/// `command claude` ("user always gets claude"). `health_interval` is `None` in
+/// `command "${NICE_CLAUDE_LAUNCHER:-claude}"` ("user always gets claude, or their
+/// launcher"). `health_interval` is `None` in
 /// production (30 s default) and a short value in the scenario's self-heal step.
 /// The foreground drain is **waker-woken** (App-Nap-safe) — never a coalescable
 /// timer. Returns the RESOLVED socket path — read post-`start()`, the same value
@@ -1585,6 +1610,15 @@ pub(crate) fn arm_window_control_socket(
         );
     }
 
+    // The Claude launcher, read from the settings store at ARM time — the "env
+    // before fork" invariant: the store is loaded before any window opens, so
+    // the value is fixed by the time this window's ptys fork. A live change
+    // rewrites it through `refresh_window_claude_launcher` (new terminals only).
+    // Absent store (some itests) ⇒ `None`, byte-identical to today.
+    let claude_launcher = cx
+        .try_global::<crate::settings::prefs_store::SettingsPrefsStore>()
+        .and_then(|s| s.claude_launcher());
+
     // Stamp the window's shell-injection env from the RESOLVED path — after
     // `start()`, still BEFORE the caller forks the Main window.
     let socket_path = socket.path().to_string();
@@ -1596,6 +1630,7 @@ pub(crate) fn arm_window_control_socket(
                 .to_string_lossy()
                 .into_owned(),
         ),
+        claude_launcher,
     });
 
     // The waker-woken foreground drain: park on `readable()`, then route every
@@ -4623,6 +4658,49 @@ mod tests {
             stamped,
             Some(expected.clone()),
             "NICE_SOCKET must carry the window-keyed path, not a fresh/legacy one"
+        );
+
+        ws.update(cx, |ws, _| ws.teardown());
+        let _ = std::fs::remove_file(&expected);
+    }
+
+    /// Arm-time stamping (the "env before fork" invariant): with the settings
+    /// store holding a `claude_launcher`, `arm_window_control_socket` must stamp
+    /// that value into the window's shell env — so a forgotten read there cannot
+    /// pass the pure composer tests (which never touch the store).
+    #[gpui::test]
+    fn arm_stamps_claude_launcher_from_the_settings_store(cx: &mut gpui::TestAppContext) {
+        use crate::control_socket::mint_window_socket_path;
+
+        cx.update(|cx| {
+            let path = std::env::temp_dir()
+                .join(format!("nice-arm-launcher-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut store =
+                crate::settings::prefs_store::SettingsPrefsStore::with_defaults(path);
+            store
+                .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+                .unwrap();
+            cx.set_global(store);
+        });
+
+        let ws = cx.new(|_| WindowState::new("/home/u"));
+        let expected = ws.read_with(cx, |ws, _| mint_window_socket_path(ws.window_session_id()));
+        let _ = std::fs::remove_file(&expected);
+
+        ws.update(cx, |ws, cx| {
+            arm_window_control_socket(ws, cx, Vec::new(), None)
+        });
+
+        let launcher = ws.read_with(cx, |ws, _| {
+            ws.ptys
+                .window_shell_env()
+                .and_then(|e| e.claude_launcher.clone())
+        });
+        assert_eq!(
+            launcher,
+            Some("/usr/local/bin/cl".to_string()),
+            "arm must stamp NICE_CLAUDE_LAUNCHER from the settings store"
         );
 
         ws.update(cx, |ws, _| ws.teardown());

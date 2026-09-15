@@ -54,29 +54,30 @@ _nice_claude_exited() {
     return 0
 }
 
+# Nice sets NICE_CLAUDE_LAUNCHER from the Claude launcher setting; unset => claude.
 claude() {
     # Passthrough (no handshake): outside a Nice pty, piped stdin,
     # non-interactive flags, non-interactive subcommands.
     if [[ -z "$NICE_SOCKET" ]]; then
-        command claude "$@"
+        command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
         return
     fi
     if [[ ! -t 0 ]]; then
-        command claude "$@"
+        command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
         return
     fi
     local a
     for a in "$@"; do
         case "$a" in
             -p|--print|-h|--help|--version|--output-format|--output-format=*)
-                command claude "$@"
+                command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
                 return
                 ;;
         esac
     done
     case "${1-}" in
         mcp|config|migrate-installer|update|doctor)
-            command claude "$@"
+            command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             return
             ;;
     esac
@@ -105,7 +106,7 @@ claude() {
         # bash exec PATH-searches an external binary and never resolves
         # functions — plain `exec claude` already bypasses this shadow.
         # (`exec command claude` would exec the /usr/bin/command shim.)
-        exec claude "$@"
+        exec "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
     fi
 
     # Reply grammar (unchanged): newtab | inplace [sid|-] [settings]
@@ -126,9 +127,9 @@ claude() {
             # `${#pre[@]}` — the ARRAY length. `${#pre}` (the zsh spelling)
             # would be the length of element 0 in bash.
             if (( ${#pre[@]} )); then
-                exec claude "${pre[@]}" "$@"
+                exec "${NICE_CLAUDE_LAUNCHER:-claude}" "${pre[@]}" "$@"
             else
-                exec claude "$@"
+                exec "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             fi
             ;;
         attach)
@@ -139,21 +140,21 @@ claude() {
             [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
             # `${sid:0:8}` — bash substring. zsh's `${sid[1,8]}` subscript
             # expands to the WHOLE string in bash (inventory finding 3).
-            if command claude attach "${sid:0:8}"; then
+            if command "${NICE_CLAUDE_LAUNCHER:-claude}" attach "${sid:0:8}"; then
                 _nice_claude_exited
                 return 0
             fi
-            exec claude "${post[@]}"
+            exec "${NICE_CLAUDE_LAUNCHER:-claude}" "${post[@]}"
             ;;
         resume)
             local -a post
             post=(--resume "$sid")
             [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
-            exec claude "${post[@]}"
+            exec "${NICE_CLAUDE_LAUNCHER:-claude}" "${post[@]}"
             ;;
         *)
             printf '%s\n' "nice: unexpected response '$response'; running claude directly" >&2
-            exec claude "$@"
+            exec "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             ;;
     esac
 }

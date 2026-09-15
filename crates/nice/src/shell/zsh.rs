@@ -329,7 +329,7 @@ mod tests {
             (
                 "ZSHRC_BODY",
                 ZSHRC_BODY,
-                "482b4f0d30a1d16b1bd8939cc71e1977479e5988a87e404d204e56f23fc9376b",
+                "53eb57ecc6afe760ffbcbd7fd259a5a865c37eb5d8b1737e504317eb0371fc27",
             ),
         ] {
             assert_eq!(sha256_hex(body.as_bytes()), want, "{name} bytes changed");
@@ -573,15 +573,17 @@ mod tests {
     fn zshrc_attach_mode_falls_back_to_resume() {
         let body = zshrc();
         assert!(
-            body.contains(r#"if command claude attach "${sid[1,8]}"; then"#),
-            "attach must run as a child so its failure can fall back"
+            body.contains(
+                r#"if command "${NICE_CLAUDE_LAUNCHER:-claude}" attach "${sid[1,8]}"; then"#
+            ),
+            "attach must run as a child (through the launcher) so its failure can fall back"
         );
         assert!(
             body.contains(r#"local -a post=(--resume "$sid")"#),
             "the fallback resumes the FULL uuid from the reply"
         );
         assert!(
-            !body.contains(r#"exec command claude attach"#),
+            !body.contains(r#"exec command "${NICE_CLAUDE_LAUNCHER:-claude}" attach"#),
             "attach must NOT be exec'd — that would discard the fallback"
         );
     }
@@ -625,7 +627,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains(r#"exec command claude "${post[@]}""#),
+            code.contains(r#"exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "${post[@]}""#),
             "resume must exec the rebuilt argv. Got: <{code}>"
         );
         assert!(
@@ -669,9 +671,56 @@ mod tests {
             "must warn when the socket is gone"
         );
         assert!(
-            body.contains(r#"exec command claude "$@""#),
-            "unreachable socket must fall back to running claude directly"
+            body.contains(r#"exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@""#),
+            "unreachable socket must fall back to running the launcher directly"
         );
+    }
+
+    /// Every claude spawn/exec inside the shadow routes through the launcher
+    /// expansion `"${NICE_CLAUDE_LAUNCHER:-claude}"`, so setting the Claude
+    /// launcher redirects every verb. The ONLY bare `command claude` left in the
+    /// script is Command Compose's `command claude -p`, which deliberately runs
+    /// the real binary — no other line may spell `claude` as a literal command
+    /// word.
+    #[test]
+    fn zshrc_shadow_sites_route_through_the_launcher() {
+        let body = zshrc();
+        // No pre-launcher spelling survives anywhere in the script.
+        for forbidden in [
+            r#"command claude "$@""#,
+            r#"exec command claude "$@""#,
+            r#"command claude "${pre[@]}""#,
+            r#"exec command claude "${post[@]}""#,
+            r#"command claude attach"#,
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` must route through ${{NICE_CLAUDE_LAUNCHER:-claude}}"
+            );
+        }
+        // The launcher expansion appears at every verb: two passthrough short-
+        // circuits before the handshake plus the flag/subcommand ones, the
+        // unreachable fallback, both inplace arms, the attach child, the attach
+        // fallback, the resume exec, and the unexpected-reply fallback.
+        assert!(
+            body.matches(r#""${NICE_CLAUDE_LAUNCHER:-claude}""#).count() >= 11,
+            "the launcher expansion must appear at every claude site"
+        );
+        // The one allow-listed bare-claude site: Command Compose runs the real
+        // binary, never the launcher.
+        assert!(
+            body.contains(r#"command claude -p "$_nice_compose_instruction""#),
+            "Command Compose must keep running the real claude binary"
+        );
+        // …and it is the ONLY line spelling `claude` as a literal command word.
+        for line in body.lines() {
+            if line.contains("command claude") {
+                assert!(
+                    line.contains("command claude -p"),
+                    "line runs a bare `command claude` outside compose: <{line}>"
+                );
+            }
+        }
     }
 
     #[test]
@@ -792,13 +841,22 @@ mod tests {
     /// quote so a failure shows what the shell actually did.
     struct ShadowRun {
         execs: Vec<String>,
+        /// Argv the fake LAUNCHER (`cl`) recorded, one line per exec — populated
+        /// only when the leg sets `NICE_CLAUDE_LAUNCHER`. When it is set the
+        /// launcher owns every verb and `execs` (the fake `claude`) stays empty.
+        launcher_execs: Vec<String>,
         /// Every payload the wrapper wrote to the socket, one per line — the
         /// handshake first, then any fire-and-forget notification.
         payloads: Vec<String>,
         transcript: String,
     }
 
-    fn run_claude_shadow_e2e(reply: &str, attach_exit: i32, command: &str) -> ShadowRun {
+    fn run_claude_shadow_e2e(
+        reply: &str,
+        attach_exit: i32,
+        command: &str,
+        extra_env: &[(&str, &str)],
+    ) -> ShadowRun {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
 
@@ -806,6 +864,7 @@ mod tests {
         let bin = home.0.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let record = home.0.join("argv");
+        let cl_record = home.0.join("cl_argv");
         let sent = home.0.join("payloads");
 
         // The handshake partner: record the payload, print Nice's one-line reply.
@@ -831,6 +890,23 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The fake LAUNCHER: same shape as the fake `claude` (honors the attach
+        // outcome so the attach-fallback leg exercises the launcher on both legs),
+        // recording to its own file. A launcher leg passes
+        // `NICE_CLAUDE_LAUNCHER=cl`, and the shadow's `command cl …` /
+        // `exec command cl …` PATH-resolve to this fixture — the bare-name form
+        // the plan says a hand-edited setting may carry.
+        let fake_cl = bin.join("cl");
+        std::fs::write(
+            &fake_cl,
+            format!(
+                "#!/bin/zsh\nprint -r -- \"$@\" >> {rec}\n[[ \"$1\" == attach ]] && exit {attach_exit}\nexit 0\n",
+                rec = cl_record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_cl, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let zdotdir = make_isolated();
         let capture = home.0.join("pty.bin");
@@ -896,6 +972,7 @@ zpty -d n 2>/dev/null
             .env("NICE_PANE_ID", "t1-claude")
             .env("TERM", "xterm-256color")
             .env("LANG", "en_US.UTF-8")
+            .envs(extra_env.iter().copied())
             .current_dir(&home.0)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -905,6 +982,11 @@ zpty -d n 2>/dev/null
 
         ShadowRun {
             execs: std::fs::read_to_string(&record)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            launcher_execs: std::fs::read_to_string(&cl_record)
                 .unwrap_or_default()
                 .lines()
                 .map(str::to_string)
@@ -934,6 +1016,7 @@ zpty -d n 2>/dev/null
             &format!("attach {uuid} /ptr.json"),
             0,
             &format!("claude --resume {uuid}"),
+            &[],
         );
         assert_eq!(
             ok.execs,
@@ -955,6 +1038,7 @@ zpty -d n 2>/dev/null
             &format!("attach {uuid} /ptr.json"),
             1,
             &format!("claude --resume {uuid}"),
+            &[],
         );
         assert_eq!(
             fell_back.execs,
@@ -980,12 +1064,89 @@ zpty -d n 2>/dev/null
     #[test]
     fn claude_shadow_resume_mode_replaces_the_attach_args_e2e() {
         let uuid = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
-        let run = run_claude_shadow_e2e(&format!("resume {uuid}"), 0, "claude attach b8c8244b");
+        let run =
+            run_claude_shadow_e2e(&format!("resume {uuid}"), 0, "claude attach b8c8244b", &[]);
         assert_eq!(
             run.execs,
             vec![format!("--resume {uuid}")],
             "pty: <{}>",
             run.transcript
+        );
+    }
+
+    /// With `NICE_CLAUDE_LAUNCHER` set, EVERY verb execs the launcher and the
+    /// real `claude` runs NOTHING — the shadow's `command "${…:-claude}"` /
+    /// `exec command "${…:-claude}"` route through it, and a bare-name launcher
+    /// PATH-resolves in the login shell (the hand-edited-setting form).
+    #[test]
+    fn claude_shadow_routes_every_verb_through_the_launcher_e2e() {
+        let uuid = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
+        let launcher = &[("NICE_CLAUDE_LAUNCHER", "cl")][..];
+
+        // inplace: the launcher gets --settings then --session-id ahead of args.
+        let inplace = run_claude_shadow_e2e(
+            &format!("inplace {uuid} /ptr.json"),
+            0,
+            "claude",
+            launcher,
+        );
+        assert_eq!(
+            inplace.launcher_execs,
+            vec![format!("--settings /ptr.json --session-id {uuid}")],
+            "inplace must exec the launcher with Nice's flags. pty: <{}>",
+            inplace.transcript
+        );
+        assert!(
+            inplace.execs.is_empty(),
+            "the real claude must NOT run when a launcher is set. execs: {:?}",
+            inplace.execs
+        );
+
+        // attach then fall back: the launcher gets both legs.
+        let fell_back = run_claude_shadow_e2e(
+            &format!("attach {uuid} /ptr.json"),
+            1,
+            &format!("claude --resume {uuid}"),
+            launcher,
+        );
+        assert_eq!(
+            fell_back.launcher_execs,
+            vec![
+                "attach b8c8244b".to_string(),
+                format!("--settings /ptr.json --resume {uuid}"),
+            ],
+            "attach + fallback must both run through the launcher. pty: <{}>",
+            fell_back.transcript
+        );
+        assert!(
+            fell_back.execs.is_empty(),
+            "the real claude must NOT run when a launcher is set. execs: {:?}",
+            fell_back.execs
+        );
+
+        // resume: the launcher replaces the user's attach args wholesale.
+        let resume =
+            run_claude_shadow_e2e(&format!("resume {uuid}"), 0, "claude attach b8c8244b", launcher);
+        assert_eq!(
+            resume.launcher_execs,
+            vec![format!("--resume {uuid}")],
+            "resume must run through the launcher. pty: <{}>",
+            resume.transcript
+        );
+        assert!(resume.execs.is_empty(), "execs: {:?}", resume.execs);
+
+        // unreachable socket: the fallback execs the launcher, not claude.
+        let unreachable = run_claude_shadow_e2e("", 0, "claude --resume abc", launcher);
+        assert_eq!(
+            unreachable.launcher_execs,
+            vec!["--resume abc".to_string()],
+            "an unreachable socket must exec the launcher with the user's args. pty: <{}>",
+            unreachable.transcript
+        );
+        assert!(
+            unreachable.execs.is_empty(),
+            "the real claude must NOT run when a launcher is set. execs: {:?}",
+            unreachable.execs
         );
     }
 

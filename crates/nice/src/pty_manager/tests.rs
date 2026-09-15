@@ -17,7 +17,8 @@ use nice_term_view::TerminalEvent;
 
 use super::{
     build_claude_exec_command, build_claude_extra_env, build_claude_prefill_command,
-    claude_launch_display_command, claude_session_title_from_args, claude_worktree_cwd, clip_title,
+    claude_exec_program, claude_launch_display_command, claude_session_title_from_args,
+    claude_worktree_cwd, clip_title,
     compose_claude_reply, default_mint_id, dispatch_extra_args, dispatch_prompt, dispatch_title,
     handoff_extra_args, handoff_prompt, handoff_title,
     merge_env_spec_wins, mint_session_uuid, parse_claude_title, pending_prefill_for,
@@ -1641,6 +1642,7 @@ fn manager_with_shell_env(
         socket_path: socket.map(str::to_string),
         inject_pairs: zsh_inject_pairs(zdotdir, user_zdotdir),
         compose_conf: Some("/conf/compose.json".to_string()),
+        claude_launcher: None,
     });
     m
 }
@@ -1707,11 +1709,50 @@ fn absent_compose_conf_is_not_injected() {
         socket_path: Some("/tmp/s".to_string()),
         inject_pairs: zsh_inject_pairs(None, None),
         compose_conf: None,
+        claude_launcher: None,
     });
     let pairs = m.session_window_env_pairs("t", "p");
     assert!(
         !pairs.iter().any(|(k, _)| k == "NICE_COMPOSE_CONF"),
         "no compose_conf field ⇒ no NICE_COMPOSE_CONF injection"
+    );
+}
+
+/// The Claude launcher rides `session_window_env_pairs` as `NICE_CLAUDE_LAUNCHER`
+/// when the window armed one — after `NICE_COMPOSE_CONF`, before the tab/pane ids.
+#[test]
+fn session_env_injects_claude_launcher_when_set() {
+    let mut m = PtyManager::new();
+    m.set_window_shell_env(WindowShellEnv {
+        socket_path: Some("/tmp/s".to_string()),
+        inject_pairs: zsh_inject_pairs(None, None),
+        compose_conf: Some("/conf/compose.json".to_string()),
+        claude_launcher: Some("/usr/local/bin/cl".to_string()),
+    });
+    let pairs = m.session_window_env_pairs("t", "p");
+    assert_eq!(
+        value_of(&pairs, "NICE_CLAUDE_LAUNCHER"),
+        Some("/usr/local/bin/cl")
+    );
+    let pos = |k: &str| pairs.iter().position(|(kk, _)| kk == k);
+    assert!(
+        pos("NICE_COMPOSE_CONF") < pos("NICE_CLAUDE_LAUNCHER"),
+        "NICE_CLAUDE_LAUNCHER must follow NICE_COMPOSE_CONF"
+    );
+    assert!(
+        pos("NICE_CLAUDE_LAUNCHER") < pos("NICE_TAB_ID"),
+        "NICE_CLAUDE_LAUNCHER must precede the tab/pane ids"
+    );
+}
+
+/// No launcher set ⇒ no `NICE_CLAUDE_LAUNCHER` var (byte-identical to today).
+#[test]
+fn session_env_omits_claude_launcher_when_unset() {
+    let mgr = manager_with_shell_env(Some("/tmp/s"), Some("/z"), Some("/u"));
+    let pairs = mgr.session_window_env_pairs("t", "p");
+    assert!(
+        !pairs.iter().any(|(k, _)| k == "NICE_CLAUDE_LAUNCHER"),
+        "unset launcher ⇒ no NICE_CLAUDE_LAUNCHER injection"
     );
 }
 
@@ -1827,6 +1868,7 @@ fn claude_extra_env_common_columns_for_every_mode() {
             &zsh_inject_pairs(Some("/z"), Some("/user/z")),
             crate::shell::PrefillStrategy::ShellSide,
             None,
+            None,
         );
         assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
         assert_eq!(value_of(&env, "NICE_TAB_ID"), Some("tab1"));
@@ -1850,6 +1892,7 @@ fn claude_extra_env_omits_socket_when_absent() {
         &[],
         crate::shell::PrefillStrategy::ShellSide,
         None,
+        None,
     );
     assert_eq!(value_of(&env, "NICE_SOCKET"), None);
     assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
@@ -1866,6 +1909,7 @@ fn claude_extra_env_resume_deferred_sets_prefill_and_zdotdir() {
         Some("/tmp/s.sock"),
         &zsh_inject_pairs(Some("/managed/z"), Some("/user/z")),
         crate::shell::PrefillStrategy::ShellSide,
+        None,
         None,
     );
     assert_eq!(value_of(&env, "ZDOTDIR"), Some("/managed/z"));
@@ -1889,6 +1933,7 @@ fn claude_extra_env_resume_deferred_user_zdotdir_empty_when_none() {
         &zsh_inject_pairs(Some("/z"), None),
         crate::shell::PrefillStrategy::ShellSide,
         None,
+        None,
     );
     assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), Some(""));
 }
@@ -1905,6 +1950,7 @@ fn claude_extra_env_settings_path_splices_into_prefill() {
         &zsh_inject_pairs(Some("/z"), Some("/user/z")),
         crate::shell::PrefillStrategy::ShellSide,
         Some("/Users/nick/Library/Application Support/settings.json".to_string()),
+        None,
     );
     assert_eq!(
         value_of(&env, "NICE_PREFILL_COMMAND"),
@@ -1928,6 +1974,7 @@ fn claude_extra_env_prefill_off_sets_no_prefill_command() {
         &[],
         crate::shell::PrefillStrategy::Off,
         Some("/settings.json".to_string()),
+        None,
     );
     assert_eq!(
         value_of(&env, "NICE_PREFILL_COMMAND"),
@@ -1956,6 +2003,7 @@ fn claude_extra_env_prefill_app_typed_sets_no_prefill_command() {
         &[("NICE_BASH_RC".to_string(), "/rc".to_string())],
         crate::shell::PrefillStrategy::AppTyped,
         None,
+        None,
     );
     assert_eq!(value_of(&env, "NICE_PREFILL_COMMAND"), None);
     assert_eq!(
@@ -1963,6 +2011,51 @@ fn claude_extra_env_prefill_app_typed_sets_no_prefill_command() {
         Some("/rc"),
         "the profile's own inject pairs still splice, whatever the prefill strategy"
     );
+}
+
+/// The Claude launcher rides EVERY mode's env when set, and NO mode's when unset —
+/// it follows the `advanced.claude_launcher` setting, never the mode. (A claude
+/// child and a deferred-resume shell must see the same `NICE_CLAUDE_LAUNCHER`.)
+#[test]
+fn claude_extra_env_injects_launcher_across_every_mode() {
+    for mode in [
+        ClaudeSessionMode::None,
+        ClaudeSessionMode::New("id".into()),
+        ClaudeSessionMode::Resume("id".into()),
+        ClaudeSessionMode::Attach("abc12345".into()),
+        ClaudeSessionMode::ResumeDeferred("SID".into()),
+    ] {
+        let with = build_claude_extra_env(
+            &mode,
+            "t",
+            "p",
+            Some("/s"),
+            &zsh_inject_pairs(Some("/z"), Some("/u")),
+            crate::shell::PrefillStrategy::ShellSide,
+            None,
+            Some("/usr/local/bin/cl"),
+        );
+        assert_eq!(
+            value_of(&with, "NICE_CLAUDE_LAUNCHER"),
+            Some("/usr/local/bin/cl"),
+            "{mode:?} must carry the launcher when set"
+        );
+        let without = build_claude_extra_env(
+            &mode,
+            "t",
+            "p",
+            Some("/s"),
+            &zsh_inject_pairs(Some("/z"), Some("/u")),
+            crate::shell::PrefillStrategy::ShellSide,
+            None,
+            None,
+        );
+        assert_eq!(
+            value_of(&without, "NICE_CLAUDE_LAUNCHER"),
+            None,
+            "{mode:?} must not carry the launcher when unset"
+        );
+    }
 }
 
 // =====================================================================
@@ -2198,6 +2291,125 @@ fn exec_command_settings_path_quoted_when_contains_space() {
         Some("/Users/dev user/.nice/s.json"),
     );
     assert_eq!(cmd, "exec '/c' --settings '/Users/dev user/.nice/s.json'");
+}
+
+// =====================================================================
+// claude_exec_program — the pure exec-PROGRAM selector (claude vs. the
+// `advanced.claude_launcher`), and its interaction with NICE_CLAUDE_OVERRIDE.
+// =====================================================================
+
+/// The full selector matrix: no launcher ⇒ claude; launcher ⇒ launcher; and an
+/// override (where `claude` is already the override's value) always wins, launcher
+/// ignored.
+#[test]
+fn claude_exec_program_selects_launcher_or_claude() {
+    // No launcher, no override ⇒ claude unchanged (byte-identical to today).
+    assert_eq!(claude_exec_program("/bin/claude", None, false), "/bin/claude");
+    // Launcher set, no override ⇒ the launcher.
+    assert_eq!(claude_exec_program("/bin/claude", Some("/x/cl"), false), "/x/cl");
+    // Override wins: the launcher is ignored, the (already-override) program stays.
+    assert_eq!(
+        claude_exec_program("/x/override", Some("/x/cl"), true),
+        "/x/override"
+    );
+    // Override with no launcher ⇒ still just the program.
+    assert_eq!(claude_exec_program("/x/override", None, true), "/x/override");
+}
+
+/// The launcher spliced as the exec PROGRAM through the same single-quoting, with
+/// every mode's flag order unchanged (New's `--session-id`, Resume's `--resume`,
+/// Attach's subcommand, None's passthrough args).
+#[test]
+fn exec_command_with_launcher_program_across_modes() {
+    assert_eq!(
+        build_claude_exec_command(
+            "/x/cl",
+            &ClaudeSessionMode::None,
+            &args(&["--foo"]),
+            false,
+            Some("p"),
+        ),
+        "exec '/x/cl' --settings 'p' '--foo'"
+    );
+    assert_eq!(
+        build_claude_exec_command(
+            "/x/cl",
+            &ClaudeSessionMode::New("id".into()),
+            &[],
+            false,
+            Some("p"),
+        ),
+        "exec '/x/cl' --settings 'p' --session-id 'id'"
+    );
+    assert_eq!(
+        build_claude_exec_command(
+            "/x/cl",
+            &ClaudeSessionMode::Resume("id".into()),
+            &[],
+            false,
+            None,
+        ),
+        "exec '/x/cl' --resume 'id'"
+    );
+    // Attach still drops the theme pointer (a global flag before the subcommand
+    // makes the CLI stop seeing a subcommand).
+    assert_eq!(
+        build_claude_exec_command(
+            "/x/cl",
+            &ClaudeSessionMode::Attach("abc12345".into()),
+            &[],
+            false,
+            Some("p"),
+        ),
+        "exec '/x/cl' attach 'abc12345'"
+    );
+}
+
+/// The launcher exec line, wrapped by each profile's `spawn_argv` exactly as
+/// `spawn_claude_pane` does (it strips the leading `exec ` first): zsh gives
+/// `zsh -ilc "exec '/x/cl' …"`, bash gives `bash -il -c "exec '/x/cl' …"`.
+#[test]
+fn spawn_argv_wraps_launcher_exec_line_for_both_profiles() {
+    use crate::shell::bash::BashProfile;
+    use crate::shell::zsh::ZshProfile;
+    use crate::shell::{ShellProfile, SpawnCtx};
+
+    let exec_line = build_claude_exec_command(
+        "/x/cl",
+        &ClaudeSessionMode::New("id".into()),
+        &[],
+        false,
+        Some("p"),
+    );
+    // spawn_claude_pane hands spawn_argv the post-`exec` remainder.
+    let command = exec_line.strip_prefix("exec ").unwrap().to_string();
+
+    let zsh = ZshProfile::new("/bin/zsh");
+    assert_eq!(
+        zsh.spawn_argv(&SpawnCtx {
+            inject: None,
+            command: Some(&command),
+        }),
+        vec![
+            "/bin/zsh".to_string(),
+            "-ilc".to_string(),
+            "exec '/x/cl' --settings 'p' --session-id 'id'".to_string(),
+        ]
+    );
+
+    let bash = BashProfile::new("/bin/bash");
+    assert_eq!(
+        bash.spawn_argv(&SpawnCtx {
+            inject: None,
+            command: Some(&command),
+        }),
+        vec![
+            "/bin/bash".to_string(),
+            "-il".to_string(),
+            "-c".to_string(),
+            "exec '/x/cl' --settings 'p' --session-id 'id'".to_string(),
+        ]
+    );
 }
 
 // =====================================================================

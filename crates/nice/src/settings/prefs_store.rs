@@ -51,6 +51,12 @@ struct AdvancedSection {
     smooth_scroll: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shell: Option<String>,
+    /// The `advanced.claude_launcher` value — a program Nice execs in place of
+    /// `claude` for every Claude session it opens. Absent, or an empty string,
+    /// means "run `claude`" (the `shell` rule). Written by the Settings ▸
+    /// Advanced ▸ Claude launcher picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_launcher: Option<String>,
 }
 
 /// The on-disk document, for DECODING R23's own keys. Every other top-level key is
@@ -149,6 +155,15 @@ impl SettingsPrefsStore {
             .filter(|s: &String| !s.is_empty())
     }
 
+    /// The persisted `advanced.claude_launcher` value (`None` ⇒ run `claude`
+    /// as today), applying the `shell()` empty-string rule.
+    pub fn claude_launcher(&self) -> Option<String> {
+        self.advanced
+            .claude_launcher
+            .clone()
+            .filter(|s: &String| !s.is_empty())
+    }
+
     /// The injected file path (test hook).
     pub fn path(&self) -> &Path {
         &self.path
@@ -215,6 +230,18 @@ impl SettingsPrefsStore {
             return Ok(false);
         }
         self.advanced.shell = path;
+        self.write()?;
+        Ok(true)
+    }
+
+    /// Persist the `advanced.claude_launcher` choice, write-through
+    /// only-if-changed. `None` omits the key entirely rather than writing
+    /// `null` (the section's `skip_serializing_if`).
+    pub fn set_claude_launcher(&mut self, path: Option<String>) -> std::io::Result<bool> {
+        if self.advanced.claude_launcher == path {
+            return Ok(false);
+        }
+        self.advanced.claude_launcher = path;
         self.write()?;
         Ok(true)
     }
@@ -490,10 +517,14 @@ mod tests {
 
         let mut store = SettingsPrefsStore::load(path.clone());
         store.set_shell(Some("/bin/bash".to_string())).unwrap();
+        store
+            .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+            .unwrap();
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(raw["advanced"]["shell"], "/bin/bash");
+        assert_eq!(raw["advanced"]["claude_launcher"], "/usr/local/bin/cl");
         assert_eq!(raw["appearance"]["scheme"], "dark");
         assert_eq!(raw["appearance"]["accent"], "ocean");
         assert_eq!(raw["file_browser_sort"]["criterion"], "name");
@@ -534,6 +565,86 @@ mod tests {
         assert_eq!(
             reloaded.shell_setting(),
             crate::shell::resolve::ShellSetting::Path("/opt/homebrew/bin/fish".to_string())
+        );
+    }
+
+    /// The picker's round-trip: unset → a path → unset, through the file each
+    /// time (the `set_shell_round_trips_through_the_file` shape).
+    #[test]
+    fn set_claude_launcher_round_trips_through_the_file() {
+        let path = temp_path("claude-launcher-set");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        assert_eq!(store.claude_launcher(), None, "absent key ⇒ unset");
+
+        assert!(
+            store
+                .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+                .unwrap()
+        );
+        let reloaded = SettingsPrefsStore::load(path.clone());
+        assert_eq!(reloaded.claude_launcher(), Some("/usr/local/bin/cl".to_string()));
+
+        let mut store = reloaded;
+        assert!(
+            store.set_claude_launcher(None).unwrap(),
+            "back to unset writes"
+        );
+        let reloaded = SettingsPrefsStore::load(path);
+        assert_eq!(reloaded.claude_launcher(), None);
+    }
+
+    /// `None` omits the `claude_launcher` key entirely — never
+    /// `"claude_launcher": null` (the `set_shell_none_omits_the_key` shape).
+    #[test]
+    fn set_claude_launcher_none_omits_the_key() {
+        let path = temp_path("claude-launcher-omit");
+        let mut store = SettingsPrefsStore::load(path.clone());
+        store
+            .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+            .unwrap();
+        store.set_claude_launcher(None).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw["advanced"].get("claude_launcher").is_none(),
+            "unset must leave no `claude_launcher` key: {raw}"
+        );
+    }
+
+    /// A hand-edited empty string reads as unset (the `shell_empty_string_reads_as_absent` rule).
+    #[test]
+    fn claude_launcher_empty_string_reads_as_absent() {
+        let path = temp_path("claude-launcher-raw-empty");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"advanced":{"claude_launcher":""}}"#,
+        )
+        .unwrap();
+        let store = SettingsPrefsStore::load(path);
+        assert_eq!(store.claude_launcher(), None);
+    }
+
+    /// only-if-changed: re-picking the same launcher performs no second write.
+    #[test]
+    fn set_same_claude_launcher_does_not_rewrite() {
+        let path = temp_path("claude-launcher-noop");
+        let mut store = SettingsPrefsStore::load(path);
+        assert!(
+            store
+                .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+                .unwrap(),
+            "first pick writes"
+        );
+        assert!(
+            !store
+                .set_claude_launcher(Some("/usr/local/bin/cl".to_string()))
+                .unwrap(),
+            "re-picking the identical launcher must not rewrite"
+        );
+        assert!(
+            store.set_claude_launcher(None).unwrap(),
+            "unset is a different value, so it does write"
         );
     }
 }

@@ -11,9 +11,9 @@
 //! process-wide `ShellRuntime`, refreshes every live window's inject env and
 //! re-probes `claude`. Nothing in a test or `run_selftest` can reach that half.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use gpui::{div, prelude::*, px, AnyElement, App, Context, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, AsyncApp, Context, Window};
 
 use crate::settings::controls::{dropdown, toggle_switch, DropdownItem};
 use crate::settings::prefs_store::SettingsPrefsStore;
@@ -24,6 +24,17 @@ use crate::shell::resolve::ShellSetting;
 /// The Shell dropdown's a11y trigger id; each option row is
 /// `<trigger>.<id_suffix>` (`settings.advanced.shell.bin_bash`).
 const SHELL_DROPDOWN_ID: &str = "settings.advanced.shell";
+
+/// The Claude-launcher dropdown's a11y trigger id; each option row is
+/// `<trigger>.<id_suffix>` (`settings.advanced.claudeLauncher.default`).
+const CLAUDE_LAUNCHER_DROPDOWN_ID: &str = "settings.advanced.claudeLauncher";
+
+/// The Claude-launcher row's ⓘ hover text.
+const CLAUDE_LAUNCHER_ROW_INFO: &str = "Runs this program instead of claude for \
+every Claude session Nice opens — new sessions, handoff, dispatch, and claude \
+typed in a terminal — with the same arguments. It must accept claude's \
+arguments. New sessions only; a missing launcher fails the session visibly \
+rather than silently running claude.";
 
 /// The persisted smooth-scroll value (default OFF; absent store ⇒ OFF).
 fn smooth_scroll_on(cx: &App) -> bool {
@@ -153,6 +164,138 @@ pub(crate) fn perform_pick_shell(cx: &mut App, path: Option<String>) {
     cx.refresh_windows();
 }
 
+/// The raw persisted `advanced.claude_launcher` value (`None` ⇒ run `claude`,
+/// which is also what an absent store reads as).
+fn persisted_claude_launcher(cx: &App) -> Option<String> {
+    cx.try_global::<SettingsPrefsStore>()
+        .and_then(|s| s.claude_launcher())
+}
+
+/// The Claude-launcher dropdown's options: `claude` (the default — selected when
+/// unset, and picking it clears the setting), the stored value (only when set —
+/// selected, with a " (missing)" suffix when it is an absolute path that no
+/// longer exists), and "Choose…" (opens the file panel).
+///
+/// Pure so ids, labels and the exactly-one-selected invariant are unit-tested
+/// without a window (`shell_dropdown_items`' shape). `exists` is injected — the
+/// live caller stats an absolute persisted path; a bare command name PATH-
+/// resolves in the login shell, so the caller passes `true` for it and no
+/// "(missing)" is ever shown.
+pub(crate) fn claude_launcher_dropdown_items(
+    persisted: Option<&str>,
+    exists: bool,
+) -> Vec<DropdownItem> {
+    let is_set = persisted.is_some();
+    let mut items = Vec::new();
+
+    // The default: run `claude`. Selected when unset; picking it clears the
+    // setting (persist `None`).
+    items.push(DropdownItem::new(
+        format!("{CLAUDE_LAUNCHER_DROPDOWN_ID}.default"),
+        "claude",
+        !is_set,
+        |cx| perform_set_claude_launcher(cx, None),
+    ));
+
+    // The stored value's own row — only when set, and always the selection.
+    if let Some(value) = persisted {
+        let missing = value.starts_with('/') && !exists;
+        let label = if missing {
+            format!("{value} (missing)")
+        } else {
+            value.to_string()
+        };
+        let stored = value.to_string();
+        items.push(DropdownItem::new(
+            format!("{CLAUDE_LAUNCHER_DROPDOWN_ID}.current"),
+            label,
+            true,
+            move |cx| perform_set_claude_launcher(cx, Some(stored.clone())),
+        ));
+    }
+
+    // Open the file panel to pick a launcher.
+    items.push(DropdownItem::new(
+        format!("{CLAUDE_LAUNCHER_DROPDOWN_ID}.choose"),
+        "Choose…",
+        false,
+        perform_pick_claude_launcher,
+    ));
+
+    items
+}
+
+/// The persistence half of a launcher pick: write `advanced.claude_launcher`
+/// through the [`SettingsPrefsStore`], returning whether the value actually
+/// changed. No live window fan-out — this is the half a `#[gpui::test]` drives
+/// (the [`persist_shell_setting`] split). Absent store ⇒ a no-op reporting "no
+/// change"; a failed *write* still reports a change (the in-memory value already
+/// moved, so the pick takes effect this run, it just won't survive a relaunch).
+pub(crate) fn persist_claude_launcher(cx: &mut App, path: Option<String>) -> bool {
+    if cx.try_global::<SettingsPrefsStore>().is_none() {
+        return false;
+    }
+    match cx.global_mut::<SettingsPrefsStore>().set_claude_launcher(path) {
+        Ok(changed) => changed,
+        Err(e) => {
+            eprintln!("nice: could not persist the Claude launcher setting: {e}");
+            true
+        }
+    }
+}
+
+/// Apply a launcher choice live: persist it, then rewrite every armed window's
+/// `NICE_CLAUDE_LAUNCHER` so new panes fork with the new value, and repaint so
+/// the dropdown re-renders its selection. Panes already running keep the
+/// launcher they forked with (the row's "new terminals only" promise). Reached
+/// from the `claude` (clear) and stored-value dropdown rows, and from
+/// [`perform_pick_claude_launcher`] once a pick validates.
+pub(crate) fn perform_set_claude_launcher(cx: &mut App, launcher: Option<String>) {
+    persist_claude_launcher(cx, launcher.clone());
+    crate::app::refresh_window_claude_launcher(cx, launcher);
+    cx.refresh_windows();
+}
+
+/// The "Choose…" click path (live UI only): present the executable file panel
+/// with NO `App` borrow held (the production panel spins a nested run loop that
+/// drains the main dispatch queue — presenting under a live borrow double-
+/// borrows the `AppCell` the moment a queued gpui task fires, the
+/// [`perform_pick_shell`]/`perform_import` modal-safety rule). On a chosen path
+/// require a regular file with an executable bit — a non-executable pick is
+/// logged and dropped rather than persisted (the launcher never falls back to
+/// `claude`, so a bad pick must not stick) — then apply it live.
+pub(crate) fn perform_pick_claude_launcher(cx: &mut App) {
+    let Some(picker) = crate::settings::file_picker::picker_handle(cx) else {
+        return;
+    };
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let Some(path) = picker.pick_claude_launcher() else {
+            return;
+        };
+        if !is_executable_file(&path) {
+            eprintln!(
+                "nice: {} is not an executable file; leaving the Claude launcher unchanged",
+                path.display()
+            );
+            return;
+        }
+        let value = path.to_string_lossy().into_owned();
+        let _ = acx.update(|cx| perform_set_claude_launcher(cx, Some(value)));
+    })
+    .detach();
+}
+
+/// A regular file carrying an executable bit — the pick-time gate (design §7,
+/// "fail loudly, no silent fallback"). A directory, a symlink to nothing, or a
+/// plain data file all fail here so they never reach the setting.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
 /// The Advanced pane body (The spec §Advanced). **Shell** first — the dropdown
 /// over [`shell_dropdown_items`], with the "new terminals only" promise in its ⓘ
 /// ([`shell_row_info`]) — then the "Smooth scrolling" [`toggle_switch`] (a11y
@@ -179,6 +322,21 @@ pub(crate) fn advanced_pane(window: &mut Window, cx: &mut Context<SettingsRootVi
         .map(|item| item.label.to_string())
         .unwrap_or_else(|| "Automatic".to_string());
 
+    // The Claude-launcher dropdown, under Shell. An absolute persisted path is
+    // stat'd so a launcher that no longer exists reads "(missing)"; a bare
+    // command name PATH-resolves in the login shell, so it is treated as present.
+    let launcher = persisted_claude_launcher(cx);
+    let launcher_exists = launcher
+        .as_deref()
+        .map(|p| !p.starts_with('/') || Path::new(p).exists())
+        .unwrap_or(true);
+    let launcher_items = claude_launcher_dropdown_items(launcher.as_deref(), launcher_exists);
+    let launcher_label = launcher_items
+        .iter()
+        .find(|item| item.selected)
+        .map(|item| item.label.to_string())
+        .unwrap_or_else(|| "claude".to_string());
+
     div()
         .flex()
         .flex_col()
@@ -188,6 +346,18 @@ pub(crate) fn advanced_pane(window: &mut Window, cx: &mut Context<SettingsRootVi
             "Shell",
             shell_row_info(&automatic_name),
             dropdown(SHELL_DROPDOWN_ID, current_label, items, window, cx),
+            cx,
+        ))
+        .child(setting_row_info(
+            "Claude launcher",
+            CLAUDE_LAUNCHER_ROW_INFO,
+            dropdown(
+                CLAUDE_LAUNCHER_DROPDOWN_ID,
+                launcher_label,
+                launcher_items,
+                window,
+                cx,
+            ),
             cx,
         ))
         .child(setting_row(
@@ -328,6 +498,122 @@ mod tests {
         assert_eq!(
             reloaded.shell_setting(),
             crate::shell::resolve::ShellSetting::Automatic
+        );
+    }
+
+    /// Unset ⇒ two rows (`claude` selected, then "Choose…"); the default row
+    /// clears the setting.
+    #[test]
+    fn launcher_items_default_when_unset() {
+        let items = claude_launcher_dropdown_items(None, true);
+        assert_eq!(
+            ids(&items),
+            vec![
+                "settings.advanced.claudeLauncher.default".to_string(),
+                "settings.advanced.claudeLauncher.choose".to_string(),
+            ]
+        );
+        assert_eq!(labels(&items), vec!["claude", "Choose…"]);
+        assert_eq!(selected_label(&items), "claude");
+    }
+
+    /// A set launcher adds its own row between `claude` and "Choose…", and that
+    /// row — not `claude` — is the selection. A present absolute path shows no
+    /// "(missing)" suffix.
+    #[test]
+    fn launcher_items_select_the_stored_value() {
+        let items = claude_launcher_dropdown_items(Some("/Users/x/.local/bin/cl"), true);
+        assert_eq!(
+            ids(&items),
+            vec![
+                "settings.advanced.claudeLauncher.default".to_string(),
+                "settings.advanced.claudeLauncher.current".to_string(),
+                "settings.advanced.claudeLauncher.choose".to_string(),
+            ]
+        );
+        assert_eq!(
+            labels(&items),
+            vec!["claude", "/Users/x/.local/bin/cl", "Choose…"]
+        );
+        assert_eq!(selected_label(&items), "/Users/x/.local/bin/cl");
+    }
+
+    /// An absolute path that no longer exists keeps its row selected but gains a
+    /// " (missing)" suffix; a bare command name (passed with `exists=true` by
+    /// the live caller, since it PATH-resolves) never shows the suffix.
+    #[test]
+    fn launcher_items_flag_a_missing_absolute_path() {
+        let items = claude_launcher_dropdown_items(Some("/no/such/cl"), false);
+        assert_eq!(selected_label(&items), "/no/such/cl (missing)");
+
+        // A bare command name is treated as present (the caller passes true).
+        let items = claude_launcher_dropdown_items(Some("cl"), true);
+        assert_eq!(selected_label(&items), "cl");
+        assert_eq!(
+            ids(&items)[1],
+            "settings.advanced.claudeLauncher.current",
+            "the bare name still gets its own current row"
+        );
+    }
+
+    /// The persistence half round-trips through the settings FILE and reports
+    /// only real changes — the whole of what a test may reach (the live window
+    /// fan-out lives in `perform_set_claude_launcher`, which nothing here calls;
+    /// the `persist_shell_setting` split).
+    #[gpui::test]
+    fn persist_claude_launcher_round_trips_and_only_reports_changes(cx: &mut TestAppContext) {
+        let path = temp_settings_path("launcher-round-trip");
+        cx.update(|app| {
+            assert!(
+                !persist_claude_launcher(app, Some("/x/cl".to_string())),
+                "no store ⇒ no change"
+            );
+
+            app.set_global(SettingsPrefsStore::load(path.clone()));
+            assert!(persist_claude_launcher(app, Some("/x/cl".to_string())));
+            assert!(
+                !persist_claude_launcher(app, Some("/x/cl".to_string())),
+                "re-picking the same launcher is not a change"
+            );
+        });
+        assert_eq!(
+            SettingsPrefsStore::load(path.clone()).claude_launcher(),
+            Some("/x/cl".to_string()),
+            "the pick reached the file"
+        );
+
+        cx.update(|app| {
+            assert!(persist_claude_launcher(app, None), "clearing to claude writes");
+            assert!(
+                !persist_claude_launcher(app, None),
+                "re-clearing is not a change"
+            );
+        });
+        assert_eq!(
+            SettingsPrefsStore::load(path).claude_launcher(),
+            None,
+            "clearing reads as absent"
+        );
+    }
+
+    /// The executable-bit gate: a directory and a plain data file both fail; a
+    /// file with an executable bit passes.
+    #[test]
+    fn only_an_executable_regular_file_passes_the_gate() {
+        let home = ScratchHome::new("nice-launcher-execbit");
+        let cl = home.install_executable("cl", "#!/bin/sh\n");
+        assert!(is_executable_file(&cl), "an installed executable passes");
+
+        let dir = cl.parent().unwrap();
+        assert!(!is_executable_file(dir), "a directory fails");
+
+        let data = dir.join("notes.txt");
+        std::fs::write(&data, "plain").unwrap();
+        assert!(!is_executable_file(&data), "a non-executable file fails");
+
+        assert!(
+            !is_executable_file(Path::new("/no/such/thing")),
+            "a missing path fails"
         );
     }
 }

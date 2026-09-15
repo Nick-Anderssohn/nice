@@ -58,6 +58,7 @@ _nice_claude_exited() {
     return 0
 }
 
+# Nice sets NICE_CLAUDE_LAUNCHER from the Claude launcher setting; unset => claude.
 claude() {
     # Passthrough to the real binary (no handshake) when:
     #   1. Not inside a Nice pty ($NICE_SOCKET unset).
@@ -65,25 +66,25 @@ claude() {
     #   3. User passed a flag that makes claude non-interactive.
     #   4. User invoked a non-interactive subcommand.
     if [[ -z "$NICE_SOCKET" ]]; then
-        command claude "$@"
+        command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
         return
     fi
     if [[ ! -t 0 ]]; then
-        command claude "$@"
+        command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
         return
     fi
     local a
     for a in "$@"; do
         case "$a" in
             -p|--print|-h|--help|--version|--output-format|--output-format=*)
-                command claude "$@"
+                command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
                 return
                 ;;
         esac
     done
     case "${1-}" in
         mcp|config|migrate-installer|update|doctor)
-            command claude "$@"
+            command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             return
             ;;
     esac
@@ -111,7 +112,7 @@ claude() {
     response=$(printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 2 2>/dev/null)
     if [[ -z "$response" ]]; then
         print -u2 "nice: control socket unreachable; running claude directly"
-        exec command claude "$@"
+        exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
     fi
 
     # The reply is one line of up to three positional fields:
@@ -144,9 +145,9 @@ claude() {
             # Guard the expansion so an empty `pre` never trips the
             # user's `setopt nounset` (and never injects an empty arg).
             if (( ${#pre} )); then
-                exec command claude "${pre[@]}" "$@"
+                exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "${pre[@]}" "$@"
             else
-                exec command claude "$@"
+                exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             fi
             ;;
         attach)
@@ -169,11 +170,11 @@ claude() {
             # window is a prompt again, or its promotion flag stays set forever.
             local -a post=(--resume "$sid")
             [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
-            if command claude attach "${sid[1,8]}"; then
+            if command "${NICE_CLAUDE_LAUNCHER:-claude}" attach "${sid[1,8]}"; then
                 _nice_claude_exited
                 return 0
             fi
-            exec command claude "${post[@]}"
+            exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "${post[@]}"
             ;;
         resume)
             # The mirror: the user ran `claude attach <id>` for a session the
@@ -182,11 +183,11 @@ claude() {
             # `attach`).
             local -a post=(--resume "$sid")
             [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
-            exec command claude "${post[@]}"
+            exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "${post[@]}"
             ;;
         *)
             print -u2 "nice: unexpected response '$response'; running claude directly"
-            exec command claude "$@"
+            exec command "${NICE_CLAUDE_LAUNCHER:-claude}" "$@"
             ;;
     esac
 }

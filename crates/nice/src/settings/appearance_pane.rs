@@ -1659,6 +1659,11 @@ mod tests {
             self.async_app.update(|_| {});
             Some(self.path.clone())
         }
+
+        fn pick_claude_launcher(&self) -> Option<PathBuf> {
+            self.async_app.update(|_| {});
+            Some(self.path.clone())
+        }
     }
 
     #[gpui::test]

@@ -29,6 +29,12 @@ pub trait FilePickerOps {
     /// Present the theme-file chooser. Returns the chosen file's path, or `None`
     /// when the user cancels.
     fn pick_theme_file(&self) -> Option<PathBuf>;
+
+    /// Present the Claude-launcher chooser (Settings ▸ Advanced ▸ "Choose…").
+    /// Returns the chosen executable's path, or `None` when the user cancels.
+    /// The second method on this one seam — the recording fake shares its call
+    /// counter and scripted slot with [`FilePickerOps::pick_theme_file`].
+    fn pick_claude_launcher(&self) -> Option<PathBuf>;
 }
 
 // MARK: - Production impl (objc2 via platform.rs) --------------------------------
@@ -40,6 +46,10 @@ pub struct ProductionFilePicker;
 impl FilePickerOps for ProductionFilePicker {
     fn pick_theme_file(&self) -> Option<PathBuf> {
         crate::platform::choose_theme_file().map(PathBuf::from)
+    }
+
+    fn pick_claude_launcher(&self) -> Option<PathBuf> {
+        crate::platform::choose_executable_file().map(PathBuf::from)
     }
 }
 
@@ -82,6 +92,15 @@ impl RecordingFilePicker {
 
 impl FilePickerOps for RecordingFilePicker {
     fn pick_theme_file(&self) -> Option<PathBuf> {
+        let mut state = self.state.lock().unwrap();
+        state.calls += 1;
+        state.scripted.clone()
+    }
+
+    /// Shares the one call counter and scripted slot with `pick_theme_file` —
+    /// no Settings flow drives both pickers in a single scenario, so one slot
+    /// is enough and keeps the fake a single `scripted`/`calls` pair.
+    fn pick_claude_launcher(&self) -> Option<PathBuf> {
         let mut state = self.state.lock().unwrap();
         state.calls += 1;
         state.scripted.clone()
@@ -148,5 +167,18 @@ mod tests {
         fake.set_next(Some(p.clone()));
         assert_eq!(fake.pick_theme_file(), Some(p));
         assert_eq!(fake.call_count(), 2, "both invocations were logged");
+    }
+
+    #[test]
+    fn pick_claude_launcher_shares_the_slot_and_counter() {
+        let fake = RecordingFilePicker::new();
+        // Unset ⇒ a cancel.
+        assert_eq!(fake.pick_claude_launcher(), None);
+        // The scripted slot and counter are shared with `pick_theme_file`.
+        let p = PathBuf::from("/Users/x/.local/bin/cl");
+        fake.set_next(Some(p.clone()));
+        assert_eq!(fake.pick_claude_launcher(), Some(p.clone()));
+        assert_eq!(fake.pick_theme_file(), Some(p), "one scripted slot serves both");
+        assert_eq!(fake.call_count(), 3, "every invocation is counted");
     }
 }

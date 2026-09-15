@@ -1565,6 +1565,7 @@ pub fn open_splits_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
                 socket_path: None,
                 inject_pairs: vec![("ZDOTDIR".to_string(), base_s.clone())],
                 compose_conf: None,
+                claude_launcher: None,
             });
             let session_id = s
                 .workspace

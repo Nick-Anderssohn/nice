@@ -2887,6 +2887,59 @@ pub fn choose_theme_file() -> Option<String> {
     }
 }
 
+/// The Claude-launcher chooser: an `NSOpenPanel` for a single executable file,
+/// prompt "Choose", hidden files shown (a launcher like `cl` commonly lives
+/// under a dot-directory such as `~/.local/bin`), rooted at `$HOME`. No type
+/// filter — an executable carries no extension, so an allowlist would gray out
+/// exactly the files this panel is for; the executable-bit check happens at the
+/// call site. Returns the chosen file's path, or `None` if the user cancels.
+/// Modal — production ONLY (the `RecordingFilePicker` answers in tests /
+/// scenarios, so no real panel ever opens under the suite), same modal-safety
+/// rules as [`choose_theme_file`].
+///
+/// # Safety
+/// Main thread with an autorelease pool (a gpui button handler satisfies both).
+pub fn choose_executable_file() -> Option<String> {
+    // `NSModalResponseOK` — the panel's accept response.
+    const NS_MODAL_RESPONSE_OK: isize = 1;
+    unsafe {
+        let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+        if panel.is_null() {
+            return None;
+        }
+        let _: () = msg_send![panel, setCanChooseFiles: true];
+        let _: () = msg_send![panel, setCanChooseDirectories: false];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+        let _: () = msg_send![panel, setResolvesAliases: true];
+        // Launchers commonly live under dot-directories (`~/.local/bin`).
+        let _: () = msg_send![panel, setShowsHiddenFiles: true];
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                let dir = file_url(&home);
+                let _: () = msg_send![panel, setDirectoryURL: dir];
+            }
+        }
+        let prompt = ns_string("Choose");
+        let _: () = msg_send![panel, setPrompt: prompt];
+        // No type filter: executables carry no extension.
+
+        let response: isize = msg_send![panel, runModal];
+        if response != NS_MODAL_RESPONSE_OK {
+            return None;
+        }
+        let urls: *mut AnyObject = msg_send![panel, URLs];
+        if urls.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![urls, count];
+        if count == 0 {
+            return None;
+        }
+        let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+        standardized_path(url)
+    }
+}
+
 // ===========================================================================
 // R27 update check — the one synchronous NSURLSession GitHub Releases GET
 // (Binding decision D1). This is the ONLY module that touches OS networking; the

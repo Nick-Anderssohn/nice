@@ -318,6 +318,13 @@ pub(crate) struct WindowShellEnv {
     /// ZLE widget reads per compose (accent + `claude -p` flags). `None` ⇒ the
     /// var is not injected and the widget falls back to its built-in defaults.
     pub(crate) compose_conf: Option<String>,
+    /// `NICE_CLAUDE_LAUNCHER` — the program the `claude()` shadow and the direct
+    /// Claude spawn run in place of `claude` (the `advanced.claude_launcher`
+    /// setting). `None` ⇒ the var is not injected and the shadow runs `claude`,
+    /// byte-identical to today. Stamped at arm time from the settings store, so
+    /// the value is fixed before any pty forks; `refresh_window_claude_launcher`
+    /// rewrites it on a live setting change (new terminals only).
+    pub(crate) claude_launcher: Option<String>,
 }
 
 pub(crate) struct PtyManager {
@@ -2150,6 +2157,9 @@ impl PtyManager {
         if let Some(conf) = &env.compose_conf {
             pairs.push(("NICE_COMPOSE_CONF".to_string(), conf.clone()));
         }
+        if let Some(launcher) = &env.claude_launcher {
+            pairs.push(("NICE_CLAUDE_LAUNCHER".to_string(), launcher.clone()));
+        }
         pairs.push(("NICE_TAB_ID".to_string(), session_id.to_string()));
         pairs.push(("NICE_PANE_ID".to_string(), term_window_id.to_string()));
         pairs
@@ -2525,9 +2535,13 @@ impl PtyManager {
         cx: &mut App,
     ) -> Result<()> {
         // Window shell-injection facts (empty on a manager that never armed a socket).
-        let (socket_path, inject_pairs) = match &self.window_shell_env {
-            Some(env) => (env.socket_path.clone(), env.inject_pairs.clone()),
-            None => (None, Vec::new()),
+        let (socket_path, inject_pairs, claude_launcher) = match &self.window_shell_env {
+            Some(env) => (
+                env.socket_path.clone(),
+                env.inject_pairs.clone(),
+                env.claude_launcher.clone(),
+            ),
+            None => (None, Vec::new(), None),
         };
         // `NICE_CLAUDE_OVERRIDE` in the env means the wrapper owns the full argv —
         // suppress every Nice-injected flag (re-read here, the test seam).
@@ -2548,6 +2562,7 @@ impl PtyManager {
                 &inject_pairs,
                 prefill,
                 settings_path.map(str::to_string),
+                claude_launcher.as_deref(),
             );
             // Deferred-resume panes ARE injected: the rc tail is what pre-types
             // the prefill line at the prompt.
@@ -2563,9 +2578,15 @@ impl PtyManager {
                 &inject_pairs,
                 prefill,
                 settings_path.map(str::to_string),
+                claude_launcher.as_deref(),
             );
+            // The exec PROGRAM is the launcher (when set and not overridden);
+            // the env var above follows the setting on its own. Under an
+            // override the launcher is ignored and `claude` (already the
+            // override value from `resolve_claude_binary`) stays flag-free.
+            let program = claude_exec_program(claude, claude_launcher.as_deref(), is_override);
             let exec_line =
-                build_claude_exec_command(claude, mode, extra_args, is_override, settings_path);
+                build_claude_exec_command(program, mode, extra_args, is_override, settings_path);
             // `SpawnSpec::command` wraps its arg as `zsh -ilc "exec <cmd>"`; the
             // composer already emits `exec <claude> …`, so hand it the post-`exec`
             // remainder (the composer always prefixes `exec `, so the strip is total).
@@ -2914,8 +2935,10 @@ pub(crate) enum ClaudeSessionMode {
 ///
 /// The per-mode matrix is R14's FROZEN spec (R15 wired this function into the
 /// live spawn path and may extend the signature — never the matrix): EVERY mode sets `TERM_PROGRAM`,
-/// `NICE_TAB_ID`, `NICE_PANE_ID`, and `NICE_SOCKET` (when a socket exists) so the
-/// SessionStart hook can reach Nice; ONLY [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred)
+/// `NICE_TAB_ID`, `NICE_PANE_ID`, `NICE_SOCKET` (when a socket exists), and
+/// `NICE_CLAUDE_LAUNCHER` (when the `advanced.claude_launcher` setting is set)
+/// so the SessionStart hook can reach Nice and a deferred-resume shell execs the
+/// same launcher a claude child does; ONLY [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred)
 /// adds the shell profile's `inject_pairs` (zsh: `ZDOTDIR` when the rc write
 /// succeeded, plus the always-present `NICE_USER_ZDOTDIR`) and the
 /// `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
@@ -2940,6 +2963,7 @@ pub(crate) fn build_claude_extra_env(
     inject_pairs: &[(String, String)],
     prefill: PrefillStrategy,
     settings_path: Option<String>,
+    claude_launcher: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
@@ -2948,6 +2972,14 @@ pub(crate) fn build_claude_extra_env(
     ];
     if let Some(sp) = socket_path {
         env.push(("NICE_SOCKET".to_string(), sp.to_string()));
+    }
+    // The launcher rides EVERY mode's env (not just ResumeDeferred): a claude
+    // child (from the exec line) and a deferred-resume shell must both see the
+    // same `NICE_CLAUDE_LAUNCHER`, or a `/fork` / restore shadow would type
+    // `claude --resume` against a launcher it can't see. Follows the setting
+    // alone — no interaction with `NICE_CLAUDE_OVERRIDE`.
+    if let Some(launcher) = claude_launcher {
+        env.push(("NICE_CLAUDE_LAUNCHER".to_string(), launcher.to_string()));
     }
     if let ClaudeSessionMode::ResumeDeferred(claude_session_id) = mode {
         // The rc-injection pairs the active profile produced for this window —
@@ -3023,6 +3055,30 @@ pub(crate) fn build_claude_prefill_command(settings_path: Option<&str>, claude_s
         .map(|p| format!(" --settings {}", nice_term_core::shell_single_quote(p)))
         .unwrap_or_default();
     format!("claude{settings_arg} --resume {claude_session_id}")
+}
+
+/// Select the program the Claude spawn should `exec` — `claude`, or the
+/// `advanced.claude_launcher` the user set in its place.
+///
+/// - `is_override == true` (set when `NICE_CLAUDE_OVERRIDE` is in the env) ⇒
+///   `claude` (already the override's value here): the wrapper owns the full
+///   argv and stays flag-free, so the launcher is ignored. The two knobs never
+///   interact — the `NICE_CLAUDE_LAUNCHER` env var still follows the setting on
+///   its own (see [`build_claude_extra_env`]).
+/// - otherwise the launcher when one is set, else `claude` unchanged.
+///
+/// A single executable path, no arguments — the caller splices it through the
+/// existing single-quoting in [`build_claude_exec_command`].
+pub(crate) fn claude_exec_program<'a>(
+    claude: &'a str,
+    launcher: Option<&'a str>,
+    is_override: bool,
+) -> &'a str {
+    if is_override {
+        claude
+    } else {
+        launcher.unwrap_or(claude)
+    }
 }
 
 /// Assemble the `exec <claude> …` command line for the inner `zsh -ilc`

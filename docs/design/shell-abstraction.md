@@ -121,7 +121,7 @@ pub trait ShellProfile: Send + Sync {
     /// Shell-specific env pairs for an INJECTED spawn — finding 2.
     /// zsh: `ZDOTDIR` + `NICE_USER_ZDOTDIR`. bash: empty (injection rides
     /// argv). Generic pairs (NICE_SOCKET/NICE_TAB_ID/NICE_PANE_ID/
-    /// NICE_COMPOSE_CONF) are NOT this method's job — they stay
+    /// NICE_COMPOSE_CONF/NICE_CLAUDE_LAUNCHER) are NOT this method's job — they stay
     /// shell-agnostic in pty_manager.
     fn inject_env(&self, inject: &InjectPaths, user: &UserShellEnv) -> Vec<(String, String)>;
 
