@@ -263,6 +263,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 	<string>NSApplication</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Programs running in $APP_NAME, such as Claude Code voice dictation, need microphone access.</string>
 </dict>
 </plist>
 PLIST

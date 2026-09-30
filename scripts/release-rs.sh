@@ -95,6 +95,7 @@ scripts/rust-bundle.sh --prod --universal --dest "$BUILD_DIR"
 # ── 3. Developer ID re-sign with hardened runtime (required by notarization) ──
 log "codesigning with Developer ID (hardened runtime + timestamp)"
 codesign --force --options runtime --timestamp \
+    --entitlements "$REPO_ROOT/Resources/Nice.entitlements" \
     --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
 
 log "codesign --verify --deep --strict"
