@@ -27,7 +27,8 @@
 //!   n ≈ inked cells — measured as 79% of a 51 s input-flood whole-app freeze;
 //!   see [`plan_row`]). Each run still carries `background_color` so the
 //!   patched bg-luminance composition curve engages (the whole reason Path B
-//!   was gated on this renderer);
+//!   was gated on this renderer) — on light themes only, see
+//!   [`text_curve_enabled`];
 //! * a **block cursor** — focused is a solid block with an iTerm2-style *smart*
 //!   color ([`crate::color::smart_cursor_colors`]): it wears the accent whenever
 //!   the accent reads in context (notably on empty cells, the common resting
@@ -92,7 +93,7 @@ use nice_theme::Srgba;
 
 use crate::boxdraw::{self, apple_approx_coverage, Prim, Segment};
 use crate::font::{cell_fallbacks, is_symbol_char};
-use crate::color::{resolve_color, smart_cursor_colors};
+use crate::color::{relative_luminance, resolve_color, smart_cursor_colors};
 use crate::input::TermInputHandler;
 use crate::search::VIEWPORT_MATCH_MARGIN;
 use crate::session_handle::TerminalSessionHandle;
@@ -1288,9 +1289,9 @@ impl TerminalElement {
                                 let cell_y_px =
                                     ((oy_f + cur.row as f32 * ch) * scale).round();
                                 paint_cursor_glyph(
-                                    window, cx, &cell, glyph_color, block_color, &font_family,
-                                    font_px, cw, ch, x, y, cell_x_px, cell_y_px, scale, cw_px_i,
-                                    ch_px_i, light_px,
+                                    window, cx, &cell, glyph_color, block_color, default_bg,
+                                    &font_family, font_px, cw, ch, x, y, cell_x_px, cell_y_px,
+                                    scale, cw_px_i, ch_px_i, light_px,
                                 );
                             }
                         }
@@ -1564,7 +1565,8 @@ fn paint_procedural_run(
 /// advances and kerning cannot accumulate drift across the run. The run carries
 /// one `background_color` (the style key splits runs on bg), so the patched
 /// bg-luminance composition curve engages exactly as the per-cell pass did —
-/// the mechanism the whole Path-B decision was gated on.
+/// the mechanism the whole Path-B decision was gated on. Dark themes send no
+/// `background_color`, which turns the curve off (see [`text_curve_enabled`]).
 #[allow(clippy::too_many_arguments)]
 fn paint_glyph_run(
     window: &mut Window,
@@ -1581,6 +1583,7 @@ fn paint_glyph_run(
 ) {
     let decoration = Some(rgb(run.style.fg).into());
     let effective_bg = run.style.bg.unwrap_or(default_bg);
+    let curve = text_curve_enabled(default_bg);
     // Symbol cells are always isolated single-cell runs (see `plan_row`).
     let symbol = run.cells == 1 && run.text.chars().next().is_some_and(is_symbol_char);
     let text_run = TextRun {
@@ -1601,7 +1604,7 @@ fn paint_glyph_run(
             fallbacks: cell_fallbacks(symbol),
         },
         color: rgb(run.style.fg).into(),
-        background_color: Some(rgb(effective_bg).into()),
+        background_color: curve.then(|| rgb(effective_bg).into()),
         underline: run.style.underline.then(|| UnderlineStyle {
             thickness: px(DECORATION_THICKNESS),
             color: decoration,
@@ -1618,6 +1621,19 @@ fn paint_glyph_run(
     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
 }
 
+/// Below this theme-background relative luminance (≈ #767676, perceptual mid
+/// grey) the theme counts as dark.
+const DARK_THEME_BG_LUMINANCE: f32 = 0.18;
+
+/// Whether glyphs get the vendored bg-aware composition curve (`zed-bg-luminance`
+/// patch), which runs only when the `TextRun` carries a `background_color`.
+/// Light themes keep it. Dark themes turn it off: its light-on-dark gamma boost
+/// reads too heavy there. Keyed on the theme background, not each cell's, so a
+/// whole terminal renders one way.
+fn text_curve_enabled(default_bg: u32) -> bool {
+    relative_luminance(default_bg) >= DARK_THEME_BG_LUMINANCE
+}
+
 /// Paint the cursor cell's glyph over the solid block: the character in
 /// `glyph_color` on the `block_color` block, honoring the cell's bold / italic.
 /// Both colors come from [`crate::color::smart_cursor_colors`] — the accent (with
@@ -1629,7 +1645,8 @@ fn paint_glyph_run(
 /// The single most important detail (see [`paint_glyph_run`]): the run carries
 /// `background_color = Some(block_color)` so the vendored bg-luminance patch
 /// composites the glyph's antialiasing against the block, not the page — else
-/// its edges fringe against the wrong luminance.
+/// its edges fringe against the wrong luminance. Dark themes send `None`
+/// instead, like every other glyph (see [`text_curve_enabled`]).
 #[allow(clippy::too_many_arguments)]
 fn paint_cursor_glyph(
     window: &mut Window,
@@ -1637,6 +1654,7 @@ fn paint_cursor_glyph(
     cell: &PaintCell,
     glyph_color: u32,
     block_color: u32,
+    default_bg: u32,
     font_family: &SharedString,
     font_px: f32,
     cw: f32,
@@ -1663,7 +1681,7 @@ fn paint_cursor_glyph(
         len: text.len(),
         font: cell_font(font_family.clone(), cell.bold, cell.italic, symbol),
         color: rgb(glyph_color).into(),
-        background_color: Some(rgb(block_color).into()),
+        background_color: text_curve_enabled(default_bg).then(|| rgb(block_color).into()),
         underline: None,
         strikethrough: None,
     };
@@ -1965,6 +1983,14 @@ mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
+
+    #[test]
+    fn text_curve_is_off_for_dark_themes_only() {
+        assert!(text_curve_enabled(0xffffff));
+        assert!(text_curve_enabled(0xeff1f5)); // Catppuccin Latte base
+        assert!(!text_curve_enabled(0x1e1e2e)); // Catppuccin Mocha base
+        assert!(!text_curve_enabled(0x000000));
+    }
 
     #[test]
     fn terminal_metrics_new_defaults_glyph_h_to_cell_h() {
